@@ -65,7 +65,10 @@ class Index:
         """Open (creating/migrating as needed) the metadata DB at ``path``."""
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self._conn = sqlite3.connect(str(self.path))
+        # The socket API serves requests on per-connection threads; SQLite is compiled in
+        # serialized mode here (``sqlite3.threadsafety == 3``) so one shared connection is
+        # safe. Callers serialise logical access through ``Service``.
+        self._conn = sqlite3.connect(str(self.path), check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA foreign_keys=ON")

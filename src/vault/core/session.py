@@ -605,9 +605,29 @@ class VaultSession:
                 outcome="deny", code=DowngradeForbidden.code,
             )
             raise DowngradeForbidden("downgrade_forbidden")
-        idx.set_sensitivity(logical, level)
-        new_row = idx.require_file(logical)
-        if not int(new_row["is_dir"]):
+        if int(row["is_dir"]):
+            idx.set_sensitivity(logical, level)
+            new_row = idx.require_file(logical)
+        else:
+            # The blob AAD binds its sensitivity, so a level change must re-encrypt the
+            # content; otherwise the file becomes undecryptable under the new level.
+            if row.get("blob_id"):
+                data = self._read_raw(row)
+                blob_id, size, encrypted = self.fs.write_blob(data, sensitivity=level)
+                idx.upsert_file(
+                    logical,
+                    blob_id=blob_id,
+                    is_dir=False,
+                    size=size,
+                    encrypted=encrypted,
+                    sensitivity=level,
+                    source=source,
+                )
+                if blob_id != row["blob_id"]:
+                    self.fs.delete_blob(row["blob_id"])
+            else:
+                idx.set_sensitivity(logical, level)
+            new_row = idx.require_file(logical)
             if level == "normal":
                 data = self._read_raw(new_row)
                 self._store.index_text(int(new_row["id"]), data.decode("utf-8", "ignore"))

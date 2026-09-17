@@ -67,7 +67,9 @@ class SecureStore:
     @classmethod
     def _connect(cls, dec_path: Path) -> sqlite3.Connection:
         """Open the decrypted SQLite database with plain (non-WAL) journaling."""
-        conn = sqlite3.connect(str(dec_path))
+        # ``check_same_thread=False``: the socket API dispatches on handler threads; SQLite
+        # is serialized in this environment and access is serialised by ``Service``.
+        conn = sqlite3.connect(str(dec_path), check_same_thread=False)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA journal_mode=DELETE")
         conn.execute("PRAGMA foreign_keys=ON")
