@@ -32,8 +32,8 @@ _CHAR_MAP = {
 # Diacritics and tatweel stripped during normalization.
 _STRIP = set(range(0x064B, 0x0653)) | {0x0670, 0x0640}
 
-_WHITESPACE = set(" \t\n\r\v\f\u00a0\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007"
-                  "\u2008\u2009\u200a\u2028\u2029\u202f\u205f\u3000")
+_WHITESPACE = {ord(ch) for ch in " \t\n\r\v\f\u00a0\u2000\u2001\u2002\u2003\u2004\u2005"
+               "\u2006\u2007\u2008\u2009\u200a\u2028\u2029\u202f\u205f\u3000"}
 
 
 def atomic_write_bytes(path: Path, data: bytes) -> None:

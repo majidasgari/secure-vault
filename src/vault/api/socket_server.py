@@ -50,20 +50,24 @@ class _RequestHandler(socketserver.StreamRequestHandler):
         """Serve requests until the client disconnects or sends EOF."""
         owner: "VaultSocketServer" = self.server.service  # type: ignore[attr-defined]
         session_id = owner.next_session_id()
-        while True:
-            line = self.rfile.readline()
-            if not line:
-                return
-            line = line.strip()
-            if not line:
-                continue
-            response = owner.process_line(line, session_id)
-            payload = json.dumps(response, ensure_ascii=False) + "\n"
-            try:
-                self.wfile.write(payload.encode("utf-8"))
-                self.wfile.flush()
-            except (BrokenPipeError, ConnectionResetError):
-                return
+        owner.connection_opened()
+        try:
+            while True:
+                line = self.rfile.readline()
+                if not line:
+                    return
+                line = line.strip()
+                if not line:
+                    continue
+                response = owner.process_line(line, session_id)
+                payload = json.dumps(response, ensure_ascii=False) + "\n"
+                try:
+                    self.wfile.write(payload.encode("utf-8"))
+                    self.wfile.flush()
+                except (BrokenPipeError, ConnectionResetError):
+                    return
+        finally:
+            owner.connection_closed()
 
 
 class _ThreadingUnixServer(socketserver.ThreadingUnixStreamServer):
@@ -100,6 +104,8 @@ class VaultSocketServer:
         self._thread: threading.Thread | None = None
         self._counter = 0
         self._counter_lock = threading.Lock()
+        self._active = 0
+        self._active_lock = threading.Lock()
 
     # ------------------------------------------------------------------ lifecycle
     def start(self) -> None:
@@ -186,6 +192,22 @@ class VaultSocketServer:
         with self._counter_lock:
             self._counter += 1
             return f"sock-{self._counter}"
+
+    def connection_opened(self) -> None:
+        """Record a newly accepted client connection (additive UI status counter)."""
+        with self._active_lock:
+            self._active += 1
+
+    def connection_closed(self) -> None:
+        """Record a closed client connection (additive UI status counter)."""
+        with self._active_lock:
+            if self._active > 0:
+                self._active -= 1
+
+    def connection_count(self) -> int:
+        """Return the number of currently connected clients."""
+        with self._active_lock:
+            return self._active
 
     def process_line(self, line: bytes, session_id: str) -> dict[str, Any]:
         """Parse and handle one request line, returning the response object."""
