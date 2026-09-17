@@ -1,0 +1,9 @@
+.venv/
+portable/
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+docs/reports/*.md
+*.tmp
+.DS_Store

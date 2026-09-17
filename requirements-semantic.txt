@@ -1,0 +1,4 @@
+# Opt-in extra for the local semantic search (SPEC/01 §11). Never installed by bootstrap.
+# Nothing in the app requires this file to be present; without it the semantic search
+# reports "not installed" and every other feature keeps working.
+sentence-transformers>=3

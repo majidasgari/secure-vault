@@ -1,0 +1,26 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256" role="img" aria-label="Secure Vault">
+  <title>Secure Vault</title>
+  <defs>
+    <linearGradient id="body" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#3b4a63"/>
+      <stop offset="1" stop-color="#1d2635"/>
+    </linearGradient>
+    <linearGradient id="shackle" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#f3c969"/>
+      <stop offset="1" stop-color="#c8952f"/>
+    </linearGradient>
+  </defs>
+  <!-- vault body -->
+  <rect x="30" y="86" width="196" height="146" rx="22" fill="url(#body)" stroke="#0f1520" stroke-width="4"/>
+  <!-- inner frame -->
+  <rect x="46" y="102" width="164" height="114" rx="14" fill="none" stroke="#5d708f" stroke-width="3" opacity="0.55"/>
+  <!-- handle -->
+  <circle cx="128" cy="159" r="26" fill="url(#shackle)" stroke="#8a6516" stroke-width="3"/>
+  <circle cx="128" cy="159" r="10" fill="#1d2635"/>
+  <rect x="124" y="159" width="8" height="26" rx="4" fill="#1d2635"/>
+  <!-- keyhole / shackle -->
+  <path d="M92 86V70a36 36 0 0 1 72 0v16" fill="none" stroke="url(#shackle)" stroke-width="14" stroke-linecap="round"/>
+  <circle cx="52" cy="112" r="4" fill="#8fa6c8"/>
+  <circle cx="52" cy="132" r="4" fill="#8fa6c8"/>
+  <circle cx="52" cy="152" r="4" fill="#8fa6c8"/>
+</svg>

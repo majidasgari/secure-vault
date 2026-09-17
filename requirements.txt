@@ -1,0 +1,5 @@
+PySide6>=6.10,<7
+cryptography>=44
+argon2-cffi>=23
+markdown-it-py>=3
+Pygments>=2.17
