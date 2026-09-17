@@ -1,17 +1,17 @@
-# Secure Vault — گاوصندوق
+# Secure Vault
 
-**گاوصندوق** یک برنامه‌ی شخصیِ رمزنگاری‌شده برای یادداشت‌ها و گذرواژه‌هاست که جای
-Joplin و KeePass را می‌گیرد و «ایجنت‌آگاه» است: ایجنت‌ها از طریق MCP به آن دسترسی
-دارند، اما محتوای فایل‌های *محرمانه* و *رمز* هرگز به آن‌ها داده نمی‌شود — فقط نام‌ها،
-ساختار و سطح حساسیت قابل‌دیدن است و همه‌ی دسترسی‌ها در یک لاگ فقط‌الحاقی ثبت می‌شوند.
-برای شروع سریع:
+**Secure Vault** is a personal, encrypted notes-and-passwords application that replaces
+Joplin and KeePass and is **agent-aware**: agents reach it over MCP, but the content of
+*secret* and *secretfile* files is never handed to them — only names, structure and
+sensitivity level are visible, and every access is recorded in an append-only log.
+Quick start:
 
 ```bash
 tools/bootstrap.sh
-./bin/secure-vault          # روی این ماشین: QT_QPA_PLATFORM=offscreen ./bin/secure-vault --self-test
+./bin/secure-vault          # on this machine: QT_QPA_PLATFORM=offscreen ./bin/secure-vault --self-test
 ```
 
-> **مهم:** گذرواژه‌ی اصلی ذخیره نمی‌شود و هیچ راهی برای بازیابی آن وجود ندارد.
+> **Important:** the master password is never stored and there is no way to recover it.
 
 ---
 
@@ -83,7 +83,7 @@ QT_QPA_PLATFORM=offscreen PYTHONPATH=src ./.venv/bin/python -m vault --self-test
 * **Editor**: markdown source with a live preview for `normal` files, per-block
   RTL/LTR formatting (auto / RTL / LTR, `Ctrl+Shift+D`) and monospace fences. For
   `secret` files the preview is disabled; `secretfile` files never reach the editor
-  at all. **ویرایش در مرورگر** opens the current note in the web UI.
+  at all. **Edit in browser** opens the current note in the web UI.
 * **Sensitivity levels**: right-click a file → *Set level* → `normal`, `secret` or
   `secretfile`. Lowering requires confirmation and is only possible from the UI.
 * **Secret viewer**: a native plain-text window (no web engine) for `secretfile`
