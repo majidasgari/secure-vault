@@ -8,17 +8,26 @@ only for locking, the auto-lock clock and the agent secret-request flow.
 
 from __future__ import annotations
 
+import threading
 from pathlib import Path
 from typing import Any, Callable
 
-from PySide6.QtCore import QObject, QTimer, QUrl, Signal
+from PySide6.QtCore import QObject, Qt, QTimer, QUrl, Signal
 from PySide6.QtGui import QDesktopServices
-from PySide6.QtWidgets import QDialog, QLabel, QMessageBox, QPushButton, QVBoxLayout
+from PySide6.QtWidgets import (
+    QDialog,
+    QLabel,
+    QMessageBox,
+    QProgressDialog,
+    QPushButton,
+    QVBoxLayout,
+)
 
 from .. import __version__
 from ..api.service import Service
 from ..api.socket_server import VaultSocketServer
 from ..config import runtime_dir, user_config
+from ..core.meta import DEFAULT_IMPORT_MIRROR
 from ..errors import Unauthorized, VaultError
 from . import i18n, notifications, theme, viewer
 from .main_window import MainWindow
@@ -79,6 +88,8 @@ class VaultApplication(QObject):
     """Owns the service, the socket server, the windows and the timers."""
 
     secret_requested = Signal(object)
+    # Emitted from the importer worker thread with the report dict (SPEC/03 §4 Importer).
+    import_finished = Signal(object)
 
     def __init__(
         self,
@@ -114,10 +125,18 @@ class VaultApplication(QObject):
         self.current_screen = "none"
         self.confirm_hook: Callable[[str, str], bool] | None = None
         self._secret_dialogs: list[SecretRequestDialog] = []
+        # Joplin import (SPEC/03 §4 "Importer"): the report of the last run, exposed so the
+        # smoke tests can assert the UI path without a modal dialog.
+        self.last_import_report: dict[str, Any] | None = None
+        self.last_import_mirror: str | None = None
+        self.last_import_error: str | None = None
+        self.import_running = False
+        self._import_progress: QProgressDialog | None = None
 
         i18n.set_language(language)
         theme.apply(qapp, language)
         self.secret_requested.connect(self._show_secret_request)
+        self.import_finished.connect(self._on_import_finished)
 
         self._auto_lock_timer = QTimer(self)
         self._auto_lock_timer.setInterval(AUTO_LOCK_TICK_MS)
@@ -489,11 +508,123 @@ class VaultApplication(QObject):
             return
         self.hub.notify()
 
-    def import_joplin(self) -> None:
-        """Joplin import is delivered in P4; explain rather than fail."""
-        QMessageBox.information(
-            self.window, i18n.tr("menu.import"), i18n.tr("settings.import_unavailable")
+    def import_joplin(
+        self,
+        *,
+        wait: bool = False,
+        mirror_root: str | None = None,
+        globs: list[str] | None = None,
+    ) -> dict[str, Any] | None:
+        """Run the Joplin importer against the configured mirror (SPEC/04).
+
+        In the GUI this runs on a worker thread with a busy indicator, because the real
+        mirror takes minutes; ``wait=True`` (used by the smoke tests and the headless
+        self-test) runs it inline instead. The vault must be unlocked, and the importer
+        itself refuses a vault home that overlaps the mirror.
+        """
+        if self.session is None:
+            return None
+        settings = self.get_settings() or {}
+        import_settings = dict(settings.get("import_joplin") or {})
+        mirror = Path(
+            mirror_root
+            or import_settings.get("mirror_root")
+            or DEFAULT_IMPORT_MIRROR
         )
+        globs = list(globs if globs is not None else import_settings.get("sensitive_globs") or [])
+        # Exposed for the tests and the log: the path the importer will actually read, so a
+        # wrong setting is never silently replaced by the built-in default.
+        self.last_import_mirror = str(mirror)
+        if self.session.is_locked:
+            self._show_import_error(i18n.tr("error.VAULT_LOCKED"))
+            return None
+        if self.import_running:
+            return None
+        from ..importers.joplin_mirror import JoplinMirrorImporter
+
+        if not mirror.is_dir():
+            self._show_import_error(i18n.tr("import.mirror_missing", path=str(mirror)))
+            return None
+        importer = JoplinMirrorImporter(mirror, mark_secret_globs=globs)
+        self.import_running = True
+        if wait or self.self_test:
+            try:
+                report = importer.run(self.session).to_dict()
+            except Exception as exc:  # noqa: BLE001 - surface any importer failure in the UI
+                self.import_running = False
+                self._show_import_error(error_message(exc))
+                return None
+            self.import_running = False
+            self._on_import_finished(report)
+            return report
+        self._show_import_progress()
+        worker = threading.Thread(
+            target=self._run_import_worker, args=(importer,), name="vault-import", daemon=True
+        )
+        worker.start()
+        return None
+
+    def _run_import_worker(self, importer: Any) -> None:
+        """Run the importer off the GUI thread and hand the report back via a signal."""
+        try:
+            payload = importer.run(self.session).to_dict()
+        except Exception as exc:  # noqa: BLE001
+            payload = {"error": error_message(exc)}
+        self.import_finished.emit(payload)
+
+    def _show_import_progress(self) -> None:
+        """Show a busy indicator while the importer runs (no-op when headless)."""
+        if self.self_test:
+            return
+        dialog = QProgressDialog(self.window)
+        dialog.setWindowTitle(i18n.tr("menu.import"))
+        dialog.setLabelText(i18n.tr("import.running"))
+        dialog.setRange(0, 0)
+        dialog.setCancelButton(None)
+        dialog.setWindowModality(Qt.WindowModality.WindowModal)
+        dialog.show()
+        self._import_progress = dialog
+
+    def _close_import_progress(self) -> None:
+        """Close the busy indicator if it is open."""
+        dialog, self._import_progress = self._import_progress, None
+        if dialog is not None:
+            dialog.close()
+            dialog.deleteLater()
+
+    def _on_import_finished(self, payload: Any) -> None:
+        """Record the report and show it to the user (never a modal in self-test mode)."""
+        self._close_import_progress()
+        self.import_running = False
+        report = dict(payload or {})
+        self.last_import_report = report
+        if report.get("error"):
+            self._show_import_error(str(report["error"]))
+            return
+        if self.self_test:
+            return
+        counts = {
+            key: report.get(key, 0)
+            for key in (
+                "notes_created",
+                "notes_updated",
+                "notes_skipped",
+                "folders_created",
+                "assets_imported",
+            )
+        }
+        counts["errors"] = len(report.get("errors") or [])
+        QMessageBox.information(
+            self.window, i18n.tr("import.done_title"), i18n.tr("import.done_text", **counts)
+        )
+
+    def _show_import_error(self, message: str) -> None:
+        """Tell the user why the import did not run."""
+        if self.self_test:
+            self.last_import_error = message
+            return
+        self.last_import_error = message
+        QMessageBox.warning(self.window, i18n.tr("menu.import"), message)
 
     def rename_path(self, src: str, dst: str) -> None:
         """Move/rename a path."""

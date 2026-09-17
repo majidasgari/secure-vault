@@ -27,6 +27,8 @@ SCHEMA_VERSION = 1
 META_FILENAME = ".vault-meta.json"
 
 _DEFAULT_IMPORT_MIRROR = "/data/Cloud/Documents/Notes/joplin-mirror"
+#: Public alias: the Joplin mirror root used when the settings carry no explicit path.
+DEFAULT_IMPORT_MIRROR = _DEFAULT_IMPORT_MIRROR
 
 
 def default_settings() -> dict[str, Any]:
@@ -159,4 +161,10 @@ class VaultMeta:
         )
 
 
-__all__ = ["VaultMeta", "SCHEMA_VERSION", "META_FILENAME", "default_settings"]
+__all__ = [
+    "VaultMeta",
+    "SCHEMA_VERSION",
+    "META_FILENAME",
+    "DEFAULT_IMPORT_MIRROR",
+    "default_settings",
+]

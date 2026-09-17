@@ -225,10 +225,9 @@ class SettingsDialog(QDialog):
         )
 
     def _run_import(self) -> None:
-        """Importer is delivered in P4; explain instead of failing."""
-        QMessageBox.information(
-            self, i18n.tr("settings.run_import"), i18n.tr("settings.import_unavailable")
-        )
+        """Persist the current settings, then run the Joplin importer (SPEC/04)."""
+        self._on_accept()
+        self._controller.import_joplin()
 
     # ------------------------------------------------------------------ accept
     def _on_accept(self) -> None:

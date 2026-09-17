@@ -8,6 +8,7 @@ re-encrypts the database back into ``secure.store``; on close the decrypted file
 
 from __future__ import annotations
 
+import atexit
 import os
 import sqlite3
 import uuid
@@ -31,6 +32,47 @@ def _dec_path(runtime: Path) -> Path:
     doing so lets one of them unlink the file the other still has open.
     """
     return Path(runtime) / f"store.{os.getpid()}.{uuid.uuid4().hex[:8]}.dec"
+
+
+def cleanup_stale(runtime: Path, *, keep: Path | None = None) -> list[Path]:
+    """Delete decrypted store files left behind by processes that are no longer alive.
+
+    A killed process (SIGKILL, a crash, a ``timeout``) never reaches :meth:`SecureStore.close`,
+    so its plaintext store would otherwise sit on the runtime tmpfs — and, after a big import,
+    that can be hundreds of megabytes of readable notes. Files owned by a live process are
+    kept (a second vault process is legitimate); ``keep`` is never touched.
+
+    Returns the list of removed paths.
+    """
+    runtime = Path(runtime)
+    removed: list[Path] = []
+    if not runtime.is_dir():
+        return removed
+    for candidate in runtime.glob("store.*.dec"):
+        if keep is not None and candidate == keep:
+            continue
+        parts = candidate.name.split(".")
+        try:
+            pid = int(parts[1]) if len(parts) > 2 else -1
+        except (IndexError, ValueError):
+            pid = -1
+        if pid > 0 and pid != os.getpid():
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                pass
+            except PermissionError:
+                continue
+            else:
+                continue  # the owning process is alive — leave it alone
+        if pid == os.getpid():
+            continue  # a live store of ours (another instance in this process)
+        try:
+            candidate.unlink()
+            removed.append(candidate)
+        except FileNotFoundError:
+            pass
+    return removed
 
 _SCHEMA = """
 CREATE VIRTUAL TABLE IF NOT EXISTS fts_content USING fts5(
@@ -63,6 +105,15 @@ class SecureStore:
         self._store_path = self.home / STORE_FILENAME
         self._conn: sqlite3.Connection | None = conn
         self._dirty = False
+        atexit.register(self._remove_dec_on_exit)
+
+    def _remove_dec_on_exit(self) -> None:
+        """Best-effort removal of the decrypted store when the interpreter exits."""
+        for suffix in ("", "-journal", "-wal", "-shm"):
+            try:
+                Path(str(self._dec_path) + suffix).unlink()
+            except OSError:
+                pass
 
     def mark_dirty(self) -> None:
         """Flag the store as mutated so the next :meth:`flush` rewrites the blob."""
@@ -92,6 +143,7 @@ class SecureStore:
         runtime = default_runtime_dir()
         runtime.mkdir(parents=True, exist_ok=True)
         dec_path = _dec_path(runtime)
+        cleanup_stale(runtime, keep=dec_path)
         conn = cls._connect(dec_path)
         try:
             os.chmod(dec_path, 0o600)
@@ -123,6 +175,7 @@ class SecureStore:
         blob = store_path.read_bytes()
         plaintext = decrypt_blob(master_key, STORE_BLOB_ID, blob, sensitivity="normal")
         dec_path = _dec_path(runtime)
+        cleanup_stale(runtime, keep=dec_path)
         atomic_write_bytes(dec_path, plaintext)
         try:
             os.chmod(dec_path, 0o600)

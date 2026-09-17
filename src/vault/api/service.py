@@ -14,7 +14,7 @@ from datetime import datetime, timezone
 from typing import Any, Callable
 
 from ..core import semantics
-from ..core.security import SOURCE_MCP, SOURCE_UI
+from ..core.security import LEVELS, SOURCE_MCP, SOURCE_UI
 from ..errors import (
     BadRequest,
     DowngradeForbidden,
@@ -439,11 +439,32 @@ class Service:
             settings["language"] = self._text(params["language"], param="language")
         if "auto_lock_seconds" in params:
             settings["auto_lock_seconds"] = int(params["auto_lock_seconds"])
+        if "default_sensitivity" in params:
+            level = self._text(params["default_sensitivity"], param="default_sensitivity")
+            if level not in LEVELS:
+                raise BadRequest("unknown_level", details={"level": level})
+            settings["default_sensitivity"] = level
         semantic = params.get("semantic")
         if isinstance(semantic, dict):
             current = settings.setdefault("semantic", {})
             if "enabled" in semantic:
                 current["enabled"] = bool(semantic["enabled"])
+            if semantic.get("model"):
+                current["model"] = self._text(semantic["model"], param="semantic.model")
+        importer = params.get("import_joplin")
+        if isinstance(importer, dict):
+            current = settings.setdefault("import_joplin", {})
+            if importer.get("mirror_root"):
+                current["mirror_root"] = self._text(
+                    importer["mirror_root"], param="import_joplin.mirror_root"
+                )
+            globs = importer.get("sensitive_globs")
+            if isinstance(globs, list):
+                current["sensitive_globs"] = [
+                    self._text(str(item), param="import_joplin.sensitive_globs")
+                    for item in globs
+                    if str(item).strip()
+                ]
         self.session.meta.save()
         return {"updated": True, "settings": json.loads(json.dumps(settings))}
 

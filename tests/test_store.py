@@ -106,3 +106,27 @@ class SecureStoreTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class StaleStoreCleanupTest(unittest.TestCase):
+    """A killed process must not leave its decrypted store behind (SPEC/01 §8)."""
+
+    def test_dead_process_store_is_removed_and_live_one_kept(self) -> None:
+        """Stale ``store.<pid>.<rand>.dec`` files go; a live process's file and ``keep`` stay."""
+        import os
+        import tempfile
+        from pathlib import Path
+
+        from vault.core.store import cleanup_stale
+
+        runtime = Path(tempfile.mkdtemp(prefix="sv-runtime-"))
+        dead = runtime / "store.999999.abcdef12.dec"
+        live = runtime / f"store.{os.getpid()}.11111111.dec"
+        keep = runtime / "store.999998.aabbccdd.dec"
+        for path in (dead, live, keep):
+            path.write_bytes(b"plaintext")
+        removed = cleanup_stale(runtime, keep=keep)
+        self.assertIn(dead, removed)
+        self.assertFalse(dead.exists(), "a dead process's store survived")
+        self.assertTrue(live.exists(), "a live process's store was deleted")
+        self.assertTrue(keep.exists(), "the keep= path was deleted")
