@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+#
+# secure-vault — launch the Secure Vault desktop app (SPEC/05 §3).
+#
+# Uses the project virtualenv created by tools/bootstrap.sh and runs the package
+# straight from src/ via PYTHONPATH, so nothing has to be pip-installed. All
+# arguments are forwarded to `python -m vault` (e.g. --home, --language, --debug,
+# --self-test).
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+PY="$ROOT/.venv/bin/python"
+
+if [ ! -x "$PY" ]; then
+  echo "secure-vault: no virtualenv at $ROOT/.venv" >&2
+  echo "secure-vault: run $ROOT/tools/bootstrap.sh first" >&2
+  exit 1
+fi
+
+export PYTHONPATH="$ROOT/src${PYTHONPATH:+:$PYTHONPATH}"
+exec "$PY" -m vault "$@"

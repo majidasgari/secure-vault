@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+#
+# secure-vault-mcp — MCP stdio entry point for the Secure Vault bridge (SPEC/05 §3).
+#
+# This is the command an agent runtime (Hermes/Claude) spawns. It must behave like a
+# pure stdio filter: it execs `python -m vault.mcp` and never wraps or redirects
+# stdout, because stdout is the JSON-RPC channel. Diagnostics go to stderr only.
+#
+# Set SECURE_VAULT_DEBUG=1 to pass --debug (extra diagnostics on stderr).
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+PY="$ROOT/.venv/bin/python"
+
+if [ ! -x "$PY" ]; then
+  echo "secure-vault-mcp: no virtualenv at $ROOT/.venv" >&2
+  echo "secure-vault-mcp: run $ROOT/tools/bootstrap.sh first" >&2
+  exit 1
+fi
+
+export PYTHONPATH="$ROOT/src${PYTHONPATH:+:$PYTHONPATH}"
+
+if [ "${SECURE_VAULT_DEBUG:-0}" = "1" ]; then
+  exec "$PY" -m vault.mcp --debug "$@"
+fi
+exec "$PY" -m vault.mcp "$@"
