@@ -62,6 +62,11 @@ class SecureStore:
         self._dec_path = Path(dec_path)
         self._store_path = self.home / STORE_FILENAME
         self._conn: sqlite3.Connection | None = conn
+        self._dirty = False
+
+    def mark_dirty(self) -> None:
+        """Flag the store as mutated so the next :meth:`flush` rewrites the blob."""
+        self._dirty = True
 
     # ------------------------------------------------------------------ lifecycle
     @classmethod
@@ -93,6 +98,7 @@ class SecureStore:
         except OSError:  # pragma: no cover - best effort
             pass
         store = cls(home, master_key, runtime, dec_path, conn)
+        store.mark_dirty()
         store.flush()
         return store
 
@@ -126,15 +132,23 @@ class SecureStore:
         return cls(home, master_key, runtime, dec_path, conn)
 
     def flush(self) -> None:
-        """Commit and re-encrypt the decrypted database back into ``secure.store``."""
+        """Commit and re-encrypt the decrypted database back into ``secure.store``.
+
+        Nothing is written when the store has not been mutated since the last flush: an
+        unlock/lock cycle with no edits must not rewrite the blob, otherwise every open
+        would push a fresh copy of it to the user's cloud folder.
+        """
         if self._conn is None:
             return
         self._conn.commit()
+        if not self._dirty:
+            return
         plaintext = self._materialize_dec().read_bytes()
         blob = encrypt_blob(
             self.master_key, STORE_BLOB_ID, plaintext, sensitivity="normal"
         )
         atomic_write_bytes(self._store_path, blob)
+        self._dirty = False
 
     def _materialize_dec(self) -> Path:
         """Return the decrypted DB path, rebuilding the file when it vanished.
@@ -196,6 +210,7 @@ class SecureStore:
             "indexed_at=excluded.indexed_at",
             (int(file_id), digest, now_ms()),
         )
+        self._dirty = True
         self._conn.commit()
 
     def remove_file(self, file_id: int) -> None:
@@ -206,6 +221,7 @@ class SecureStore:
         self._conn.execute("DELETE FROM fts_content WHERE rowid=?", (fid,))
         self._conn.execute("DELETE FROM content_meta WHERE file_id=?", (fid,))
         self._conn.execute("DELETE FROM vectors WHERE file_id=?", (fid,))
+        self._dirty = True
         self._conn.commit()
 
     def search_text(self, query: str, *, limit: int = 50) -> list[tuple[int, float]]:
@@ -244,6 +260,7 @@ class SecureStore:
             "updated_at=excluded.updated_at",
             (folder_path, text, now_ms()),
         )
+        self._dirty = True
         self._conn.commit()
 
     def get_folder_note(self, folder_path: str) -> str | None:
@@ -273,6 +290,7 @@ class SecureStore:
             "INSERT OR REPLACE INTO vectors(file_id, model, dim, vec) VALUES(?,?,?,?)",
             (int(file_id), model, len(vec) // 4, bytes(vec)),
         )
+        self._dirty = True
         self._conn.commit()
 
     def get_vectors(self, model: str) -> list[tuple[int, bytes]]:
@@ -289,6 +307,7 @@ class SecureStore:
         if self._conn is None:
             return 0
         cur = self._conn.execute("DELETE FROM vectors")
+        self._dirty = True
         self._conn.commit()
         return int(cur.rowcount if cur.rowcount is not None else 0)
 

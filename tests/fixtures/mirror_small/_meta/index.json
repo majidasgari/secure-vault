@@ -1,0 +1,58 @@
+{
+  "counts": {
+    "notes": 3,
+    "notebooks": 2,
+    "tags": 1,
+    "assets": 1,
+    "missing_resource_binaries": 0,
+    "unresolved_refs": 1
+  },
+  "notebooks": [
+    {"id": "nb-work", "name": "Work", "path": "Work", "parent": null},
+    {"id": "nb-personal", "name": "Personal", "path": "Personal", "parent": null}
+  ],
+  "notes": [
+    {
+      "id": "n-first",
+      "title": "First",
+      "path": "Work/first.md",
+      "notebook": "nb-work",
+      "tags": ["alpha"],
+      "updated": "2024-01-02T03:04:05Z",
+      "created": "2024-01-01T00:00:00Z",
+      "source_url": null,
+      "is_todo": false
+    },
+    {
+      "id": "n-second",
+      "title": "Second",
+      "path": "Work/second.md",
+      "notebook": "nb-work",
+      "tags": [],
+      "updated": "2024-02-02T03:04:05Z",
+      "created": "2024-01-01T00:00:00Z",
+      "source_url": null,
+      "is_todo": true
+    },
+    {
+      "id": "n-third",
+      "title": "Third",
+      "path": "Personal/third.md",
+      "notebook": "nb-personal",
+      "tags": [],
+      "updated": "2024-03-02T03:04:05Z",
+      "created": "2024-01-01T00:00:00Z",
+      "source_url": null,
+      "is_todo": false
+    }
+  ],
+  "assets": {
+    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa": "pic.png"
+  },
+  "tags": [
+    {"id": "t-alpha", "name": "alpha"}
+  ],
+  "unresolved_refs": [
+    {"note": "n-first", "resource": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}
+  ]
+}
