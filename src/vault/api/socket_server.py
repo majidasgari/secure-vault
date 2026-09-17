@@ -119,8 +119,11 @@ class VaultSocketServer:
             os.chmod(self.runtime_dir, 0o700)
         except OSError:  # pragma: no cover - best effort
             pass
-        self._write_tokens()
+        # Bind first: publishing a token for a socket someone else serves left the bridge
+        # authenticating against the *other* daemon, which answers UNAUTHORIZED (and the app's
+        # tray never sees the calls).
         self._bind()
+        self._write_tokens()
         assert self._server is not None
         self._thread = threading.Thread(
             target=self._server.serve_forever, name="vault-socket", daemon=True

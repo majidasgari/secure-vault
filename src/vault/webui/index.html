@@ -1,0 +1,171 @@
+<!doctype html>
+<html lang="fa" dir="rtl" data-theme="dark">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="color-scheme" content="dark light">
+  <title data-i18n="web.title">Secure Vault</title>
+  <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+  <div id="login-view" class="view">
+    <form id="login-form" class="login-card" autocomplete="off">
+      <h1 data-i18n="web.title"></h1>
+      <p class="muted" data-i18n="web.subtitle"></p>
+      <div id="token-block" hidden>
+        <label for="token-input" data-i18n="web.token"></label>
+        <input id="token-input" name="token" type="password" autocomplete="off"
+               spellcheck="false" data-i18n-placeholder="web.token_placeholder">
+        <p class="hint" data-i18n="web.token_hint"></p>
+      </div>
+      <button id="token-toggle" type="button" class="link" data-i18n="web.have_token" hidden></button>
+      <p id="claim-hint" class="hint" data-i18n="web.claim_hint" hidden></p>
+      <label for="password-input" data-i18n="unlock.password"></label>
+      <input id="password-input" name="password" type="password"
+             autocomplete="current-password" data-i18n-placeholder="unlock.password_placeholder">
+      <button id="unlock-button" type="submit" class="primary" data-i18n="web.unlock_button"></button>
+      <p id="login-error" class="error" hidden></p>
+      <p id="login-lockout" class="warn" hidden></p>
+      <select id="lang-select-login" class="lang-select" data-i18n-title="web.language"
+              data-i18n-aria="web.language" hidden></select>
+    </form>
+  </div>
+
+  <div id="app-view" class="view" hidden>
+    <header class="app-header">
+      <button id="btn-menu" type="button" class="icon-btn mobile-only"
+              data-i18n-title="web.mobile_tree">☰</button>
+      <span class="brand">🛡️ <span data-i18n="web.title"></span></span>
+      <form id="global-search-form" class="global-search" role="search">
+        <select id="search-kind" class="kind-select" data-i18n-title="web.search_kind">
+          <option value="filenames" data-i18n="web.filenames"></option>
+          <option value="text" data-i18n="web.text"></option>
+          <option value="semantic" data-i18n="web.semantic"></option>
+        </select>
+        <input id="global-search" type="search" autocomplete="off"
+               data-i18n-placeholder="web.global_search_placeholder">
+        <button id="btn-global-search" type="submit" data-i18n="search.button"></button>
+      </form>
+      <span class="spacer"></span>
+      <div class="header-actions">
+        <button id="btn-theme" type="button" class="icon-btn" data-i18n-title="web.theme">◐</button>
+        <select id="lang-select" class="lang-select header-select" data-i18n-title="web.language"
+                hidden></select>
+        <button id="btn-lock" type="button" data-i18n="web.lock"></button>
+      </div>
+    </header>
+
+    <p id="stale-banner" class="stale-banner" hidden></p>
+    <div id="mobile-backdrop" class="mobile-backdrop" hidden></div>
+    <main class="layout">
+      <aside id="panel-left" class="panel panel-left">
+        <div class="panel-head">
+          <input id="filter-input" type="search" data-i18n-placeholder="web.filter_placeholder">
+          <button id="btn-refresh" type="button" class="icon-btn" data-i18n-title="web.refresh">⟳</button>
+        </div>
+        <div class="sidebar-actions">
+          <button id="btn-new-note-side" type="button" data-i18n="web.new_note"></button>
+          <button id="btn-new-folder" type="button" data-i18n="web.new_folder"></button>
+        </div>
+        <div class="panel-section">
+          <h3 class="section-title" data-i18n="web.tree_heading"></h3>
+          <ul id="folder-tree" class="tree"></ul>
+        </div>
+        <div class="tags">
+          <h3 class="section-title" data-i18n="web.tags_heading"></h3>
+          <div id="tag-chips" class="chips"></div>
+        </div>
+      </aside>
+
+      <section id="panel-center" class="panel panel-center">
+        <div id="view-welcome" class="view-pane welcome">
+          <p data-i18n="web.welcome"></p>
+        </div>
+
+        <div id="view-folder" class="view-pane" hidden>
+          <nav id="folder-crumbs" class="breadcrumbs"></nav>
+          <h2 data-i18n="web.notebooks"></h2>
+          <ul id="notebook-list" class="notebook-list"></ul>
+          <h2 id="notes-heading"></h2>
+          <ul id="notes-list" class="notes-list"></ul>
+        </div>
+
+        <div id="view-note" class="view-pane" hidden>
+          <div class="note-head">
+            <nav id="note-crumbs" class="breadcrumbs"></nav>
+            <div class="note-actions">
+              <button id="btn-note-edit-top" type="button" class="primary" data-i18n="menu.edit"></button>
+              <button id="btn-note-raw-top" type="button" data-i18n="web.raw"></button>
+              <button id="btn-note-delete-top" type="button" class="danger"
+                      data-i18n="menu.delete"></button>
+            </div>
+          </div>
+          <h1 id="note-title" dir="auto"></h1>
+          <p id="note-meta" class="meta-line"></p>
+          <div id="note-tags" class="chips"></div>
+          <a id="note-source" class="source-link" target="_blank" rel="noopener noreferrer" hidden></a>
+          <article id="note-body" class="preview" dir="auto"></article>
+        </div>
+
+        <div id="view-edit" class="view-pane" hidden>
+          <div class="format-toolbar">
+            <div id="format-toolbar"></div>
+            <input id="image-input" type="file" accept="image/*" multiple hidden>
+          </div>
+          <div class="editor-toolbar">
+            <span id="editor-path" class="muted" dir="auto"></span>
+            <span class="spacer"></span>
+            <select id="level-select" hidden>
+              <option value="normal" data-i18n="level.normal"></option>
+              <option value="secret" data-i18n="level.secret"></option>
+              <option value="secretfile" data-i18n="level.secretfile"></option>
+            </select>
+            <button id="btn-preview" type="button" data-i18n="web.preview"></button>
+            <button id="btn-cancel" type="button" data-i18n="web.cancel"></button>
+            <button id="btn-save" type="button" class="primary" data-i18n="web.save"></button>
+          </div>
+          <div id="dirty-indicator" class="dirty" hidden data-i18n="editor.unsaved_title"></div>
+          <div class="edit-split">
+            <textarea id="editor" spellcheck="false" dir="auto" data-i18n-placeholder="editor.placeholder"></textarea>
+            <div id="preview" class="preview" hidden></div>
+          </div>
+        </div>
+
+        <div id="view-tag" class="view-pane" hidden>
+          <nav class="breadcrumbs"><span id="tag-crumbs"></span></nav>
+          <h2 id="tag-heading"></h2>
+          <ul id="tag-results" class="notes-list"></ul>
+        </div>
+
+        <div id="view-search" class="view-pane" hidden>
+          <nav class="breadcrumbs"><span id="search-crumbs"></span></nav>
+          <h2 id="search-heading"></h2>
+          <p id="search-status" class="muted"></p>
+          <ul id="global-results" class="results"></ul>
+        </div>
+
+      </section>
+
+    </main>
+
+    <footer class="statusbar">
+      <span id="activity-banner" class="activity-banner" hidden></span>
+      <span id="foot-lock"></span>
+      <span id="foot-files"></span>
+      <span id="foot-agents"></span>
+      <span id="foot-autolock"></span>
+      <span class="spacer"></span>
+      <span class="muted" data-i18n="web.offline_hint"></span>
+    </footer>
+  </div>
+
+  <div id="modal-root"></div>
+  <div id="toast-root" class="toast-root" aria-live="polite"></div>
+  <div id="busy-overlay" class="busy-overlay" hidden>
+    <div class="spinner"></div>
+    <span data-i18n="web.busy"></span>
+  </div>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

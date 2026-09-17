@@ -8,10 +8,13 @@ and the ``source`` recorded in the append-only access log.
 
 from __future__ import annotations
 
+import base64
+import binascii
 import json
 import threading
+from collections import deque
 from datetime import datetime, timezone
-from typing import Any, Callable
+from typing import Any, Callable, Iterable
 
 from ..core import semantics
 from ..core.security import LEVELS, SOURCE_MCP, SOURCE_UI
@@ -28,7 +31,109 @@ ROLE_UI = SOURCE_UI
 ROLE_MCP = SOURCE_MCP
 ROLES = (ROLE_UI, ROLE_MCP)
 
+#: Read-only telemetry that must never write an access-log row.
+#:
+#: The status bar and the log panel poll these while the UI is open. Logging a poll writes a row
+#: per poll (measured: ~1000 rows in 18 minutes — 40 % of the whole log, i.e. the log filled
+#: itself), and the DB grows for as long as anything watches the vault. Refusals and errors are
+#: still logged: only the "allow" row of a pure telemetry read is dropped.
+QUIET_METHODS = frozenset(
+    {
+        "vault.status",
+        "vault.access_log",
+        "vault.access_log_count",
+        "vault.ping",
+        "vault.recent",
+        "vault.i18n",
+    }
+)
+
 SecretRequestCallback = Callable[[dict[str, Any]], Any]
+
+
+def _decode_content(content: str, encoding: str) -> bytes:
+    """Turn a JSON string into the bytes to store.
+
+    ``base64`` is not a Python text codec, so ``"…".encode("base64")`` raises — the web editor
+    uploads pasted images that way, so binary payloads are decoded here instead.
+    """
+    name = str(encoding or "utf-8").strip().lower()
+    if name in ("base64", "b64"):
+        try:
+            return base64.b64decode(content, validate=True)
+        except (binascii.Error, ValueError) as exc:
+            raise ValueError("invalid_base64") from exc
+    if name in ("hex", "hexadecimal"):
+        try:
+            return bytes.fromhex(content)
+        except ValueError as exc:
+            raise ValueError("invalid_hex") from exc
+    return content.encode(encoding, errors="strict")
+
+#: Maximum number of activity events kept by the UI feed (SPEC/09 §D).
+ACTIVITY_LIMIT = 200
+
+
+class ActivityFeed:
+    """A bounded, newest-first activity feed (metadata only; SPEC/09 §7).
+
+    Pure Python so it can be unit-tested without Qt. The feed never stores file
+    content — events are the metadata dicts emitted by ``VaultSession.on_activity``.
+
+    Only **agent** traffic is kept (``mcp``/``socket``) plus every secret-level event from any
+    source: the feed drives the tray's "what is being read right now" indicator, and status
+    polls, imports or a human clicking around in the GUI would drown it.
+    """
+
+    #: Sources that mean "an agent is touching the vault right now".
+    AGENT_SOURCES = ("mcp", "socket")
+    #: Sensitivity levels that always make it into the feed, whatever the source.
+    ALWAYS_LEVELS = ("secret", "secretfile")
+
+    def __init__(self, limit: int = ACTIVITY_LIMIT) -> None:
+        """Create an empty feed bounded to ``limit`` entries."""
+        self.limit = max(1, int(limit))
+        self._items: deque[dict[str, Any]] = deque(maxlen=self.limit)
+
+    def add(self, event: dict[str, Any]) -> dict[str, Any]:
+        """Append one event, dropping the oldest once the limit is reached.
+
+        Events that are neither agent traffic nor a secret/deny signal are returned unchanged
+        but **not stored** — that keeps the tray honest about who is reading what.
+        """
+        item = dict(event or {})
+        source = str(item.get("source") or "")
+        kind = str(item.get("kind") or "")
+        level = str(item.get("sensitivity") or "")
+        if source not in self.AGENT_SOURCES and level not in self.ALWAYS_LEVELS and kind != "deny":
+            return item
+        self._items.append(item)
+        return item
+
+    def events(self, limit: int | None = None) -> list[dict[str, Any]]:
+        """Return the newest-first events (optionally capped at ``limit``)."""
+        items = list(reversed(self._items))
+        return items[:limit] if limit else items
+
+    def last_read(self) -> dict[str, Any] | None:
+        """Return the most recent ``kind == "read"`` event, if any."""
+        for event in reversed(self._items):
+            if event.get("kind") == "read":
+                return event
+        return None
+
+    def clear(self) -> None:
+        """Drop every stored event."""
+        self._items.clear()
+
+    def __len__(self) -> int:
+        """Return the number of stored events."""
+        return len(self._items)
+
+    def extend(self, events: Iterable[dict[str, Any]]) -> None:
+        """Append several events in order."""
+        for event in events:
+            self.add(event)
 
 # Methods callable by each role. Anything absent from the table is unknown (``-32601``).
 _UI_ONLY = "ui"
@@ -63,7 +168,13 @@ class Service:
 
     # ------------------------------------------------------------------ dispatch
     def dispatch(
-        self, method: str, params: dict, *, role: str, session_id: str
+        self,
+        method: str,
+        params: dict,
+        *,
+        role: str,
+        session_id: str,
+        source: str | None = None,
     ) -> dict:
         """Route one command and return its result dict.
 
@@ -97,6 +208,12 @@ class Service:
                 raise PermissionDenied(
                     "method_not_allowed", details={"method": method, "role": role}
                 )
+            previous_source = getattr(self.session, "_activity_source", None)
+            self.session._activity_source = source or (
+                SOURCE_MCP if role == ROLE_MCP else "gui"
+            )
+            previous_suppress = getattr(self.session, "_suppress_log", False)
+            self.session._suppress_log = True      # this layer writes the one row for the call
             try:
                 result = handler(self, params, role, session_id)
             except PermissionDenied as exc:
@@ -117,10 +234,14 @@ class Service:
                     code=exc.code, session_id=session_id,
                 )
                 raise
-            self._log(
-                role=role, tool=method, target=target, outcome="allow",
-                session_id=session_id,
-            )
+            finally:
+                self.session._activity_source = previous_source
+                self.session._suppress_log = previous_suppress
+            if method not in QUIET_METHODS:
+                self._log(
+                    role=role, tool=method, target=target, outcome="allow",
+                    session_id=session_id,
+                )
             return result
 
     # ------------------------------------------------------------------ helpers
@@ -198,11 +319,23 @@ class Service:
         except (UnicodeDecodeError, LookupError) as exc:
             raise BadRequest("decode_error", details={"encoding": encoding}) from exc
         row = self.session.index.require_file(logical)
+        try:
+            tags = self.session.index.get_tags(logical)
+        except Exception:  # noqa: BLE001 - tags are best-effort metadata
+            tags = []
+        source_url = next(
+            (tag[len("source:") :] for tag in tags if tag.startswith("source:")),
+            None,
+        )
         return {
             "path": _api_path(logical),
             "content": content,
             "sensitivity": row["sensitivity"],
             "size": int(row["size"]),
+            "mtime": int(row["mtime"]),
+            "created": int(row.get("created", row["mtime"])),
+            "tags": tags,
+            "source_url": source_url,
         }
 
     # -------------------------------------------------------------- handlers: vault
@@ -272,8 +405,8 @@ class Service:
         if sensitivity is not None:
             sensitivity = self._text(sensitivity, param="sensitivity")
         try:
-            data = content.encode(encoding, errors="strict")
-        except (UnicodeEncodeError, LookupError) as exc:
+            data = _decode_content(content, encoding)
+        except ValueError as exc:
             raise BadRequest("encode_error", details={"encoding": encoding}) from exc
         created = self.session.index.get_file(logical) is None
         row = self.session.write_file(
@@ -465,6 +598,22 @@ class Service:
                     for item in globs
                     if str(item).strip()
                 ]
+        web = params.get("web")
+        if isinstance(web, dict):
+            current = settings.setdefault("web", {})
+            if "enabled" in web:
+                current["enabled"] = bool(web["enabled"])
+            if "host" in web:
+                current["host"] = self._text(web["host"], param="web.host")
+            if "port" in web:
+                try:
+                    current["port"] = max(0, min(65535, int(web["port"])))
+                except (TypeError, ValueError) as exc:
+                    raise BadRequest("param_must_be_int", details={"param": "web.port"}) from exc
+            if "allow_lan" in web:
+                current["allow_lan"] = bool(web["allow_lan"])
+            if "open_browser_on_start" in web:
+                current["open_browser_on_start"] = bool(web["open_browser_on_start"])
         self.session.meta.save()
         return {"updated": True, "settings": json.loads(json.dumps(settings))}
 
@@ -502,6 +651,86 @@ class Service:
         files.sort(key=lambda row: (int(row["mtime"]), row["logical_path"]), reverse=True)
         return {"entries": [self._entry(row) for row in files[: max(0, limit)]]}
 
+    # --------------------------------------------------- handlers: aggregates (web)
+    def _h_tree(self, params: dict, role: str, session_id: str) -> dict:
+        """Return the folder tree with per-subtree note counts (metadata only).
+
+        Used by the browser UI's sidebar; works while the vault is locked because it
+        only reads names/levels from the plaintext index.
+        """
+        rows = list(self.session.index.walk("/"))
+        nodes: dict[str, dict[str, Any]] = {}
+        for row in rows:
+            logical = row["logical_path"]
+            if logical == "/":
+                continue
+            nodes[logical] = {
+                "path": _api_path(logical),
+                "name": logical.rsplit("/", 1)[-1],
+                "is_dir": bool(row["is_dir"]),
+                "sensitivity": row["sensitivity"],
+                "size": int(row["size"]),
+                "mtime": int(row["mtime"]),
+                "note_count": 0,
+                "children": [],
+            }
+        roots: list[dict[str, Any]] = []
+        for logical, node in nodes.items():
+            parent = logical.rsplit("/", 1)[0] if "/" in logical else ""
+            if parent and parent in nodes and nodes[parent]["is_dir"]:
+                nodes[parent]["children"].append(node)
+            else:
+                roots.append(node)
+
+        def _count(node: dict[str, Any]) -> int:
+            """Return the number of note files in ``node``'s subtree."""
+            if not node["is_dir"]:
+                node["note_count"] = 0
+                return 1
+            total = 0
+            for child in node["children"]:
+                total += _count(child)
+            node["note_count"] = total
+            return total
+
+        for root in roots:
+            _count(root)
+
+        def _sort(items: list[dict[str, Any]]) -> None:
+            items.sort(key=lambda item: (not item["is_dir"], item["name"].lower()))
+            for item in items:
+                _sort(item["children"])
+
+        _sort(roots)
+        counts = self.session.index.count()
+        return {
+            "tree": roots,
+            "counts": {
+                "files": int(counts["files"]),
+                "folders": int(counts["dirs"]),
+                "by_level": counts["by_level"],
+            },
+        }
+
+    def _h_all_tags(self, params: dict, role: str, session_id: str) -> dict:
+        """Return every tag with its usage count."""
+        rows = self.session.index.all_tags()
+        return {
+            "tags": [
+                {"name": str(row["name"]), "count": int(row["count"])} for row in rows
+            ]
+        }
+
+    def _h_files_by_tag(self, params: dict, role: str, session_id: str) -> dict:
+        """Return every file carrying ``tag`` (metadata only)."""
+        tag = self._text(self._require(params, "tag"), param="tag")
+        rows = self.session.index.files_by_tag(tag)
+        return {
+            "tag": tag,
+            "count": len(rows),
+            "results": [self._entry(row) for row in rows],
+        }
+
     # ------------------------------------------------------------------- routing
     _ROUTES: dict[str, tuple[Any, str]] = {
         "vault.status": (_h_status, _BOTH),
@@ -534,7 +763,17 @@ class Service:
         "vault.stats": (_h_stats, _BOTH),
         "vault.verify_blobs": (_h_verify_blobs, _UI_ONLY),
         "vault.recent": (_h_recent, _BOTH),
+        "vault.tree": (_h_tree, _UI_ONLY),
+        "vault.all_tags": (_h_all_tags, _UI_ONLY),
+        "vault.files_by_tag": (_h_files_by_tag, _UI_ONLY),
     }
 
 
-__all__ = ["Service", "ROLE_UI", "ROLE_MCP", "ROLES"]
+__all__ = [
+    "Service",
+    "ROLE_UI",
+    "ROLE_MCP",
+    "ROLES",
+    "ActivityFeed",
+    "ACTIVITY_LIMIT",
+]

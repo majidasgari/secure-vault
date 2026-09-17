@@ -20,11 +20,13 @@ from ..errors import (
     NotFound,
     PermissionDenied,
     Unauthorized,
+    VaultError,
     VaultLocked,
 )
 from ..util import normalize_vault_path, now_ms, wipe
 from . import search as search_mod
 from . import semantics
+from . import retention
 from .crypto import derive_master_key
 from .index import Index
 from .meta import META_FILENAME, VaultMeta
@@ -39,6 +41,7 @@ from .store import SecureStore
 from .vaultfs import VaultFS
 
 SecretRequestCallback = Callable[[dict[str, Any]], Any]
+ActivityCallback = Callable[[dict[str, Any]], Any]
 
 
 class VaultSession:
@@ -66,6 +69,9 @@ class VaultSession:
         self._semantic_provider: semantics.EmbeddingProvider | None = None
         self._pending: dict[str, dict[str, Any]] = {}
         self.on_secret_request: SecretRequestCallback | None = None
+        # SPEC/09 §7: metadata-only activity feed hook (never carries content).
+        self.on_activity: ActivityCallback | None = None
+        self._activity_source: str | None = None
 
     # ------------------------------------------------------------------ lifecycle
     @staticmethod
@@ -134,10 +140,63 @@ class VaultSession:
             plain_threshold=self._plain_threshold,
         )
         self._store = SecureStore.open(self._home, master_key, self._runtime)
+        self._prune_access_log()
         self.touch()
+
+    def reindex_search(
+        self, progress: Callable[[str, int, int], None] | None = None
+    ) -> dict[str, int]:
+        """Rebuild the full-text index from the stored bodies (owner housekeeping).
+
+        The index is derived data: dropping and rebuilding it never touches file content, and it
+        is the only way to reclaim the millions of base64 tokens a previous version stored for
+        inline images (measured: a 253 MB store for 48 MB of notes).
+        """
+        self._require_unlocked()
+        idx = self._require_index()
+        assert self._store is not None
+        previous = getattr(self, "_suppress_log", False)
+        self._suppress_log = True          # bulk housekeeping must not flood the audit log
+        try:
+            dropped = self._store.reset_index()
+            files = [row for row in idx.walk("/") if not int(row["is_dir"])]
+            indexed = 0
+            for position, row in enumerate(files, start=1):
+                if str(row.get("sensitivity") or "normal") == "normal":
+                    try:
+                        data = self.read_file(str(row["logical_path"]), source=SOURCE_UI)
+                    except VaultError:
+                        data = b""
+                    if data:
+                        self._store.index_text(
+                            int(row["id"]), data.decode("utf-8", errors="ignore")
+                        )
+                        indexed += 1
+                if progress is not None and (position % 25 == 0 or position == len(files)):
+                    progress("reindex", position, len(files))
+            self._store.vacuum()
+            self._store.flush()
+        finally:
+            self._suppress_log = previous
+        return {"dropped": dropped, "indexed": indexed, "files": len(files)}
+
+    def _prune_access_log(self) -> None:
+        """Keep the audit log bounded (newest rows win; failures never block unlocking).
+
+        Retention lives in :mod:`vault.core.retention` so the data layer
+        (:mod:`vault.core.index`) stays free of any DELETE on the log.
+        """
+        if self._index is None:
+            return
+        try:
+            retention.prune_access_log(self._index)
+        except Exception:  # noqa: BLE001 - housekeeping must never block the user
+            return
 
     def lock(self) -> None:
         """Flush, wipe the master key and close the store and index."""
+        if self._index is not None:
+            self._prune_access_log()
         if self._store is not None:
             self._store.close()
             self._store = None
@@ -227,7 +286,14 @@ class VaultSession:
         details: str | None = None,
         session: str | None = None,
     ) -> None:
-        """Append an access-log row, never letting logging failure mask the operation."""
+        """Append an access-log row, never letting logging failure mask the operation.
+
+        While an API dispatch is running the *service* owns the single row for the call (so the
+        tool column carries the API method name), and core-level rows are suppressed — otherwise
+        every real read/write produced two rows.
+        """
+        if getattr(self, "_suppress_log", False):
+            return
         try:
             self._require_index().log_access(
                 source=source,
@@ -261,6 +327,42 @@ class VaultSession:
             session=session,
         )
         raise PermissionDenied(reason, details={"path": path})
+
+    def _emit_activity(
+        self,
+        *,
+        kind: str,
+        tool: str,
+        path: str | None,
+        sensitivity: str | None,
+        outcome: str,
+        bytes: int | None = None,
+        session: str | None = None,
+    ) -> None:
+        """Emit one metadata-only activity event (SPEC/09 §7).
+
+        The event carries the path, level, source, tool, outcome and byte count — never
+        any content. The transport source defaults to ``gui`` and is overridden by
+        :class:`~vault.api.service.Service` while a call is being dispatched.
+        """
+        callback = self.on_activity
+        if callback is None:
+            return
+        event = {
+            "ts": now_ms(),
+            "source": self._activity_source or "gui",
+            "tool": tool,
+            "path": path,
+            "sensitivity": sensitivity,
+            "outcome": outcome,
+            "bytes": bytes,
+            "session": session,
+            "kind": kind,
+        }
+        try:
+            callback(event)
+        except Exception:  # noqa: BLE001 - the feed must never break an operation
+            pass
 
     # ------------------------------------------------------------------- properties
     @property
@@ -329,6 +431,10 @@ class VaultSession:
         """List the direct children of ``path`` (metadata only; works while locked)."""
         logical = normalize_vault_path(path)
         entries = self._require_index().list_dir(logical)
+        self._emit_activity(
+            kind="list", tool="list_folder", path=logical, sensitivity=None,
+            outcome="allow",
+        )
         return {"path": logical, "entries": entries}
 
     def read_file(
@@ -341,13 +447,29 @@ class VaultSession:
             PermissionDenied: when the source may not read this level.
         """
         logical = normalize_vault_path(path)
-        self._require_unlocked()
+        try:
+            self._require_unlocked()
+        except VaultLocked:
+            self._emit_activity(
+                kind="read", tool="read_file", path=logical, sensitivity=None,
+                outcome="deny", session=session,
+            )
+            raise
         row = self._require_index().require_file(logical)
         if int(row["is_dir"]):
             raise BadRequest("is_directory", details={"path": logical})
         if not Policy.can_read_content(row["sensitivity"], source):
+            self._emit_activity(
+                kind="read", tool="read_file", path=logical,
+                sensitivity=row["sensitivity"], outcome="deny", session=session,
+            )
             self._deny("read_file", logical, source, "content_forbidden", session)
         data = self.fs.read_bytes(row)
+        self._emit_activity(
+            kind="read", tool="read_file", path=logical,
+            sensitivity=row["sensitivity"], outcome="allow", bytes=len(data),
+            session=session,
+        )
         self._log(
             source=source, tool="read_file", target_path=logical, outcome="allow",
             session=session,
@@ -444,6 +566,14 @@ class VaultSession:
         self._log(
             source=source, tool="write_file", target_path=logical, outcome="allow"
         )
+        self._emit_activity(
+            kind="write",
+            tool="write_file",
+            path=logical,
+            sensitivity=desired,
+            outcome="allow",
+            bytes=size,
+        )
         return self._require_index().require_file(logical)
 
     def write_lines(
@@ -504,6 +634,9 @@ class VaultSession:
         idx.upsert_file(logical, is_dir=True, sensitivity="normal", source=source)
         self.flush()
         self._log(source=source, tool="mkdir", target_path=logical, outcome="allow")
+        self._emit_activity(
+            kind="mkdir", tool="mkdir", path=logical, sensitivity=None, outcome="allow"
+        )
         return idx.require_file(logical)
 
     def move(self, src: str, dst: str, *, source: str = SOURCE_UI) -> dict[str, Any]:
@@ -516,6 +649,9 @@ class VaultSession:
         idx.move(source_path, dest_path)
         self.flush()
         self._log(source=source, tool="move", target_path=dest_path, outcome="allow")
+        self._emit_activity(
+            kind="move", tool="move", path=dest_path, sensitivity=None, outcome="allow"
+        )
         return idx.require_file(dest_path)
 
     def copy(self, src: str, dst: str, *, source: str = SOURCE_UI) -> dict[str, Any]:
@@ -577,6 +713,9 @@ class VaultSession:
             self._store.remove_file(int(row["id"]))
         self.flush()
         self._log(source=source, tool="delete", target_path=logical, outcome="allow")
+        self._emit_activity(
+            kind="delete", tool="delete", path=logical, sensitivity=None, outcome="allow"
+        )
         return {
             "path": logical,
             "deleted": len(removed),
@@ -673,6 +812,10 @@ class VaultSession:
     ) -> list[dict[str, Any]]:
         """Search filenames (all levels, names only)."""
         results = search_mod.search_filenames(self, query, limit=limit)
+        self._emit_activity(
+            kind="search", tool="search_filenames", path=None, sensitivity=None,
+            outcome="allow",
+        )
         self._log(source=source, tool="search_filenames", outcome="allow")
         return results
 
@@ -682,6 +825,10 @@ class VaultSession:
         """Search literal content (``normal`` files only)."""
         self._require_unlocked()
         results = search_mod.search_text(self, query, limit=limit)
+        self._emit_activity(
+            kind="search", tool="search_text", path=None, sensitivity=None,
+            outcome="allow",
+        )
         self._log(source=source, tool="search_text", outcome="allow")
         return results
 
@@ -691,6 +838,10 @@ class VaultSession:
         """Search by embedding similarity (``normal`` files only)."""
         self._require_unlocked()
         results = search_mod.search_semantic(self, query, limit=limit)
+        self._emit_activity(
+            kind="search", tool="search_semantic", path=None, sensitivity=None,
+            outcome="allow",
+        )
         self._log(source=source, tool="search_semantic", outcome="allow")
         return results
 
@@ -709,6 +860,10 @@ class VaultSession:
         if row["sensitivity"] != "secretfile" or not Policy.can_request_open_secret(
             row["sensitivity"], source
         ):
+            self._emit_activity(
+                kind="read", tool="request_open_secret", path=logical,
+                sensitivity=row["sensitivity"], outcome="deny", session=session,
+            )
             self._deny(
                 "request_open_secret", logical, source, "only_secretfile", session
             )

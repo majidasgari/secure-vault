@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import ipaddress
 import os
 import time
 import unicodedata
@@ -98,6 +99,19 @@ def normalize_logical_path(raw: str) -> str:
     if len(result.encode("utf-8")) > _MAX_PATH_BYTES:
         raise InvalidPath("path_too_long", details={"path": raw})
     return result
+
+
+def is_loopback(host: str) -> bool:
+    """Return True for ``localhost`` and any loopback IP literal.
+
+    Lives in this leaf module so both ``vault.web`` and ``vault.web.api`` can use it without an
+    import cycle.
+    """
+    text = str(host or "").strip().strip("[]")
+    try:
+        return ipaddress.ip_address(text).is_loopback
+    except ValueError:
+        return text == "localhost"
 
 
 def normalize_vault_path(raw: str) -> str:

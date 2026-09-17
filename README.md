@@ -27,8 +27,13 @@ set: Python, PySide6, `cryptography`, `argon2-cffi`, `markdown-it-py` and Pygmen
 
 ## Status
 
-* Core, socket API, MCP bridge, Qt UI, Joplin importer, desktop integration and the
-  Windows portable **builder** are implemented; the 200-case test suite is green.
+* Core, socket API, MCP bridge, Qt UI, browser web UI (with Joplin-mirror parity),
+  Joplin importer, tray shell, desktop integration and the Windows portable
+  **builder** are implemented.
+* The **tray is the always-on shell**: it starts the web UI automatically in-process,
+  gates `secret`/`secretfile` reads with a Copy dialog, and always shows which file is
+  being read right now (activity feed + tooltip + SSE). The Qt markdown editor is
+  bidi-correct per block and can open the current note in the browser.
 * The GUI has **not** been verified on a real screen yet — only headless/offscreen.
   Fonts, RTL, tray, notifications and the KDE menu icon must be checked by hand.
 * The Windows portable build is **produced but not verified on Windows** (see
@@ -75,8 +80,10 @@ QT_QPA_PLATFORM=offscreen PYTHONPATH=src ./.venv/bin/python -m vault --self-test
 ## Quick tour
 
 * **Browser** (left dock): a tree of folders/files with a sensitivity label per entry.
-* **Editor**: markdown source with a live preview for `normal` files. For `secret`
-  files the preview is disabled; `secretfile` files never reach the editor at all.
+* **Editor**: markdown source with a live preview for `normal` files, per-block
+  RTL/LTR formatting (auto / RTL / LTR, `Ctrl+Shift+D`) and monospace fences. For
+  `secret` files the preview is disabled; `secretfile` files never reach the editor
+  at all. **ویرایش در مرورگر** opens the current note in the web UI.
 * **Sensitivity levels**: right-click a file → *Set level* → `normal`, `secret` or
   `secretfile`. Lowering requires confirmation and is only possible from the UI.
 * **Secret viewer**: a native plain-text window (no web engine) for `secretfile`
@@ -84,8 +91,10 @@ QT_QPA_PLATFORM=offscreen PYTHONPATH=src ./.venv/bin/python -m vault --self-test
 * **Search** (right dock): three separate searches — filenames, literal content
   (FTS5) and semantic (opt-in) — never hybridized.
 * **Log panel** (right dock): the append-only access log; every agent call is there.
-* **Tray**: lock, show, search and settings; `secret` opens raise a desktop
-  notification, and an agent `request_open_secret` pops a dialog on your desktop.
+* **Tray**: the always-on shell — open/copy the web UI link, lock, the last reads
+  (with a 🔑 badge for recent secret reads), settings and quit. `secret` reads raise a
+  desktop notification, an agent `request_open_secret` pops a **Show & copy** dialog
+  on your desktop, and the tooltip always names the file being read.
 
 ## Giving agents access (MCP)
 
@@ -124,6 +133,33 @@ search the content of `normal` files, read/write folder notes, **raise** a level
 (never lower), and ask you to display a `secretfile`. What they can **never** do:
 read `secret`/`secretfile` content, search it, lower a level, or receive the content
 of a `request_open_secret` call. See `docs/MCP.md` for the full tool reference.
+
+## Using it from a browser (web UI)
+
+The same vault is also usable from any browser on the machine (or, explicitly
+opted in, the LAN). The web process owns the session; the keys never leave it.
+
+```bash
+./bin/secure-vault-web --home /path/to/vault --port 8788
+# or: PYTHONPATH=src ./.venv/bin/python -m vault.web --port 0
+```
+
+It prints the URL and a one-time **access token** on stderr. Open the URL, paste the
+token and the master password. Every `/api/*` request needs the token in the
+`X-Vault-Token` header — the cookie set by the `/?token=…` link is deliberately
+*not* enough to authorise a call. Persian-first, RTL, responsive down to a phone,
+and fully offline (no CDN, no build step). The SPA has the same features as the
+Joplin-mirror browser — dark theme with a light toggle, one global search box, a
+collapsible folder tree with per-subtree note counts, tag chips, folder/note/raw/
+edit views with a formatting toolbar, and a parity `/api/index` + `/api/search` +
+`/api/raw` surface. `--allow-lan` is required to bind a non-loopback host. See
+`docs/WEBUI.md` for the token flow, the API and the security caveats.
+
+**You normally do not start it by hand.** The Qt app is the shell: after unlock it
+starts the same `WebServer` in-process on the same session (`web.enabled`, default
+true) and the tray menu opens/copies the token URL. If another instance already owns
+the port/token, the app does not take over the vault and points the tray at the
+already-running instance instead.
 
 ## Importing from Joplin
 
@@ -165,8 +201,11 @@ keep secrets in small files. The master password is never stored. See
 Everything runs offline with the stdlib `unittest` runner:
 
 ```bash
-./.venv/bin/python tests/run_tests.py                              # 200 cases
+./.venv/bin/python tests/run_tests.py                              # all suites
 ./.venv/bin/python tests/run_tests.py --only test_session          # one suite
+./.venv/bin/python tests/run_tests.py --only test_web              # the web UI suite
+./.venv/bin/python tests/run_tests.py --only test_activity         # the activity feed
+./.venv/bin/python tests/run_tests.py --only test_bidi             # editor bidi rules
 QT_QPA_PLATFORM=offscreen ./.venv/bin/python tests/test_ui_smoke.py
 ./.venv/bin/python tools/smoke_e2e.py
 ./.venv/bin/python tools/smoke_mcp.py
@@ -180,13 +219,13 @@ file for the scratch-vault recipe and the list of things you must verify by hand
 
 ```
 secure-vault/
-├── bin/                 secure-vault, secure-vault-mcp launchers
+├── bin/                 secure-vault, secure-vault-mcp, secure-vault-web launchers
 ├── assets/              icon.svg + Vazirmatn fonts
 ├── i18n/                fa.json, en.json UI catalogues
-├── src/vault/           the package (core, api, ui, importers)
+├── src/vault/           the package (core, api, ui, web, webui, importers)
 ├── tests/               unittest suites + run_tests.py
 ├── tools/               bootstrap, desktop install, importer CLI, smoke scripts, Windows builder
-├── docs/                ARCHITECTURE, SECURITY, MCP, SYNC, IMPORT_JOPLIN, WINDOWS, TESTING
+├── docs/                ARCHITECTURE, SECURITY, MCP, SYNC, IMPORT_JOPLIN, WINDOWS, TESTING, WEBUI
 └── portable/win/        output of the Windows builder (git-ignored)
 ```
 

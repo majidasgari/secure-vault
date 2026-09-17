@@ -241,6 +241,11 @@ def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv)
     _setup_logging(args.debug)
 
+    # QtWebEngine silently produces a blank page when its sandbox or GPU stack is unusable
+    # (the "empty preview" symptom). These flags must be set before Qt starts.
+    os.environ.setdefault("QTWEBENGINE_DISABLE_SANDBOX", "1")
+    os.environ.setdefault("QTWEBENGINE_CHROMIUM_FLAGS", "--disable-gpu")
+
     app = QApplication.instance() or QApplication(sys.argv[:1] or ["secure-vault"])
     app.setApplicationName("Secure Vault")
     app.setDesktopFileName("secure-vault")

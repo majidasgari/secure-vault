@@ -6,7 +6,7 @@ import logging
 from pathlib import Path
 from typing import Any
 
-from PySide6.QtCore import QUrl
+from PySide6.QtCore import Qt, QUrl
 from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import (
     QCheckBox,
@@ -54,6 +54,7 @@ class SettingsDialog(QDialog):
         self._build_vault()
         self._build_semantic()
         self._build_importer()
+        self._build_web()
         self._build_log()
 
         self.buttons = QDialogButtonBox(self)
@@ -158,6 +159,40 @@ class SettingsDialog(QDialog):
         self.import_button = QPushButton(page)
         self.import_button.clicked.connect(self._run_import)
         form.addRow(self.import_button)
+        self.reindex_button = QPushButton(page)
+        self.reindex_button.clicked.connect(self._run_reindex)
+        form.addRow(self.reindex_button)
+        self.tabs.addTab(page, "")
+
+    def _build_web(self) -> None:
+        """Build the Web UI tab (SPEC/09 §A.1)."""
+        page = QWidget(self)
+        form = QFormLayout(page)
+        web = self._settings.get("web") or {}
+        self.web_enabled = QCheckBox(page)
+        self.web_enabled.setChecked(bool(web.get("enabled", True)))
+        form.addRow(self._label("settings.web_enabled"), self.web_enabled)
+        self.web_host = QLineEdit(str(web.get("host", "127.0.0.1")), page)
+        form.addRow(self._label("settings.web_host"), self.web_host)
+        self.web_port = QSpinBox(page)
+        self.web_port.setRange(0, 65535)
+        self.web_port.setValue(int(web.get("port", 8788) or 0))
+        form.addRow(self._label("settings.web_port"), self.web_port)
+        self.web_lan = QCheckBox(page)
+        self.web_lan.setChecked(bool(web.get("allow_lan", False)))
+        form.addRow(self._label("settings.web_allow_lan"), self.web_lan)
+        self.web_open = QCheckBox(page)
+        self.web_open.setChecked(bool(web.get("open_browser_on_start", False)))
+        form.addRow(self._label("settings.web_open_browser"), self.web_open)
+        self.web_url = QLabel(page)
+        self.web_url.setWordWrap(True)
+        self.web_url.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        web_server = getattr(self._controller, "web", None)
+        if web_server is not None:
+            self.web_url.setText(f"http://{web_server.host}:{web_server.port}/")
+        else:
+            self.web_url.setText("—")
+        form.addRow(self._label("settings.web_url"), self.web_url)
         self.tabs.addTab(page, "")
 
     def _build_log(self) -> None:
@@ -229,6 +264,11 @@ class SettingsDialog(QDialog):
         self._on_accept()
         self._controller.import_joplin()
 
+    def _run_reindex(self) -> None:
+        """Rebuild the full-text index (reclaims the inline-base64 bloat in the store)."""
+        self._on_accept()
+        self._controller.reindex_search()
+
     # ------------------------------------------------------------------ accept
     def _on_accept(self) -> None:
         """Persist the settings through the service."""
@@ -249,6 +289,13 @@ class SettingsDialog(QDialog):
                     for part in self.globs_edit.text().split(",")
                     if part.strip()
                 ],
+            },
+            "web": {
+                "enabled": bool(self.web_enabled.isChecked()),
+                "host": self.web_host.text().strip() or "127.0.0.1",
+                "port": int(self.web_port.value()),
+                "allow_lan": bool(self.web_lan.isChecked()),
+                "open_browser_on_start": bool(self.web_open.isChecked()),
             },
         }
         try:
@@ -271,7 +318,8 @@ class SettingsDialog(QDialog):
         self.tabs.setTabText(1, i18n.tr("settings.tab_vault"))
         self.tabs.setTabText(2, i18n.tr("settings.tab_semantic"))
         self.tabs.setTabText(3, i18n.tr("settings.tab_importer"))
-        self.tabs.setTabText(4, i18n.tr("settings.tab_log"))
+        self.tabs.setTabText(4, i18n.tr("settings.tab_web"))
+        self.tabs.setTabText(5, i18n.tr("settings.tab_log"))
         self.language_combo.setItemText(0, i18n.tr("language.fa"))
         self.language_combo.setItemText(1, i18n.tr("language.en"))
         for index, level in enumerate(_LEVELS):
@@ -281,6 +329,7 @@ class SettingsDialog(QDialog):
         self.threshold_hint.setText(i18n.tr("settings.plain_threshold_hint"))
         self.index_button.setText(i18n.tr("settings.semantic_index"))
         self.import_button.setText(i18n.tr("settings.run_import"))
+        self.reindex_button.setText(i18n.tr("settings.reindex"))
         self.open_log_button.setText(i18n.tr("settings.open_log"))
         self._refresh_semantic_status()
 

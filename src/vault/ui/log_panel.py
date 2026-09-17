@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import csv
+import time
 from typing import Any, Callable
 
+from PySide6.QtCore import QTimer
 from PySide6.QtWidgets import (
     QComboBox,
     QFileDialog,
@@ -20,6 +22,8 @@ from PySide6.QtWidgets import (
 from . import i18n
 
 _OUTCOMES = ("", "allow", "deny", "error")
+#: Minimum time between two automatic log reloads (a poll would otherwise run per notification).
+_REFRESH_MS = 1500
 _OUTCOME_KEYS = {
     "": "log.filter_all",
     "allow": "log.filter_allow",
@@ -38,6 +42,10 @@ class LogPanel(QWidget):
         super().__init__(parent)
         self._call = call
         self._rows: list[dict] = []
+        self._last_refresh = 0.0
+        self._refresh_timer = QTimer(self)
+        self._refresh_timer.setSingleShot(True)
+        self._refresh_timer.timeout.connect(self._reload)
 
         layout = QVBoxLayout(self)
         controls = QHBoxLayout()
@@ -69,7 +77,27 @@ class LogPanel(QWidget):
 
     # ------------------------------------------------------------------ data
     def refresh(self) -> None:
-        """Reload the log rows for the active filter."""
+        """Reload the log rows for the active filter, right now."""
+        self._reload()
+
+    def refresh_soon(self) -> None:
+        """Reload at most once every :data:`_REFRESH_MS` (used by background notifications).
+
+        A log query no longer writes a log row of its own, but a panel that reloads on every
+        notification would still hammer the DB while an agent works. Explicit calls to
+        :meth:`refresh` (the Refresh button, a filter change, the self-test) always run.
+        """
+        now = time.monotonic()
+        elapsed = now - self._last_refresh
+        if elapsed < _REFRESH_MS / 1000.0:
+            if not self._refresh_timer.isActive():
+                self._refresh_timer.start(int(_REFRESH_MS - elapsed * 1000))
+            return
+        self._reload()
+
+    def _reload(self) -> None:
+        """Query the vault and repaint the table (the actual work of :meth:`refresh`)."""
+        self._last_refresh = time.monotonic()
         outcome = self.filter_combo.currentData() or ""
         params: dict[str, Any] = {"limit": 500}
         if outcome:

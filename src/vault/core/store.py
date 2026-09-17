@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import atexit
 import os
+import re
 import sqlite3
 import uuid
 from pathlib import Path
@@ -22,6 +23,21 @@ from .crypto import decrypt_blob, encrypt_blob
 
 STORE_FILENAME = "secure.store"
 STORE_BLOB_ID = "secure.store"
+
+#: ``data:`` URIs (inline images) are gigabytes of base64 that no search should ever index.
+#: Measured on a real vault: 31 MB of base64 produced a 253 MB store (136 MB of content +
+#: 117 MB of index structures) because every base64 "word" became a unique token.
+_DATA_URI_RE = re.compile(r"data:[a-zA-Z0-9.+/-]+;base64,[A-Za-z0-9+/=\s]{64,}")
+#: Hard cap on how much of one file goes into the FTS index (characters).
+MAX_INDEX_CHARS = 200_000
+
+
+def indexable_text(text: str) -> str:
+    """Return the searchable part of ``text``: no inline base64, no unbounded blobs."""
+    cleaned = _DATA_URI_RE.sub(" ", text)
+    if len(cleaned) > MAX_INDEX_CHARS:
+        cleaned = cleaned[:MAX_INDEX_CHARS]
+    return cleaned
 
 
 def _dec_path(runtime: Path) -> Path:
@@ -247,10 +263,14 @@ class SecureStore:
 
     # --------------------------------------------------------------- content index
     def index_text(self, file_id: int, text: str) -> None:
-        """Replace the FTS row for ``file_id`` with the normalized form of ``text``."""
+        """Replace the FTS row for ``file_id`` with the normalized form of ``text``.
+
+        Only the searchable part is stored (see :func:`indexable_text`); the digest is taken over
+        the *whole* text so a change is still detected.
+        """
         if self._conn is None:
             raise NotFound("store_closed")
-        normalized = normalize_fa(text)
+        normalized = normalize_fa(indexable_text(text))
         self._conn.execute("DELETE FROM fts_content WHERE rowid=?", (int(file_id),))
         self._conn.execute(
             "INSERT INTO fts_content(rowid, body, file_id) VALUES(?,?,?)",
@@ -363,6 +383,30 @@ class SecureStore:
         self._dirty = True
         self._conn.commit()
         return int(cur.rowcount if cur.rowcount is not None else 0)
+
+    def reset_index(self) -> int:
+        """Drop every FTS row and content digest so the index can be rebuilt from scratch.
+
+        Used by the "rebuild search index" action: a store written before data URIs were
+        filtered still carries megabytes of base64 tokens that only a rebuild can reclaim.
+        """
+        if self._conn is None:
+            return 0
+        rows = int(self._conn.execute("SELECT COUNT(*) FROM fts_content").fetchone()[0])
+        self._conn.execute("DELETE FROM fts_content")
+        self._conn.execute("DELETE FROM content_meta")
+        self._dirty = True
+        self._conn.commit()
+        return rows
+
+    def vacuum(self) -> None:
+        """Compact the decrypted database (reclaims the pages left by rewritten rows)."""
+        if self._conn is None:
+            return
+        self._conn.commit()
+        self._conn.execute("VACUUM")
+        self._conn.commit()
+        self._dirty = True
 
     # ----------------------------------------------------------------------- stats
     def stats(self) -> dict[str, Any]:

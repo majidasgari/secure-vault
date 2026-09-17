@@ -30,12 +30,22 @@ def _new_vault(tmp: Path, pw: str = PASSWORD, **kw):
 
 
 class InvariantsTest(unittest.TestCase):
-    """Ordered tests; later tests depend on state created by earlier ones."""
+    """Ordered tests; later tests build on state created by earlier ones."""
 
     @classmethod
     def setUpClass(cls) -> None:
         cls.tmp = Path(tempfile.mkdtemp(prefix="sv-verify-"))
         cls.state: dict = {}
+
+    def setUp(self) -> None:
+        """Keep the suite order-independent: never inherit a locked vault from a failure.
+
+        A failing step used to leave the shared session locked, which then produced a cascade
+        of ``VaultLocked`` errors in the following steps and hid the real failure.
+        """
+        session = self.state.get("s")
+        if session is not None and session.is_locked:
+            session.unlock(PASSWORD)
 
     @classmethod
     def tearDownClass(cls) -> None:
@@ -97,15 +107,20 @@ class InvariantsTest(unittest.TestCase):
         assert store.exists(), "secure.store missing"
         assert store.read_bytes()[:4] not in (b"SQLi",), "store looks like a raw sqlite file"
         rtdir = Path(os.environ.get("XDG_RUNTIME_DIR", "/tmp")) / "secure-vault"
-        cands = list(rtdir.glob("**/*.dec")) if rtdir.exists() else []
-        assert cands, f"no decrypted store under {rtdir}"
-        for cand in cands:
-            mode = cand.stat().st_mode & 0o777
-            assert mode == 0o600, f"{cand} mode {oct(mode)} != 0600"
-            assert home not in cand.parents, f"decrypted store inside the vault home: {cand}"
+        # This session's own decrypted store (the file name is per instance; another vault
+        # process — the user's running app or web UI — legitimately holds its own file, so the
+        # assertions below are about OUR file, never about "no .dec exists anywhere").
+        own = Path(getattr(s.store, "_dec_path"))
+        assert own.exists(), f"this session's decrypted store is missing: {own}"
+        assert own.parent == rtdir, f"{own} is not under {rtdir}"
+        assert rtdir.exists() and (rtdir.stat().st_mode & 0o777) == 0o700, "runtime dir must be 0700"
+        mode = own.stat().st_mode & 0o777
+        assert mode == 0o600, f"{own} mode {oct(mode)} != 0600"
+        assert home not in own.parents, f"decrypted store inside the vault home: {own}"
+        for cand in rtdir.glob("store.*.dec"):
+            assert home not in cand.parents, f"a decrypted store sits inside a vault home: {cand}"
         s.lock()
-        left = list(rtdir.glob("**/*.dec")) if rtdir.exists() else []
-        assert not left, f"decrypted store still present after lock: {left}"
+        assert not own.exists(), f"this session's decrypted store survived lock: {own}"
         s.unlock(PASSWORD)
 
     # ---------------------------------------------------------------- 05

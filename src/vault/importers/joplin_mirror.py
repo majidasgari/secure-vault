@@ -124,6 +124,18 @@ class JoplinMirrorImporter:
         self.assets_folder = DEFAULT_ASSETS_FOLDER
         self._assets: dict[str, str] = {}
         self._run_assets: dict[str, str] = {}
+        #: Live progress for a UI (plain values, safe to poll from another thread).
+        self.progress: dict[str, Any] = {
+            "phase": "",
+            "phase_done": 0,
+            "phase_total": 0,
+            "done": 0,
+            "total": 0,
+            "percent": 0,
+            "finished": False,
+        }
+        self._phase_totals: dict[str, int] = {}
+        self._phase_done: dict[str, int] = {}
 
     # --------------------------------------------------------------------- public
     def run(
@@ -135,10 +147,13 @@ class JoplinMirrorImporter:
     ) -> ImportReport:
         """Import the mirror into ``session`` and return the report.
 
-        ``dry_run`` counts everything but writes nothing.
+        ``dry_run`` counts everything but writes nothing. :attr:`progress` is updated as the
+        run advances so a UI can show a real percentage instead of an indeterminate bar.
         """
         started = now_ms()
         self._run_assets = {}
+        self._phase_totals = {}
+        self._phase_done = {}
         report = ImportReport(
             source=str(self.mirror_root), started=started, finished=started, dry_run=bool(dry_run)
         )
@@ -165,6 +180,23 @@ class JoplinMirrorImporter:
 
         notebooks = list(manifest.get("notebooks") or [])
         notes = list(manifest.get("notes") or [])
+        note_paths = {str(note.get("path")) for note in notes if note.get("path")}
+        asset_filenames = set(self._assets.values())
+        strays = (
+            self._stray_candidates(note_paths, asset_filenames)
+            if self.include_stray_md
+            else []
+        )
+        # Totals for the progress bar: every phase is known before the work starts (the strays
+        # need one cheap scan). Without this the dialog could only show an indeterminate bar.
+        self._phase_totals = {
+            "folders": len(notebooks),
+            "notes": len(notes),
+            "assets": len(self._assets) if self.import_assets else 0,
+            "strays": len(strays),
+        }
+        self._phase_done = {name: 0 for name in self._phase_totals}
+        self._advance("folders", 0, self._phase_totals["folders"])
         self._import_folders(session, report, notebooks, dry_run)
 
         tracked = self._tracked_paths(session.index, "joplin:note:")
@@ -174,14 +206,14 @@ class JoplinMirrorImporter:
                 self._import_note(session, report, note, dry_run, tracked)
             except Exception as exc:  # noqa: BLE001 - one bad note must not stop the run
                 self._error(report, str(note.get("path")), exc)
+            self._advance("notes", position, total)
             self._tick(progress, "notes", position, total)
 
-        note_paths = {str(note.get("path")) for note in notes if note.get("path")}
-        asset_filenames = set(self._assets.values())
         if self.import_assets:
             self._import_all_assets(session, report, dry_run)
-        self._import_strays(session, report, note_paths, asset_filenames, dry_run)
+        self._import_strays(session, report, strays, dry_run)
 
+        self.progress["finished"] = True
         report.finished = now_ms()
         return report
 
@@ -223,8 +255,9 @@ class JoplinMirrorImporter:
         ordered = sorted(
             notebooks, key=lambda item: str(item.get("path") or "").count("/")
         )
-        for notebook in ordered:
+        for position, notebook in enumerate(ordered, start=1):
             raw = str(notebook.get("path") or notebook.get("name") or "")
+            self._advance("folders", position, len(ordered))
             try:
                 logical = sanitize(raw)
             except VaultError as exc:
@@ -433,7 +466,10 @@ class JoplinMirrorImporter:
         (SPEC/04 §2.2 rule 6). The importer therefore materialises the whole resource set;
         link rewriting in the note bodies happens independently where refs exist.
         """
-        for resource_id, filename in sorted(self._assets.items()):
+        for position, (resource_id, filename) in enumerate(
+            sorted(self._assets.items()), start=1
+        ):
+            self._advance("assets", position, len(self._assets))
             try:
                 self._import_asset(
                     session, report, resource_id, filename, self.default_level, dry_run
@@ -441,17 +477,17 @@ class JoplinMirrorImporter:
             except Exception as exc:  # noqa: BLE001 - one bad asset must not stop the run
                 self._error(report, f"assets/{filename}", exc)
 
-    def _import_strays(
-        self,
-        session: Any,
-        report: ImportReport,
-        note_paths: set[str],
-        asset_filenames: set[str],
-        dry_run: bool,
-    ) -> None:
-        """Import stray ``*.md`` files that the manifest does not describe."""
-        if not self.include_stray_md or not self.mirror_root.is_dir():
-            return
+    def _stray_candidates(
+        self, note_paths: set[str], asset_filenames: set[str]
+    ) -> list[tuple[Path, str]]:
+        """Return every mirror ``*.md`` that the manifest does not describe.
+
+        Computed before the run so the progress bar knows the strays phase's size; the same list
+        is what :meth:`_import_strays` then imports.
+        """
+        found: list[tuple[Path, str]] = []
+        if not self.mirror_root.is_dir():
+            return found
         for path in sorted(self.mirror_root.rglob("*.md")):
             relative = path.relative_to(self.mirror_root).as_posix()
             parts = relative.split("/")
@@ -461,6 +497,22 @@ class JoplinMirrorImporter:
                 continue
             if parts[0] == "assets" and "/".join(parts[1:]) in asset_filenames:
                 continue
+            found.append((path, relative))
+        return found
+
+    def _import_strays(
+        self,
+        session: Any,
+        report: ImportReport,
+        strays: Iterable[tuple[Path, str]],
+        dry_run: bool,
+    ) -> None:
+        """Import stray ``*.md`` files that the manifest does not describe."""
+        if not self.include_stray_md:
+            return
+        items = list(strays)
+        for position, (path, relative) in enumerate(items, start=1):
+            self._advance("strays", position, len(items))
             try:
                 self._import_stray(session, report, path, relative, dry_run)
             except Exception as exc:  # noqa: BLE001 - one bad stray must not stop the run
@@ -589,6 +641,31 @@ class JoplinMirrorImporter:
         """Append one structured error to the report."""
         code = getattr(exc, "code", type(exc).__name__)
         report.errors.append({"path": path, "error": str(exc), "code": code})
+
+    def _advance(self, phase: str, done: int, total: int) -> None:
+        """Record how far ``phase`` has gone and publish the overall percentage.
+
+        The UI polls :attr:`progress` (plain ints and strings, safe from another thread) so the
+        dialog can show ``n%  (done/total)`` instead of an indeterminate bar: with 876 notes and
+        no feedback the user cannot tell a working import from a stuck one.
+        """
+        if not self._phase_totals:
+            return
+        safe_done = max(0, int(done))
+        self._phase_done[phase] = safe_done
+        overall_total = sum(int(value) for value in self._phase_totals.values()) or 1
+        overall_done = sum(
+            min(int(self._phase_done.get(name, 0)), max(int(limit), 0))
+            for name, limit in self._phase_totals.items()
+        )
+        self.progress.update(
+            phase=phase,
+            phase_done=safe_done,
+            phase_total=max(0, int(total)),
+            done=overall_done,
+            total=overall_total,
+            percent=int(round(100.0 * overall_done / overall_total)),
+        )
 
     @staticmethod
     def _tick(

@@ -33,12 +33,16 @@ class MainWindow(QMainWindow):
         super().__init__(parent)
         self.controller = controller
         self._current_path: str | None = None
+        self._last_read: dict | None = None
         self._quitting = False
         self.setObjectName("main-window")
         self.resize(1180, 760)
 
         self.editor = EditorPanel(self)
         self.editor.save_requested.connect(self._on_save_requested)
+        # NOTE: ``open_in_browser`` is wired once, in VaultApplication._build_main_window.
+        # Wiring it here as well emitted two identical requests and opened two browser tabs.
+        self.editor.open_text_editor.connect(controller.open_in_text_editor)
         self.setCentralWidget(self.editor)
 
         self.browser = BrowserPanel(controller, self)
@@ -85,6 +89,13 @@ class MainWindow(QMainWindow):
         self.count_label = QLabel(self)
         self.mcp_label = QLabel(self)
         bar = self.statusBar()
+        # Inside a Persian window the mixed Latin/Persian pieces must not be re-ordered by the
+        # bidi algorithm, which is what made the bar look scrambled.
+        bar.setLayoutDirection(
+            Qt.LayoutDirection.RightToLeft
+            if i18n.lang == "fa"
+            else Qt.LayoutDirection.LeftToRight
+        )
         bar.addWidget(self.lock_label)
         bar.addWidget(self.path_label, 1)
         bar.addPermanentWidget(self.count_label)
@@ -100,13 +111,23 @@ class MainWindow(QMainWindow):
         self.lock_label.setText(
             i18n.tr("status.locked" if locked else "status.unlocked")
         )
-        self.path_label.setText(str(self.controller.vault_home))
+        self.path_label.setText("\u200e" + str(self.controller.vault_home) + "\u200e")
         self.count_label.setText(i18n.tr("status.files", count=status.get("files", 0)))
         try:
             connections = int(self.controller.connection_count())
         except Exception:  # noqa: BLE001
             connections = 0
-        self.mcp_label.setText(i18n.tr("status.mcp", count=connections))
+        # LRM around the Latin-only fragments keeps them intact inside the RTL sentence.
+        text = "\u200e" + i18n.tr("status.mcp", count=connections) + "\u200e"
+        if self._last_read is not None and self._last_read.get("path"):
+            path = "/" + str(self._last_read["path"]).lstrip("/")
+            text += " · " + i18n.tr("status.last_read", path="\u200e" + path + "\u200e")
+        self.mcp_label.setText(text)
+
+    def set_last_read(self, event: dict) -> None:
+        """Remember the last read event and refresh the status line (SPEC/09 §8)."""
+        self._last_read = dict(event)
+        self.refresh_status()
 
     # ------------------------------------------------------------------ menus
     def _build_menus(self) -> None:
@@ -132,6 +153,7 @@ class MainWindow(QMainWindow):
         add(file_menu, "import", None, self.controller.import_joplin)
         file_menu.addSeparator()
         save_action = add(file_menu, "save", "Ctrl+S", self.editor.save)
+        add(file_menu, "browser_edit", None, self._open_current_in_browser)
         file_menu.addSeparator()
         add(file_menu, "lock", "Ctrl+L", self.controller.lock)
         add(file_menu, "quit", "Ctrl+Q", self.controller.quit)
@@ -212,6 +234,12 @@ class MainWindow(QMainWindow):
         self.browser.refresh()
         self.refresh_status()
 
+    def _open_current_in_browser(self) -> None:
+        """Open the current note in the web UI (SPEC/08 §B.7)."""
+        path = self._current_path or self.editor.current_path
+        if path:
+            self.controller.open_in_browser(path)
+
     def _on_folder_selected(self, path: str) -> None:
         """Remember the selected folder in the user config."""
         try:
@@ -244,6 +272,17 @@ class MainWindow(QMainWindow):
         if level in ("secret", "secretfile"):
             menu.addAction(
                 i18n.tr("menu.open_native"), lambda: self.controller.open_path(path)
+            )
+        menu.addSeparator()
+        # The two "work on this note elsewhere" entry points (SPEC/08 §B).
+        menu.addAction(
+            i18n.tr("editor.edit_in_browser"),
+            lambda: self.controller.open_in_browser(path),
+        )
+        if level == "normal":
+            menu.addAction(
+                i18n.tr("editor.open_text_editor"),
+                lambda: self.controller.open_in_text_editor(path),
             )
         menu.addSeparator()
         menu.addAction(i18n.tr("menu.rename"), lambda: self._rename(path))
@@ -318,6 +357,7 @@ class MainWindow(QMainWindow):
             "new_folder": "menu.new_folder",
             "import": "menu.import",
             "save": "menu.save",
+            "browser_edit": "menu.browser_edit",
             "lock": "menu.lock",
             "quit": "menu.quit",
             "find": "menu.find",

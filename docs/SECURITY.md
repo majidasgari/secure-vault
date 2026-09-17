@@ -157,3 +157,36 @@ file from a backup rather than trusting it.
 * A weak master password: Argon2id slows guessing but cannot save a guessable password.
 * Simultaneous edits from two machines on the same synced folder (see `docs/SYNC.md`).
 * Traffic/timing analysis of the sync client; the app itself makes no network calls.
+
+## 10. The web UI (`python -m vault.web`)
+
+The browser UI runs in a process that owns the `VaultSession` — the web process is
+the key holder, exactly like the GUI — and exposes an HTTP JSON API plus an SSE
+stream. Its security contract:
+
+* **Token auth.** A random 32-byte token is generated at startup, written to
+  `runtime_dir()/web.token` (mode `0600`) and printed once to stderr. Every
+  `/api/*` request must carry it in the `X-Vault-Token` header; the `vault_token`
+  cookie set by `GET /?token=…` is `HttpOnly; SameSite=Strict` and is **never**
+  accepted as authorisation (CSRF defence). Static files (`/`, `/static/*`) need no
+  token because they contain no vault data.
+* **No key exposure.** The master password is typed in the browser, verified
+  in-process, and never stored, echoed or logged. Decrypted content stays in the
+  daemon process except for the specific file the user opened; the browser holds it
+  only in the DOM (never `localStorage`, never the URL) and clears it on lock.
+* **Same sensitivity rules as the desktop UI.** `secret` files get a confirmation
+  and a disabled markdown preview; `secretfile` content is rendered as plain text
+  only and `GET /api/blob` returns `403` for it. `vault.read_secret` is not exposed
+  to the browser at all.
+* **Throttling.** Wrong passwords are answered with `401 bad_password`, a `deny`
+  row in the access log (`source="web"`) and an in-memory per-IP delay (5 s ×
+  failures past the fifth, capped at 60 s). The counter is never persisted.
+* **No store.** All `/api/*` responses are `Cache-Control: no-store`; the SPA has
+  no external references and works fully offline.
+* **Loopback by default.** A non-loopback `--host` is refused unless `--allow-lan`
+  is passed; the server then warns that the token is the only protection.
+
+The token is only as safe as the machine: any process running as your user can read
+`web.token`, and anyone with the token **and** the password can read the vault.
+Exposing the server beyond loopback over plain HTTP also exposes the token to
+network sniffers — use a TLS reverse proxy if you need that. See `docs/WEBUI.md`.
