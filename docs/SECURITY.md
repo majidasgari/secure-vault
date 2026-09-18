@@ -29,14 +29,16 @@ Never readable without the password:
 
 * every byte of file **content** (except files above the plain threshold, see §6);
 * folder notes;
-* the FTS content index and embedding vectors (they live inside `secure.store`).
+* the FTS content index (inside `secure.store`) and the embedding vectors (inside the
+  separate encrypted `semantic.db`).
 
 This matches the original design (§12): *"in locked mode only metadata/names/level are
 visible"*. The plaintext metadata DB exists so that locked-mode listing and filename
 search keep working, which is a deliberate, documented trade-off.
 
 **The no-plaintext rule:** no file content and no folder-note text may ever be written
-into the vault home outside the encrypted `files/*.enc` blobs and `secure.store`. The
+into the vault home outside the encrypted `files/*.enc` blobs, `secure.store` and
+`semantic.db`. The
 only plaintext files in the vault home are `.vault-meta.json` (KDF params + canary) and
 `meta.sqlite` (names/levels/tags/log). The test suite enforces this by scanning the whole
 vault home for known plaintext markers after writes.

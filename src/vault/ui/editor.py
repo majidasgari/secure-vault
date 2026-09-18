@@ -23,6 +23,7 @@ from PySide6.QtWidgets import (
     QComboBox,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
     QPushButton,
     QSplitter,
     QTextBrowser,
@@ -168,6 +169,8 @@ class EditorPanel(QWidget):
     open_in_browser = Signal(str)
     open_text_editor = Signal(str)
     direction_changed = Signal(str)
+    #: ``(path, note)`` when the user edits the short note of the open file.
+    note_changed = Signal(str, str)
 
     def __init__(self, parent: Any = None) -> None:
         """Create an empty editor."""
@@ -181,6 +184,7 @@ class EditorPanel(QWidget):
         self._loading = False
         self._formatting = False
         self._direction_mode = "auto"
+        self._loading_note = False
         self._preview_checked = False
         self._split_applied = False
         self._preview_load_ok: bool | None = None
@@ -204,6 +208,15 @@ class EditorPanel(QWidget):
         toolbar.addWidget(self.text_editor_button)
         toolbar.addWidget(self.browser_button)
         layout.addLayout(toolbar)
+
+        note_row = QHBoxLayout()
+        self.note_label = QLabel(self)
+        self.note_edit = QLineEdit(self)
+        self.note_edit.setClearButtonEnabled(True)
+        self.note_edit.editingFinished.connect(self._on_note_edited)
+        note_row.addWidget(self.note_label)
+        note_row.addWidget(self.note_edit, 1)
+        layout.addLayout(note_row)
 
         self.splitter = QSplitter(Qt.Horizontal, self)
         self.source = QTextEdit(self)
@@ -389,6 +402,20 @@ class EditorPanel(QWidget):
         self._refresh_actions()
         self._update_status()
 
+    def set_note(self, text: str) -> None:
+        """Show the short note of the currently open file."""
+        self._loading_note = True
+        try:
+            self.note_edit.setText(text or "")
+        finally:
+            self._loading_note = False
+
+    def _on_note_edited(self) -> None:
+        """Emit the edited note for the open file."""
+        if self._loading_note or not self.current_path:
+            return
+        self.note_changed.emit(str(self.current_path), self.note_edit.text())
+
     def clear(self) -> None:
         """Empty the editor."""
         self._loading = True
@@ -398,6 +425,7 @@ class EditorPanel(QWidget):
             self._loading = False
         self.current_path = None
         self._dirty = False
+        self.set_note("")
         self._clear_preview()
         self._refresh_actions()
 
@@ -590,12 +618,18 @@ class EditorPanel(QWidget):
     def retranslate(self) -> None:
         """Re-apply translated strings."""
         self.source.setPlaceholderText(i18n.tr("editor.placeholder"))
+        self.note_label.setText(i18n.tr("editor.file_note"))
+        self.note_edit.setPlaceholderText(i18n.tr("editor.file_note_placeholder"))
         self.direction_label.setText(i18n.tr("editor.direction"))
         for index, mode in enumerate(_DIRECTIONS):
             self.direction_combo.setItemText(index, i18n.tr(_MODE_KEYS[mode]))
         self.browser_button.setText(i18n.tr("editor.edit_in_browser"))
         self.text_editor_button.setText(i18n.tr("editor.open_text_editor"))
+        # The highlighter rewrites character formats and Qt reports that as a text
+        # change; highlighting must never mark the document as unsaved.
+        dirty = self._dirty
         self.highlighter.refresh()
+        self._dirty = dirty
         self._update_status()
 
 

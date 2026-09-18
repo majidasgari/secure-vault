@@ -14,7 +14,7 @@ import re
 import sqlite3
 import uuid
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 
 from ..config import runtime_dir as default_runtime_dir
 from ..errors import NotFound
@@ -97,6 +97,8 @@ CREATE TABLE IF NOT EXISTS content_meta(
   file_id INTEGER PRIMARY KEY, sha256 TEXT, indexed_at INTEGER);
 CREATE TABLE IF NOT EXISTS folder_notes(
   folder_path TEXT PRIMARY KEY, note_text TEXT NOT NULL, updated_at INTEGER);
+CREATE TABLE IF NOT EXISTS file_notes(
+  file_id INTEGER PRIMARY KEY, note_text TEXT NOT NULL, updated_at INTEGER);
 CREATE TABLE IF NOT EXISTS vectors(
   file_id INTEGER PRIMARY KEY, model TEXT NOT NULL, dim INTEGER NOT NULL, vec BLOB NOT NULL);
 """
@@ -262,15 +264,19 @@ class SecureStore:
         return self._conn is not None
 
     # --------------------------------------------------------------- content index
-    def index_text(self, file_id: int, text: str) -> None:
+    def index_text(self, file_id: int, text: str, note: str = "") -> None:
         """Replace the FTS row for ``file_id`` with the normalized form of ``text``.
 
         Only the searchable part is stored (see :func:`indexable_text`); the digest is taken over
-        the *whole* text so a change is still detected.
+        the *whole* text so a change is still detected. ``note`` (the user's short file note) is
+        indexed alongside the body so a note is discoverable from literal search.
         """
         if self._conn is None:
             raise NotFound("store_closed")
-        normalized = normalize_fa(indexable_text(text))
+        searchable = indexable_text(text)
+        if note:
+            searchable = f"{searchable}\n{indexable_text(note)}"
+        normalized = normalize_fa(searchable)
         self._conn.execute("DELETE FROM fts_content WHERE rowid=?", (int(file_id),))
         self._conn.execute(
             "INSERT INTO fts_content(rowid, body, file_id) VALUES(?,?,?)",
@@ -293,6 +299,7 @@ class SecureStore:
         fid = int(file_id)
         self._conn.execute("DELETE FROM fts_content WHERE rowid=?", (fid,))
         self._conn.execute("DELETE FROM content_meta WHERE file_id=?", (fid,))
+        self._conn.execute("DELETE FROM file_notes WHERE file_id=?", (fid,))
         self._conn.execute("DELETE FROM vectors WHERE file_id=?", (fid,))
         self._dirty = True
         self._conn.commit()
@@ -353,6 +360,52 @@ class SecureStore:
             "SELECT * FROM folder_notes ORDER BY folder_path"
         ).fetchall()
         return [dict(r) for r in rows]
+
+    # ------------------------------------------------------------------- file notes
+    def set_file_note(self, file_id: int, text: str) -> None:
+        """Insert or replace the short note attached to a file."""
+        if self._conn is None:
+            raise NotFound("store_closed")
+        conn = self._conn
+        conn.execute(
+            "INSERT INTO file_notes(file_id, note_text, updated_at) VALUES(?,?,?) "
+            "ON CONFLICT(file_id) DO UPDATE SET note_text=excluded.note_text, "
+            "updated_at=excluded.updated_at",
+            (int(file_id), text, now_ms()),
+        )
+        self._dirty = True
+        conn.commit()
+
+    def clear_file_note(self, file_id: int) -> None:
+        """Remove the note attached to a file, if any."""
+        if self._conn is None:
+            return
+        conn = self._conn
+        conn.execute("DELETE FROM file_notes WHERE file_id=?", (int(file_id),))
+        self._dirty = True
+        conn.commit()
+
+    def get_file_note(self, file_id: int) -> str | None:
+        """Return the note attached to ``file_id`` or None."""
+        if self._conn is None:
+            return None
+        row = self._conn.execute(
+            "SELECT note_text FROM file_notes WHERE file_id=?", (int(file_id),)
+        ).fetchone()
+        return str(row["note_text"]) if row is not None else None
+
+    def get_file_notes(self, file_ids: Iterable[int]) -> dict[int, str]:
+        """Return ``{file_id: note}`` for the ids that have a note."""
+        if self._conn is None:
+            return {}
+        ids = [int(value) for value in file_ids]
+        if not ids:
+            return {}
+        marks = ",".join("?" * len(ids))
+        rows = self._conn.execute(
+            f"SELECT file_id, note_text FROM file_notes WHERE file_id IN ({marks})", ids
+        ).fetchall()
+        return {int(r["file_id"]): str(r["note_text"]) for r in rows}
 
     # --------------------------------------------------------------------- vectors
     def set_vector(self, file_id: int, model: str, vec: bytes) -> None:

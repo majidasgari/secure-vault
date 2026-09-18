@@ -187,6 +187,10 @@ _TOOL_SPECS: list[dict[str, Any]] = [
         {
             "query": {"type": "string"},
             "limit": {"type": "integer", "default": 50},
+            "path_prefix": {
+                "type": "string",
+                "description": "Restrict to this folder subtree (e.g. /notes).",
+            },
         },
         ["query"],
         _forward("vault.search_filenames"),
@@ -194,10 +198,14 @@ _TOOL_SPECS: list[dict[str, Any]] = [
     _tool(
         "search_text",
         "Search literal content of normal files only. secret/secretfile content is never "
-        "searchable.",
+        "searchable. Each hit returns the matching line and character offset.",
         {
             "query": {"type": "string"},
             "limit": {"type": "integer", "default": 50},
+            "path_prefix": {
+                "type": "string",
+                "description": "Restrict to this folder subtree (e.g. /notes).",
+            },
         },
         ["query"],
         _forward("vault.search_text"),
@@ -208,6 +216,10 @@ _TOOL_SPECS: list[dict[str, Any]] = [
         {
             "query": {"type": "string"},
             "limit": {"type": "integer", "default": 50},
+            "path_prefix": {
+                "type": "string",
+                "description": "Restrict to this folder subtree (e.g. /notes).",
+            },
         },
         ["query"],
         _forward("vault.search_semantic"),
@@ -225,6 +237,66 @@ _TOOL_SPECS: list[dict[str, Any]] = [
         {"path": {"type": "string"}, "text": {"type": "string"}},
         ["path", "text"],
         _forward("vault.set_folder_note"),
+    ),
+    _tool(
+        "read_file_note",
+        "Read the short note attached to a file.",
+        {"path": {"type": "string"}},
+        ["path"],
+        _forward("vault.file_note"),
+    ),
+    _tool(
+        "write_file_note",
+        "Attach or replace the short note on a file.",
+        {"path": {"type": "string"}, "text": {"type": "string"}},
+        ["path", "text"],
+        _forward("vault.set_file_note"),
+    ),
+    _tool(
+        "digest",
+        "One compact overview of a folder or file: its note plus, for each child, name, "
+        "size, sensitivity, tags, note and (normal files) the first line. Use instead of "
+        "many list/read calls.",
+        {
+            "path": {"type": "string", "default": "/"},
+            "depth": {"type": "integer", "default": 1},
+        },
+        [],
+        _forward("vault.digest"),
+    ),
+    _tool(
+        "all_tags",
+        "List every tag with its usage count (metadata only).",
+        {},
+        [],
+        _forward("vault.all_tags"),
+    ),
+    _tool(
+        "files_by_tag",
+        "List every file carrying a tag (metadata only).",
+        {"tag": {"type": "string"}},
+        ["tag"],
+        _forward("vault.files_by_tag"),
+    ),
+    _tool(
+        "semantic_status",
+        "Return the semantic index status: model, chunking, chunk/file counts.",
+        {},
+        [],
+        _forward("vault.semantic_status"),
+    ),
+    _tool(
+        "semantic_reindex",
+        "Re-embed the vault, or just one folder/file subtree, into the semantic index.",
+        {
+            "path": {
+                "type": "string",
+                "description": "Limit the rebuild to this folder/file subtree.",
+            },
+            "force": {"type": "boolean", "default": True},
+        },
+        [],
+        _forward("vault.semantic_reindex"),
     ),
     _tool(
         "request_open_secret",

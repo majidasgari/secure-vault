@@ -202,6 +202,140 @@ class ServiceDispatchTest(unittest.TestCase):
         self.assertEqual(match[0]["code"], "PERMISSION_DENIED")
 
 
+class ServiceSemanticWiringTest(unittest.TestCase):
+    """The service builds the semantic provider from settings.
+
+    Regression: ``get_provider`` existed but was never called, so enabling semantic
+    search still returned ``PROVIDER_UNAVAILABLE``.
+    """
+
+    def setUp(self) -> None:
+        self.session = tmp_vault()
+        self.session.meta.settings["semantic"] = {
+            "enabled": False,
+            "provider": "stub",
+            "model": "stub",
+        }
+        self.session.meta.save()
+        self.service = Service(self.session)
+        self.session.write_file("notes/a.md", b"quantum physics")
+
+    def tearDown(self) -> None:
+        self.session.close()
+
+    def test_set_settings_enables_semantic_index(self) -> None:
+        """Enabling through the API makes index/search work without injection."""
+        self.service.dispatch(
+            "vault.set_settings", {"semantic": {"enabled": True}},
+            role="ui", session_id="t",
+        )
+        result = self.service.dispatch(
+            "vault.semantic_index", {"force": True}, role="ui", session_id="t"
+        )
+        self.assertGreaterEqual(result["indexed"], 1)
+        found = self.service.dispatch(
+            "vault.search_semantic", {"query": "quantum physics"},
+            role="ui", session_id="t",
+        )
+        self.assertGreaterEqual(found["count"], 1)
+
+    def test_semantic_status_and_scoped_reindex_via_mcp(self) -> None:
+        """An agent can read the status and rebuild just one subtree."""
+        status = self.service.dispatch(
+            "vault.semantic_status", {}, role="mcp", session_id="t"
+        )
+        self.assertIn("semantic", status)
+        self.service.dispatch(
+            "vault.set_settings", {"semantic": {"enabled": True}},
+            role="ui", session_id="t",
+        )
+        result = self.service.dispatch(
+            "vault.semantic_reindex", {"path": "/notes"}, role="mcp", session_id="t"
+        )
+        self.assertGreaterEqual(result["indexed"], 1)
+
+    def test_folder_states_and_db_path_are_validated(self) -> None:
+        """Folder scope normalizes, and a malformed value is rejected."""
+        self.service.dispatch(
+            "vault.set_settings",
+            {"semantic": {"folder_states": {"/private": False, "notes": True},
+                          "db_path": "/tmp/semantic-cache.db"}},
+            role="ui", session_id="t",
+        )
+        settings = self.service.dispatch(
+            "vault.get_settings", {}, role="ui", session_id="t"
+        )
+        self.assertEqual(
+            settings["semantic"]["folder_states"], {"private": False, "notes": True}
+        )
+        self.assertEqual(settings["semantic"]["db_path"], "/tmp/semantic-cache.db")
+        with self.assertRaises(BadRequest):
+            self.service.dispatch(
+                "vault.set_settings", {"semantic": {"folder_states": []}},
+                role="ui", session_id="t",
+            )
+
+
+class ServiceNotesAndDigestTest(unittest.TestCase):
+    """File notes, folder digests and agent-readable tags."""
+
+    def setUp(self) -> None:
+        """Create a vault with a folder note and two files."""
+        self.session = tmp_vault()
+        self.session.write_file("notes/a.md", "# Title\nbody line\n".encode())
+        self.session.write_file("notes/b.md", b"beta")
+        self.session.set_folder_note("notes", "folder desc")
+        self.service = Service(self.session)
+
+    def tearDown(self) -> None:
+        """Release the vault."""
+        self.session.close()
+
+    def test_file_note_roundtrip_and_listing(self) -> None:
+        """A file note is returned by file_note and shown in the listing."""
+        self.service.dispatch(
+            "vault.set_file_note", {"path": "/notes/a.md", "text": "short desc"},
+            role="ui", session_id="t",
+        )
+        got = self.service.dispatch(
+            "vault.file_note", {"path": "/notes/a.md"}, role="mcp", session_id="t"
+        )
+        self.assertEqual(got["note"], "short desc")
+        listing = self.service.dispatch(
+            "vault.list_folder", {"path": "/notes"}, role="ui", session_id="t"
+        )
+        by_path = {entry["path"]: entry for entry in listing["entries"]}
+        self.assertEqual(by_path["/notes/a.md"]["note"], "short desc")
+
+    def test_digest_includes_notes_and_first_line(self) -> None:
+        """digest returns the folder note plus children notes/first lines."""
+        self.service.dispatch(
+            "vault.set_file_note", {"path": "/notes/a.md", "text": "a desc"},
+            role="ui", session_id="t",
+        )
+        info = self.service.dispatch(
+            "vault.digest", {"path": "/notes", "depth": 1}, role="mcp", session_id="t"
+        )
+        self.assertEqual(info["note"], "folder desc")
+        by_name = {entry["name"]: entry for entry in info["entries"]}
+        self.assertEqual(by_name["a.md"]["note"], "a desc")
+        self.assertEqual(by_name["a.md"]["first_line"], "# Title")
+        self.assertEqual(by_name["b.md"]["first_line"], "beta")
+
+    def test_tags_are_readable_by_agents(self) -> None:
+        """all_tags and files_by_tag are read-only but open to the mcp role."""
+        self.service.dispatch(
+            "vault.set_tags", {"path": "/notes/a.md", "tags": ["x"]},
+            role="ui", session_id="t",
+        )
+        tags = self.service.dispatch("vault.all_tags", {}, role="mcp", session_id="t")
+        self.assertIn("x", {tag["name"] for tag in tags["tags"]})
+        by_tag = self.service.dispatch(
+            "vault.files_by_tag", {"tag": "x"}, role="mcp", session_id="t"
+        )
+        self.assertEqual(by_tag["count"], 1)
+
+
 class ServiceLockedModeTest(unittest.TestCase):
     """Metadata commands work while locked; content commands do not."""
 

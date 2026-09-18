@@ -61,6 +61,11 @@ def tmp_vault(
         session._fs = VaultFS(
             home, session._index, session._master_key, plain_threshold=plain_threshold
         )
+    # Keep the semantic cache inside the scratch dir instead of the user's home.
+    semantic = session.meta.settings.setdefault("semantic", {})
+    if not semantic.get("db_path"):
+        semantic["db_path"] = str(base / "semantic.db")
+        session.meta.save()
     return session
 
 

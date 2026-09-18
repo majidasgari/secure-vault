@@ -100,6 +100,65 @@ class SearchBehaviourTest(unittest.TestCase):
         self.assertTrue(results)
         self.assertEqual(results[0]["logical_path"], "sem1.md")
 
+    def test_path_prefix_scopes_results(self) -> None:
+        """A path prefix keeps a small folder's hits from being crowded out."""
+        self.session.write_file("keep/a.md", b"needle")
+        self.session.write_file("other/b.md", b"needle")
+        hits = self.session.search_text("needle", path_prefix="keep")
+        self.assertEqual({h["logical_path"] for h in hits}, {"keep/a.md"})
+        names = self.session.search_filenames("md", path_prefix="other")
+        self.assertEqual({h["logical_path"] for h in names}, {"other/b.md"})
+
+    def test_search_text_returns_line_and_offset(self) -> None:
+        """Literal hits carry the 1-based line and character offset of the match."""
+        body = "line one\nline two\nneedle here\n"
+        self.session.write_file("loc.md", body.encode("utf-8"))
+        hits = self.session.search_text("needle")
+        self.assertEqual(hits[0]["line"], 3)
+        self.assertEqual(hits[0]["offset"], len("line one\nline two\n"))
+
+    def test_semantic_provider_autowired_from_settings(self) -> None:
+        """An enabled provider in the settings is used without explicit injection."""
+        self.session.meta.settings["semantic"] = {
+            "enabled": True,
+            "provider": "stub",
+            "model": "stub",
+        }
+        self.session.meta.save()
+        self.session.refresh_semantic_provider()
+        self.session.write_file("auto.md", b"quantum physics")
+        semantics.index_all(self.session)
+        results = self.session.search_semantic("quantum physics")
+        self.assertTrue(results)
+        self.assertEqual(results[0]["logical_path"], "auto.md")
+
+    def test_semantic_skips_binary_files(self) -> None:
+        """Binary files (NUL bytes) are skipped instead of embedded as garbage."""
+        self.session.set_semantic_provider(semantics.StubProvider())
+        self.session.write_file("text.md", b"alpha")
+        self.session.write_file("image.png", b"\x89PNG\r\n\x1a\n\x00\x00\x00data")
+        result = semantics.index_all(self.session)
+        self.assertEqual(result["indexed"], 1)
+        self.assertGreaterEqual(result["skipped"], 1)
+
+    def test_index_semantics_reports_progress(self) -> None:
+        """index_semantics resolves the provider and forwards (done, total) progress."""
+        self.session.meta.settings["semantic"] = {
+            "enabled": True,
+            "provider": "stub",
+            "model": "stub",
+        }
+        self.session.meta.save()
+        for index in range(4):
+            self.session.write_file(f"p{index}.md", b"alpha")
+        ticks: list[tuple[int, int]] = []
+        result = self.session.index_semantics(
+            force=True, progress=lambda done, total: ticks.append((done, total))
+        )
+        self.assertEqual(result["indexed"], 4)
+        self.assertEqual(ticks[0], (1, 4))
+        self.assertEqual(ticks[-1], (4, 4))
+
 
 if __name__ == "__main__":
     unittest.main()

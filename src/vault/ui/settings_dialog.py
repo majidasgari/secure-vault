@@ -13,6 +13,7 @@ from PySide6.QtWidgets import (
     QComboBox,
     QDialog,
     QDialogButtonBox,
+    QFileDialog,
     QFormLayout,
     QHBoxLayout,
     QLabel,
@@ -21,10 +22,14 @@ from PySide6.QtWidgets import (
     QPushButton,
     QSpinBox,
     QTabWidget,
+    QTreeWidget,
+    QTreeWidgetItem,
     QVBoxLayout,
     QWidget,
 )
 
+from ..core.chunking import CHUNK_MODES, DEFAULT_CHUNK_MODE
+from ..core.semantics import folder_included, normalize_folder_key
 from . import i18n
 
 _LEVELS = ("normal", "secret", "secretfile")
@@ -132,11 +137,69 @@ class SettingsDialog(QDialog):
         page = QWidget(self)
         form = QFormLayout(page)
         semantic = self._settings.get("semantic") or {}
+        try:
+            status = self._controller.dispatch_ui("vault.status", {}) or {}
+            self._default_db_path = str(
+                (status.get("semantic") or {}).get("db_path") or ""
+            )
+        except Exception:  # noqa: BLE001 - the default is only a hint
+            self._default_db_path = ""
         self.semantic_check = QCheckBox(page)
         self.semantic_check.setChecked(bool(semantic.get("enabled")))
         form.addRow(self._label("settings.semantic_enable"), self.semantic_check)
         self.semantic_model = QLineEdit(str(semantic.get("model", "")), page)
         form.addRow(self._label("settings.semantic_model"), self.semantic_model)
+        self.chunk_combo = QComboBox(page)
+        for mode in CHUNK_MODES:
+            self.chunk_combo.addItem("", mode)
+        selected = self.chunk_combo.findData(
+            str(semantic.get("chunking") or DEFAULT_CHUNK_MODE)
+        )
+        self.chunk_combo.setCurrentIndex(selected if selected >= 0 else 0)
+        form.addRow(self._label("settings.semantic_chunking"), self.chunk_combo)
+
+        # Folder scope: checked = included; unchecked folders are skipped (cheap and safe).
+        self._folder_states: dict[str, bool] = {
+            normalize_folder_key(str(key)): bool(value)
+            for key, value in (semantic.get("folder_states") or {}).items()
+        }
+        self._updating_tree = False
+        folder_box = QWidget(page)
+        folder_layout = QVBoxLayout(folder_box)
+        folder_layout.setContentsMargins(0, 0, 0, 0)
+        self.folder_tree = QTreeWidget(folder_box)
+        self.folder_tree.setHeaderHidden(True)
+        self.folder_tree.setUniformRowHeights(True)
+        self.folder_tree.setMaximumHeight(180)
+        self._populate_folder_tree()
+        self.folder_tree.itemChanged.connect(self._on_folder_toggled)
+        folder_layout.addWidget(self.folder_tree)
+        folder_buttons = QHBoxLayout()
+        self.select_all_button = QPushButton(folder_box)
+        self.select_all_button.clicked.connect(lambda: self._set_all_folders(True))
+        self.deselect_all_button = QPushButton(folder_box)
+        self.deselect_all_button.clicked.connect(lambda: self._set_all_folders(False))
+        folder_buttons.addWidget(self.select_all_button)
+        folder_buttons.addWidget(self.deselect_all_button)
+        folder_layout.addLayout(folder_buttons)
+        form.addRow(self._label("settings.semantic_folders"), folder_box)
+
+        # Vector cache location (defaults under the user's home, outside the vault).
+        self.db_path_edit = QLineEdit(str(semantic.get("db_path") or ""), page)
+        self.db_path_edit.setPlaceholderText(self._default_db_path)
+        db_row = QWidget(page)
+        db_layout = QHBoxLayout(db_row)
+        db_layout.setContentsMargins(0, 0, 0, 0)
+        db_layout.addWidget(self.db_path_edit, 1)
+        self.db_browse_button = QPushButton(db_row)
+        self.db_browse_button.clicked.connect(self._browse_db_path)
+        db_layout.addWidget(self.db_browse_button)
+        form.addRow(self._label("settings.semantic_db_path"), db_row)
+        self.db_hint = QLabel(page)
+        self.db_hint.setWordWrap(True)
+        self.db_hint.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        form.addRow(self.db_hint)
+
         self.semantic_status = QLabel(page)
         self.semantic_status.setWordWrap(True)
         form.addRow(self.semantic_status)
@@ -144,6 +207,85 @@ class SettingsDialog(QDialog):
         self.index_button.clicked.connect(self._index_now)
         form.addRow(self.index_button)
         self.tabs.addTab(page, "")
+
+    def _populate_folder_tree(self) -> None:
+        """Fill the folder tree with checkable items reflecting the stored scope."""
+        self._updating_tree = True
+        try:
+            self.folder_tree.clear()
+            try:
+                tree = self._controller.dispatch_ui("vault.tree", {}).get("tree") or []
+            except Exception:  # noqa: BLE001 - a locked vault has no folders yet
+                tree = []
+            for node in tree:
+                self._add_folder_item(self.folder_tree.invisibleRootItem(), node)
+            self.folder_tree.expandAll()
+        finally:
+            self._updating_tree = False
+
+    def _add_folder_item(self, parent: Any, node: dict) -> None:
+        """Add ``node`` (and its folder children) under ``parent``."""
+        if not node.get("is_dir"):
+            return
+        key = normalize_folder_key(str(node.get("path") or ""))
+        item = QTreeWidgetItem(parent, [str(node.get("name") or key)])
+        item.setData(0, Qt.ItemDataRole.UserRole, key)
+        item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+        included = folder_included(key, self._folder_states)
+        item.setCheckState(
+            0, Qt.CheckState.Checked if included else Qt.CheckState.Unchecked
+        )
+        for child in node.get("children") or []:
+            self._add_folder_item(item, child)
+
+    def _on_folder_toggled(self, item: QTreeWidgetItem, column: int) -> None:
+        """Record the override for ``item`` and let its descendants inherit it."""
+        if self._updating_tree:
+            return
+        key = str(item.data(0, Qt.ItemDataRole.UserRole))
+        checked = item.checkState(0) == Qt.CheckState.Checked
+        self._folder_states[key] = checked
+        self._clear_descendant_overrides(item)
+        self._updating_tree = True
+        try:
+            self._apply_subtree_check(item, checked)
+        finally:
+            self._updating_tree = False
+
+    def _clear_descendant_overrides(self, item: QTreeWidgetItem) -> None:
+        """Forget explicit choices below ``item`` so they inherit again."""
+        for index in range(item.childCount()):
+            child = item.child(index)
+            child_key = str(child.data(0, Qt.ItemDataRole.UserRole))
+            self._folder_states.pop(child_key, None)
+            self._clear_descendant_overrides(child)
+
+    def _apply_subtree_check(self, item: Any, checked: bool) -> None:
+        """Set every checkbox below ``item`` (inclusive of its children) in one pass."""
+        state = Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked
+        for index in range(item.childCount()):
+            child = item.child(index)
+            child.setCheckState(0, state)
+            self._apply_subtree_check(child, checked)
+
+    def _set_all_folders(self, checked: bool) -> None:
+        """Select or deselect every folder in one click."""
+        self._folder_states = {} if checked else {"*": False}
+        self._updating_tree = True
+        try:
+            self._apply_subtree_check(self.folder_tree.invisibleRootItem(), checked)
+        finally:
+            self._updating_tree = False
+
+    def _browse_db_path(self) -> None:
+        """Pick a directory for the vector cache."""
+        chosen = QFileDialog.getExistingDirectory(
+            self,
+            i18n.tr("settings.semantic_db_path"),
+            self.db_path_edit.text().strip() or str(Path.home()),
+        )
+        if chosen:
+            self.db_path_edit.setText(chosen)
 
     def _build_importer(self) -> None:
         """Build the Importer tab."""
@@ -247,17 +389,9 @@ class SettingsDialog(QDialog):
         )
 
     def _index_now(self) -> None:
-        """Rebuild the semantic index."""
-        try:
-            result = self._controller.dispatch_ui("vault.semantic_index", {"force": True})
-        except Exception as exc:  # noqa: BLE001
-            QMessageBox.warning(self, i18n.tr("settings.semantic_index"), str(exc))
-            return
-        QMessageBox.information(
-            self,
-            i18n.tr("settings.semantic_index"),
-            i18n.tr("settings.semantic_indexed", count=result.get("indexed", 0)),
-        )
+        """Persist the settings, then rebuild the semantic index in the background."""
+        self._on_accept()
+        self._controller.semantic_index_now()
 
     def _run_import(self) -> None:
         """Persist the current settings, then run the Joplin importer (SPEC/04)."""
@@ -281,6 +415,9 @@ class SettingsDialog(QDialog):
             "semantic": {
                 "enabled": bool(self.semantic_check.isChecked()),
                 "model": self.semantic_model.text().strip(),
+                "chunking": str(self.chunk_combo.currentData()),
+                "folder_states": dict(self._folder_states),
+                "db_path": self.db_path_edit.text().strip(),
             },
             "import_joplin": {
                 "mirror_root": self.mirror_edit.text().strip(),
@@ -327,6 +464,14 @@ class SettingsDialog(QDialog):
         self.open_home_button.setText(i18n.tr("settings.open_folder"))
         self.verify_button.setText(i18n.tr("settings.verify"))
         self.threshold_hint.setText(i18n.tr("settings.plain_threshold_hint"))
+        for position, mode in enumerate(CHUNK_MODES):
+            self.chunk_combo.setItemText(position, i18n.tr(f"semantic.chunk_{mode}"))
+        self.select_all_button.setText(i18n.tr("settings.semantic_select_all"))
+        self.deselect_all_button.setText(i18n.tr("settings.semantic_deselect_all"))
+        self.db_browse_button.setText(i18n.tr("settings.semantic_db_browse"))
+        self.db_hint.setText(
+            i18n.tr("settings.semantic_db_hint", path=self._default_db_path)
+        )
         self.index_button.setText(i18n.tr("settings.semantic_index"))
         self.import_button.setText(i18n.tr("settings.run_import"))
         self.reindex_button.setText(i18n.tr("settings.reindex"))

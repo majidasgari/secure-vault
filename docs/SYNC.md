@@ -13,9 +13,13 @@ The **entire vault home** is designed to be synced:
 <vault home>/
 ├── .vault-meta.json     KDF salt/params + canary (no secrets)
 ├── meta.sqlite          plaintext metadata: names, levels, tags, access log, kv
-├── secure.store         encrypted content store (FTS index, folder notes, vectors)
+├── secure.store         encrypted content store (FTS index, folder notes)
 └── files/<aa>/<blob>.enc   AES-256-GCM blobs (or plain blobs > 10 MB)
 ```
+
+The semantic vector cache is **not** here by default: it lives in the user's data dir
+(`$XDG_DATA_HOME/secure-vault/semantic/<vault_id>.db`, i.e. under the user's home), which
+is outside the synced folder. See §2.
 
 Everything except the metadata DB is ciphertext. The metadata DB and `.vault-meta.json`
 are plaintext by design (see `docs/SECURITY.md`); they leak names, levels, tags and the
@@ -28,11 +32,21 @@ access log, but no content.
   * `store.<pid>.<rand>.dec` — the **decrypted** content store;
   * `daemon.sock` — the local Unix socket;
   * `tokens.json` — the per-daemon MCP token.
+* The **semantic vector cache** — encrypted, but a **derived, rebuildable cache**, not
+  data. It lives under the user's home by default (Settings → Semantic shows and lets you
+  change the path), so it is never swept up by the cloud client; each machine rebuilds it
+  locally (Settings → Semantic → *Build/refresh index*). If you point it at a path inside
+  the vault home, exclude it from sync by name. It can be large (one vector per chunk) and
+  is never worth syncing.
 * The user config `~/.config/secure-vault/ui.json` (machine-local window state).
 * Any backup or export you make outside the vault home.
 
 The runtime directory is outside the vault home precisely so it is never swept up by the
-cloud client. Never copy `store.*.dec` anywhere.
+cloud client. Never copy `store.*.dec` or `semantic.*.dec` anywhere.
+
+> Rebuilding the semantic index needs the embedding model available locally and downloads
+> it once (see `requirements-semantic.txt`). Until it is rebuilt, semantic search simply
+> returns nothing on that machine; full-text and filename search keep working.
 
 ## 3. Conflict behaviour
 

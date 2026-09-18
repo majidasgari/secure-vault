@@ -190,6 +190,7 @@ class VaultListModel(QAbstractTableModel):
     COLUMN_LEVEL = 1
     COLUMN_SIZE = 2
     COLUMN_MTIME = 3
+    COLUMN_NOTE = 4
 
     def __init__(self, parent: Any = None) -> None:
         """Create an empty list model."""
@@ -224,8 +225,8 @@ class VaultListModel(QAbstractTableModel):
         return 0 if parent.isValid() else len(self._entries)
 
     def columnCount(self, parent: QModelIndex = QModelIndex()) -> int:
-        """Return the four documented columns."""
-        return 4
+        """Return the five documented columns."""
+        return 5
 
     def data(self, index: QModelIndex, role: int = Qt.DisplayRole) -> Any:
         """Return cell content for the display role."""
@@ -244,6 +245,10 @@ class VaultListModel(QAbstractTableModel):
                 return format_size(int(entry.get("size", 0)))
             if column == self.COLUMN_MTIME:
                 return format_mtime(int(entry.get("mtime", 0)))
+            if column == self.COLUMN_NOTE:
+                return entry.get("note") or ""
+        if role == Qt.ToolTipRole and column == self.COLUMN_NOTE:
+            return entry.get("note") or None
         if role == Qt.TextAlignmentRole and column in (self.COLUMN_SIZE, self.COLUMN_MTIME):
             return int(Qt.AlignRight | Qt.AlignVCenter)
         if role == Qt.UserRole:
@@ -260,6 +265,7 @@ class VaultListModel(QAbstractTableModel):
             self.COLUMN_LEVEL: i18n.tr("browser.column_level"),
             self.COLUMN_SIZE: i18n.tr("browser.column_size"),
             self.COLUMN_MTIME: i18n.tr("browser.column_mtime"),
+            self.COLUMN_NOTE: i18n.tr("browser.column_note"),
         }.get(section)
 
 

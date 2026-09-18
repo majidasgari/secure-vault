@@ -22,6 +22,13 @@ EXPECTED_TOOLS = {
     "search_semantic",
     "read_folder_note",
     "write_folder_note",
+    "read_file_note",
+    "write_file_note",
+    "digest",
+    "all_tags",
+    "files_by_tag",
+    "semantic_status",
+    "semantic_reindex",
     "request_open_secret",
     "get_access_log",
 }
@@ -150,6 +157,24 @@ class MCPProtocolTest(unittest.TestCase):
         self.assertTrue(note["updated"])
         note_read = self._structured("read_folder_note", {"path": "/notes"})
         self.assertEqual(note_read["note"], "hi")
+
+        fnote = self._structured(
+            "write_file_note", {"path": "/notes/hello.md", "text": "hello desc"}
+        )
+        self.assertTrue(fnote["updated"])
+        fnote_read = self._structured("read_file_note", {"path": "/notes/hello.md"})
+        self.assertEqual(fnote_read["note"], "hello desc")
+
+        digest = self._structured("digest", {"path": "/notes", "depth": 1})
+        self.assertIn("entries", digest)
+        self.assertIn("tags", self._structured("all_tags", {}))
+        self.assertIn("results", self._structured("files_by_tag", {"tag": "nope"}))
+        self.assertIn("semantic", self._structured("semantic_status", {}))
+
+        scoped = self._structured(
+            "search_text", {"query": "hello", "path_prefix": "/notes"}
+        )
+        self.assertIn("results", scoped)
 
         log = self._structured("get_access_log", {"limit": 10})
         self.assertIn("entries", log)

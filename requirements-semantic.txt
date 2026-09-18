@@ -2,3 +2,5 @@
 # Nothing in the app requires this file to be present; without it the semantic search
 # reports "not installed" and every other feature keeps working.
 sentence-transformers>=3
+# Embedded vector index used by the separate semantic.db (no server, bundle-able).
+sqlite-vec>=0.1.6

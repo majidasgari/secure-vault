@@ -17,7 +17,7 @@ import tempfile
 from pathlib import Path
 from typing import Iterator
 
-from .api.client import VaultClient
+from .api.client import RefreshingClient, VaultClient
 from .api.mcp_server import MCPServer
 
 LOG = logging.getLogger(__name__)
@@ -84,7 +84,9 @@ def main(argv: list[str] | None = None) -> int:
     if socket_path and token:
         client = VaultClient(socket_path=Path(socket_path), token=token)
     else:
-        client = VaultClient.from_runtime(role="mcp")
+        # No explicit credentials: read them from the runtime dir, and re-read them if
+        # the app restarts mid-session (it rotates the token on every start).
+        client = RefreshingClient()
     return MCPServer(client, debug=args.debug).serve()
 
 

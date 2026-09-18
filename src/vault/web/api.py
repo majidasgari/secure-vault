@@ -52,6 +52,7 @@ MUTATING_METHODS = frozenset(
         "vault.set_sensitivity",
         "vault.set_tags",
         "vault.set_folder_note",
+        "vault.set_file_note",
         "vault.set_settings",
         "vault.semantic_index",
     }

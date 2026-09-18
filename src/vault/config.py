@@ -50,6 +50,23 @@ def user_config_dir() -> Path:
     return Path.home() / ".config" / "secure-vault"
 
 
+def user_data_dir() -> Path:
+    """Return the per-user data directory, creating it with mode ``0700``.
+
+    Honours ``XDG_DATA_HOME`` and falls back to ``~/.local/share/secure-vault``. The
+    semantic vector cache lives here by default: it is large, machine-local and
+    rebuildable, so it must not sit in the synced vault home.
+    """
+    base = os.environ.get("XDG_DATA_HOME")
+    path = (Path(base) if base else Path.home() / ".local" / "share") / "secure-vault"
+    path.mkdir(parents=True, exist_ok=True)
+    try:
+        os.chmod(path, 0o700)
+    except OSError:  # pragma: no cover - best effort on exotic filesystems
+        pass
+    return path
+
+
 @dataclass
 class UserConfig:
     """The contents of ``ui.json`` with forward-compatible unknown-key preservation."""
@@ -142,6 +159,7 @@ __all__ = [
     "DEFAULT_LANGUAGE",
     "runtime_dir",
     "user_config_dir",
+    "user_data_dir",
     "UserConfig",
     "user_config",
     "AppPaths",

@@ -27,7 +27,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-semantic = ["sentence-transformers>=3"]
+semantic = ["sentence-transformers>=3", "sqlite-vec>=0.1.6"]
 
 [project.scripts]
 secure-vault = "vault.gui:main"

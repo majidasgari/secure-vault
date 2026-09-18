@@ -39,7 +39,12 @@ set: Python, PySide6, `cryptography`, `argon2-cffi`, `markdown-it-py` and Pygmen
 * The Windows portable build is **produced but not verified on Windows** (see
   `docs/WINDOWS.md`).
 * Semantic search is opt-in and needs the extra in `requirements-semantic.txt`
-  (`sentence-transformers`); it is never installed by `bootstrap.sh`.
+  (`sentence-transformers` + the embedded `sqlite-vec` vector index); neither is installed
+  by `bootstrap.sh`. Vectors live in a **separate, rebuildable cache** under the user's
+  home (configurable in Settings) and are **never synced** (see `docs/SYNC.md`). The user
+  picks the granularity — whole document, paragraph (default) or sentence — and can tick
+  exactly which folders are included; inline `data:` URIs/base64 images are stripped
+  before embedding.
 
 ## Install
 
@@ -128,11 +133,13 @@ Some clients spell the key `mcpServers`; use whichever your Hermes version expec
 Set `SECURE_VAULT_DEBUG=1` in the server environment for diagnostics on stderr
 (stdout stays pure JSON-RPC).
 
-What agents can do: list names/structure, read/write `normal` files, search filenames,
-search the content of `normal` files, read/write folder notes, **raise** a level
-(never lower), and ask you to display a `secretfile`. What they can **never** do:
-read `secret`/`secretfile` content, search it, lower a level, or receive the content
-of a `request_open_secret` call. See `docs/MCP.md` for the full tool reference.
+What agents can do: list names/structure, read/write `normal` files, search filenames and
+the content of `normal` files (scoped with `path_prefix`), read/write **folder and file
+notes**, get a one-call `digest` of a folder, list tags (`all_tags`/`files_by_tag`), read
+the semantic status and trigger a scoped `semantic_reindex`, **raise** a level (never
+lower), and ask you to display a `secretfile`. What they can **never** do: read
+`secret`/`secretfile` content, search it, lower a level, or receive the content of a
+`request_open_secret` call. See `docs/MCP.md` for the full tool reference.
 
 ## Using it from a browser (web UI)
 
@@ -181,10 +188,11 @@ explicit non-goal: passwords belong in `secretfile` files. See
 
 ## Syncing
 
-Sync the **whole vault home** (the encrypted `files/`, `secure.store` and the
-plaintext `meta.sqlite`) with Dropbox/OneDrive/Google Drive. Never sync the runtime
-directory (`$XDG_RUNTIME_DIR/secure-vault`, which holds `store.*.dec`, the socket and
-the token). Do not run two daemons against the same synced folder on two machines.
+Sync the encrypted `files/`, `secure.store` and the plaintext `meta.sqlite` with
+Dropbox/OneDrive/Google Drive. Never sync the runtime directory
+(`$XDG_RUNTIME_DIR/secure-vault`, which holds `store.*.dec`, the socket and the token),
+and **never sync `semantic.db`** — it is a rebuildable local vector cache, recomputed on
+each machine. Do not run two daemons against the same synced folder on two machines.
 See `docs/SYNC.md`.
 
 ## Security notes

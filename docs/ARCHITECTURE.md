@@ -51,13 +51,16 @@ starts the GUI itself.
 ├── .vault-meta.json                  plaintext: vault_id, KDF params + salt, canary, settings
 ├── meta.sqlite                       plaintext metadata: files, tags, access_log, kv
 ├── secure.store                      encrypted blob; plaintext is a small SQLite DB
-│                                     (FTS5 content index, folder notes, embedding vectors)
+│                                     (FTS5 content index, folder notes)
+├── semantic.db                       encrypted vector index (rebuildable local cache;
+│                                     never synced — see docs/SYNC.md)
 └── files/
     └── <aa>/<blob_id>.enc            AES-256-GCM blob (sharded by the first 2 hex chars);
                                       files > plain_threshold (default 10 MB) are plain
 
 <runtime dir>  $XDG_RUNTIME_DIR/secure-vault/   (fallback /tmp/secure-vault-<uid>), mode 0700
 ├── store.<pid>.<rand>.dec            decrypted content store, mode 0600, removed on lock
+├── semantic.<pid>.<rand>.dec         decrypted vector index, opened lazily, removed on lock
 ├── daemon.sock                       Unix socket, mode 0600
 └── tokens.json                       {"mcp": "<64 hex chars>", "created_at": …}, mode 0600
 
@@ -74,7 +77,8 @@ are the only non-ciphertext data that may live in the vault home (see
 1. **Create** (`VaultSession.create`): generate Argon2id parameters and a random salt,
    derive the master key from the password, store a password-verification **canary** in
    `.vault-meta.json`, create `meta.sqlite`, create the empty `secure.store`, and open a
-   `VaultFS` bound to the key. The session starts unlocked.
+   `VaultFS` bound to the key. The session starts unlocked. The separate `semantic.db`
+   vector index is created lazily on the first semantic operation, not here.
 2. **Unlock** (`session.unlock(password)`): derive the key from the stored KDF params and
    verify it against the canary. A wrong password raises `Unauthorized("bad_password")`.
    On success, `secure.store` is decrypted to `<runtime>/store.<pid>.<rand>.dec` (mode

@@ -41,6 +41,11 @@ def default_settings() -> dict[str, Any]:
             "enabled": False,
             "model": "all-MiniLM-L6-v2",
             "provider": "local",
+            "chunking": "paragraph",
+            #: Per-folder overrides: normalized folder path (root = "*") -> included?
+            "folder_states": {},
+            #: Optional custom location for ``semantic.db`` (empty = user data dir).
+            "db_path": "",
         },
         "import_joplin": {
             "mirror_root": _DEFAULT_IMPORT_MIRROR,

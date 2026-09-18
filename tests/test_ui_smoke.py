@@ -237,6 +237,144 @@ class EditorBidiTest(unittest.TestCase):
 
 
 @unittest.skipUnless(HAVE_QT, "PySide6 is not installed")
+class SemanticProgressUiTest(unittest.TestCase):
+    """The semantic build shows a determinate, count-based progress bar."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        """Ensure a single offscreen QApplication exists."""
+        from PySide6.QtWidgets import QApplication
+
+        cls.app = QApplication.instance() or QApplication(["sv-semantic-progress"])
+
+    def test_progress_dialog_is_determinate_and_polled(self) -> None:
+        """The bar has a 0..100 range and tracks the adapter's count/percentage."""
+        import tempfile
+        from pathlib import Path
+
+        from vault.ui.app import SemanticProgress, VaultApplication
+
+        controller = VaultApplication(
+            self.app,
+            home=Path(tempfile.mkdtemp(prefix="sv-semprog-")),
+            no_tray=True,
+            self_test=False,
+        )
+        try:
+            adapter = SemanticProgress()
+            controller._show_semantic_progress(adapter)
+            dialog = controller._import_progress
+            self.assertIsNotNone(dialog)
+            self.assertEqual(dialog.minimum(), 0)
+            self.assertEqual(dialog.maximum(), 100)
+            self.assertEqual(dialog.value(), 0)
+
+            adapter(3, 12)
+            controller._poll_semantic_progress()
+            self.assertEqual(dialog.value(), 25)
+            self.assertIn("3", dialog.labelText())
+            self.assertIn("12", dialog.labelText())
+
+            controller._on_semantic_finished({"indexed": 12, "skipped": 0})
+            self.assertIsNone(controller._import_progress)
+            self.assertFalse(controller.import_running)
+        finally:
+            controller.shutdown()
+
+
+@unittest.skipUnless(HAVE_QT, "PySide6 is not installed")
+class SemanticSettingsUiTest(unittest.TestCase):
+    """The Settings → Semantic folder tree and select/deselect-all buttons."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        """Ensure a single offscreen QApplication exists."""
+        from PySide6.QtWidgets import QApplication
+
+        cls.app = QApplication.instance() or QApplication(["sv-semantic-settings"])
+
+    @staticmethod
+    def _items(tree):
+        """Yield every item in ``tree`` depth-first."""
+
+        def walk(parent):
+            for index in range(parent.childCount()):
+                child = parent.child(index)
+                yield child
+                yield from walk(child)
+
+        return list(walk(tree.invisibleRootItem()))
+
+    def test_folder_scope_checkboxes(self) -> None:
+        """Stored folder states drive the tree; select/deselect all rewrite them."""
+        import os
+        import tempfile
+        from pathlib import Path
+
+        from PySide6.QtCore import Qt
+
+        from support import tmp_vault
+        from vault.ui.app import VaultApplication
+        from vault.ui.settings_dialog import SettingsDialog
+
+        previous_config = os.environ.get("XDG_CONFIG_HOME")
+        os.environ["XDG_CONFIG_HOME"] = tempfile.mkdtemp(prefix="sv-semcfg-")
+        session = tmp_vault(
+            settings={
+                "web": {"enabled": False},
+                "semantic": {
+                    "enabled": True,
+                    "provider": "stub",
+                    "model": "stub",
+                    "folder_states": {"private": False},
+                },
+            }
+        )
+        session.write_file("notes/a.md", b"alpha")
+        session.write_file("private/b.md", b"beta")
+        controller = VaultApplication(
+            self.app, home=session.home, no_tray=True, self_test=True
+        )
+        try:
+            controller.attach_session(session)
+            dialog = SettingsDialog(controller, controller.window)
+            keys = {item.data(0, Qt.ItemDataRole.UserRole) for item in self._items(dialog.folder_tree)}
+            self.assertIn("notes", keys)
+            self.assertIn("private", keys)
+            by_key = {
+                item.data(0, Qt.ItemDataRole.UserRole): item
+                for item in self._items(dialog.folder_tree)
+            }
+            self.assertEqual(by_key["private"].checkState(0), Qt.CheckState.Unchecked)
+            self.assertEqual(by_key["notes"].checkState(0), Qt.CheckState.Checked)
+
+            dialog._set_all_folders(False)
+            self.assertEqual(dialog._folder_states, {"*": False})
+            self.assertTrue(
+                all(
+                    item.checkState(0) == Qt.CheckState.Unchecked
+                    for item in self._items(dialog.folder_tree)
+                )
+            )
+            dialog._set_all_folders(True)
+            self.assertEqual(dialog._folder_states, {})
+            self.assertTrue(
+                all(
+                    item.checkState(0) == Qt.CheckState.Checked
+                    for item in self._items(dialog.folder_tree)
+                )
+            )
+            dialog.close()
+        finally:
+            controller.shutdown()
+            session.close()
+            if previous_config is None:
+                os.environ.pop("XDG_CONFIG_HOME", None)
+            else:
+                os.environ["XDG_CONFIG_HOME"] = previous_config
+
+
+@unittest.skipUnless(HAVE_QT, "PySide6 is not installed")
 class WebShellSmokeTest(unittest.TestCase):
     """The in-process web shell starts with the app (SPEC/09 §A, §D)."""
 

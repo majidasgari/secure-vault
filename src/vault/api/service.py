@@ -16,7 +16,8 @@ from collections import deque
 from datetime import datetime, timezone
 from typing import Any, Callable, Iterable
 
-from ..core import semantics
+from ..core.chunking import CHUNK_MODES
+from ..core.semantics import normalize_folder_key
 from ..core.security import LEVELS, SOURCE_MCP, SOURCE_UI
 from ..errors import (
     BadRequest,
@@ -362,19 +363,42 @@ class Service:
         logical = normalize_vault_path(self._text(params.get("path", "/"), param="path"))
         result = self.session.list_folder(logical, source=role)
         note = None
+        entries = [self._entry(row) for row in result["entries"]]
         if not self.session.is_locked:
             note = self.session.folder_note(logical, source=role)
+            self._attach_notes(result["entries"], entries)
         return {
             "path": _api_path(result["path"]),
             "note": note,
-            "entries": [self._entry(row) for row in result["entries"]],
+            "entries": entries,
         }
+
+    def _attach_notes(
+        self, rows: list[dict[str, Any]], entries: list[dict[str, Any]]
+    ) -> None:
+        """Attach each child's note (file or folder) to its listing entry."""
+        if self.session._store is None:
+            return
+        file_ids = [int(row["id"]) for row in rows if not int(row["is_dir"])]
+        file_notes = self.session.store.get_file_notes(file_ids) if file_ids else {}
+        for row, entry in zip(rows, entries):
+            if int(row["is_dir"]):
+                entry["note"] = self.session.store.get_folder_note(
+                    str(row["logical_path"])
+                )
+            else:
+                entry["note"] = file_notes.get(int(row["id"]))
 
     def _h_read_file(self, params: dict, role: str, session_id: str) -> dict:
         logical = normalize_vault_path(self._text(self._require(params, "path"), param="path"))
         encoding = self._text(params.get("encoding", "utf-8"), param="encoding")
         data = self.session.read_file(logical, source=role, session=session_id)
-        return self._read_payload(logical, data, encoding)
+        payload = self._read_payload(logical, data, encoding)
+        try:
+            payload["note"] = self.session.file_note(logical, source=role)
+        except VaultError:  # noqa: BLE001 - the note is optional
+            payload["note"] = None
+        return payload
 
     def _h_read_lines(self, params: dict, role: str, session_id: str) -> dict:
         logical = normalize_vault_path(self._text(self._require(params, "path"), param="path"))
@@ -495,23 +519,54 @@ class Service:
         self.session.set_folder_note(logical, text, source=role)
         return {"path": _api_path(logical), "updated": True}
 
+    def _h_file_note(self, params: dict, role: str, session_id: str) -> dict:
+        logical = normalize_vault_path(self._text(self._require(params, "path"), param="path"))
+        note = self.session.file_note(logical, source=role)
+        return {"path": _api_path(logical), "note": note}
+
+    def _h_set_file_note(self, params: dict, role: str, session_id: str) -> dict:
+        logical = normalize_vault_path(self._text(self._require(params, "path"), param="path"))
+        text = self._text(self._require(params, "text"), param="text")
+        self.session.set_file_note(logical, text, source=role)
+        return {"path": _api_path(logical), "updated": True}
+
+    def _h_digest(self, params: dict, role: str, session_id: str) -> dict:
+        """One compact overview of a folder/file (notes + first lines), not N calls."""
+        logical = normalize_vault_path(self._text(params.get("path", "/"), param="path"))
+        depth = int(params.get("depth", 1))
+        return self.session.digest(logical, depth=depth, source=role)
+
     # ------------------------------------------------------------ handlers: search
+    @staticmethod
+    def _prefix(params: dict) -> str | None:
+        """Return the optional normalized ``path_prefix`` search scope."""
+        raw = params.get("path_prefix") or params.get("path")
+        if not isinstance(raw, str) or not raw.strip():
+            return None
+        return normalize_vault_path(raw)
+
     def _h_search_filenames(self, params: dict, role: str, session_id: str) -> dict:
         query = self._text(self._require(params, "query"), param="query")
         limit = int(params.get("limit", 50))
-        results = self.session.search_filenames(query, limit=limit, source=role)
+        results = self.session.search_filenames(
+            query, limit=limit, path_prefix=self._prefix(params), source=role
+        )
         return {"query": query, "count": len(results), "results": results}
 
     def _h_search_text(self, params: dict, role: str, session_id: str) -> dict:
         query = self._text(self._require(params, "query"), param="query")
         limit = int(params.get("limit", 50))
-        results = self.session.search_text(query, limit=limit, source=role)
+        results = self.session.search_text(
+            query, limit=limit, path_prefix=self._prefix(params), source=role
+        )
         return {"query": query, "count": len(results), "results": results}
 
     def _h_search_semantic(self, params: dict, role: str, session_id: str) -> dict:
         query = self._text(self._require(params, "query"), param="query")
         limit = int(params.get("limit", 50))
-        results = self.session.search_semantic(query, limit=limit, source=role)
+        results = self.session.search_semantic(
+            query, limit=limit, path_prefix=self._prefix(params), source=role
+        )
         return {"query": query, "count": len(results), "results": results}
 
     # ----------------------------------------------------------- handlers: secrets
@@ -584,6 +639,23 @@ class Service:
                 current["enabled"] = bool(semantic["enabled"])
             if semantic.get("model"):
                 current["model"] = self._text(semantic["model"], param="semantic.model")
+            chunking = semantic.get("chunking")
+            if chunking is not None:
+                mode = self._text(chunking, param="semantic.chunking")
+                if mode not in CHUNK_MODES:
+                    raise BadRequest("unknown_chunking", details={"value": mode})
+                current["chunking"] = mode
+            db_path = semantic.get("db_path")
+            if db_path is not None:
+                current["db_path"] = self._text(db_path, param="semantic.db_path")
+            states = semantic.get("folder_states")
+            if states is not None:
+                if not isinstance(states, dict):
+                    raise BadRequest("folder_states_must_be_object")
+                clean_states: dict[str, bool] = {}
+                for key, value in states.items():
+                    clean_states[normalize_folder_key(str(key))] = bool(value)
+                current["folder_states"] = clean_states
         importer = params.get("import_joplin")
         if isinstance(importer, dict):
             current = settings.setdefault("import_joplin", {})
@@ -615,11 +687,28 @@ class Service:
             if "open_browser_on_start" in web:
                 current["open_browser_on_start"] = bool(web["open_browser_on_start"])
         self.session.meta.save()
+        if isinstance(semantic, dict):
+            self.session.refresh_semantic_provider()
+            if "db_path" in semantic:
+                self.session.reload_semantic_store()
+            if "folder_states" in semantic:
+                self.session.prune_semantic_folders()
         return {"updated": True, "settings": json.loads(json.dumps(settings))}
 
     def _h_semantic_index(self, params: dict, role: str, session_id: str) -> dict:
         force = bool(params.get("force", False))
-        return semantics.index_all(self.session, force=force)
+        # Indexing resolves the provider from the current settings on its own.
+        return self.session.index_semantics(force=force)
+
+    def _h_semantic_status(self, params: dict, role: str, session_id: str) -> dict:
+        """Return the semantic index status (model, chunks, availability)."""
+        return {"semantic": self.session.status()["semantic"]}
+
+    def _h_semantic_reindex(self, params: dict, role: str, session_id: str) -> dict:
+        """Re-embed everything, or just one folder/file subtree (``path``)."""
+        prefix = self._prefix(params)
+        force = bool(params.get("force", True))
+        return self.session.index_semantics(force=force, prefix=prefix)
 
     def _h_stats(self, params: dict, role: str, session_id: str) -> dict:
         status = self.session.status()
@@ -749,6 +838,9 @@ class Service:
         "vault.set_tags": (_h_set_tags, _BOTH),
         "vault.folder_note": (_h_folder_note, _BOTH),
         "vault.set_folder_note": (_h_set_folder_note, _BOTH),
+        "vault.file_note": (_h_file_note, _BOTH),
+        "vault.set_file_note": (_h_set_file_note, _BOTH),
+        "vault.digest": (_h_digest, _BOTH),
         "vault.search_filenames": (_h_search_filenames, _BOTH),
         "vault.search_text": (_h_search_text, _BOTH),
         "vault.search_semantic": (_h_search_semantic, _BOTH),
@@ -760,12 +852,14 @@ class Service:
         "vault.get_settings": (_h_get_settings, _BOTH),
         "vault.set_settings": (_h_set_settings, _UI_ONLY),
         "vault.semantic_index": (_h_semantic_index, _UI_ONLY),
+        "vault.semantic_status": (_h_semantic_status, _BOTH),
+        "vault.semantic_reindex": (_h_semantic_reindex, _BOTH),
         "vault.stats": (_h_stats, _BOTH),
         "vault.verify_blobs": (_h_verify_blobs, _UI_ONLY),
         "vault.recent": (_h_recent, _BOTH),
         "vault.tree": (_h_tree, _UI_ONLY),
-        "vault.all_tags": (_h_all_tags, _UI_ONLY),
-        "vault.files_by_tag": (_h_files_by_tag, _UI_ONLY),
+        "vault.all_tags": (_h_all_tags, _BOTH),
+        "vault.files_by_tag": (_h_files_by_tag, _BOTH),
     }
 
 

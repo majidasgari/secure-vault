@@ -11,7 +11,7 @@ from enum import StrEnum
 from typing import Any
 
 from ..errors import BadRequest
-from ..util import normalize_fa
+from ..util import normalize_fa, normalize_vault_path
 from . import semantics
 from .security import Policy
 
@@ -44,8 +44,12 @@ def search_filenames(
     *,
     limit: int = 50,
     include_secret: bool = True,
+    path_prefix: str | None = None,
 ) -> list[dict[str, Any]]:
     """Search the whole logical path (names only), newest rows last.
+
+    ``path_prefix`` restricts the search to a folder subtree, which keeps results from a
+    small folder from being crowded out by a huge one.
 
     Raises:
         BadRequest: when the query is empty after normalization.
@@ -53,11 +57,14 @@ def search_filenames(
     normalized = normalize_fa(query)
     if not normalized:
         raise BadRequest("empty_query")
+    scope = normalize_vault_path(path_prefix) if path_prefix else None
     tokens = [tok for tok in normalized.split(" ") if tok]
     results: list[dict[str, Any]] = []
     for row in session.index.walk("/"):
         level = row["sensitivity"]
         if not include_secret and level != "normal":
+            continue
+        if not semantics.path_under(str(row["logical_path"]), scope):
             continue
         name = normalize_fa(row["logical_path"])
         if normalized in name or all(tok in name for tok in tokens):
@@ -77,8 +84,30 @@ def _snippet(body: str, normalized_query: str) -> str:
     return body[start : start + MAX_SNIPPET]
 
 
-def search_text(session: Any, query: str, *, limit: int = 50) -> list[dict[str, Any]]:
+def _match_location(body: str, normalized_query: str) -> tuple[int, int]:
+    """Return the 1-based ``(line, offset)`` of the first line matching the query."""
+    tokens = [token for token in normalized_query.split(" ") if token]
+    offset = 0
+    for number, line in enumerate(body.splitlines(), start=1):
+        normalized_line = normalize_fa(line)
+        if any(token in normalized_line for token in tokens):
+            return number, offset
+        offset += len(line) + 1
+    return 0, 0
+
+
+def search_text(
+    session: Any,
+    query: str,
+    *,
+    limit: int = 50,
+    path_prefix: str | None = None,
+) -> list[dict[str, Any]]:
     """Search literal content via FTS5 BM25 over ``normal`` files only.
+
+    Each hit carries a ``line`` and ``offset`` (1-based line, character offset) so a
+    caller can jump straight to the match with ``read_lines``. ``path_prefix`` scopes the
+    search to a subtree.
 
     Raises:
         BadRequest: when the query is empty.
@@ -88,13 +117,17 @@ def search_text(session: Any, query: str, *, limit: int = 50) -> list[dict[str, 
     if not normalized:
         raise BadRequest("empty_query")
     session._require_unlocked()
-    hits = session.store.search_text(normalized, limit=limit)
+    scope = normalize_vault_path(path_prefix) if path_prefix else None
+    fetch = int(limit) * 5 if scope else int(limit)
+    hits = session.store.search_text(normalized, limit=max(fetch, int(limit)))
     results: list[dict[str, Any]] = []
     for file_id, score in hits:
         row = session.index.get_file_by_id(file_id)
         if row is None:
             continue
         if not Policy.can_search_content(row["sensitivity"], "ui"):
+            continue
+        if not semantics.path_under(str(row["logical_path"]), scope):
             continue
         try:
             body = session.fs.read_bytes(row).decode("utf-8", errors="ignore")
@@ -103,11 +136,20 @@ def search_text(session: Any, query: str, *, limit: int = 50) -> list[dict[str, 
         result = _result(row, "text")
         result["snippet"] = _snippet(body, normalized)
         result["score"] = score
+        result["line"], result["offset"] = _match_location(body, normalized)
         results.append(result)
-    return results[: int(limit)]
+        if len(results) >= int(limit):
+            break
+    return results
 
 
-def search_semantic(session: Any, query: str, *, limit: int = 50) -> list[dict[str, Any]]:
+def search_semantic(
+    session: Any,
+    query: str,
+    *,
+    limit: int = 50,
+    path_prefix: str | None = None,
+) -> list[dict[str, Any]]:
     """Search by embedding cosine similarity over ``normal`` files only.
 
     Raises:
@@ -116,7 +158,7 @@ def search_semantic(session: Any, query: str, *, limit: int = 50) -> list[dict[s
     """
     if not normalize_fa(query):
         raise BadRequest("empty_query")
-    return semantics.search(session, query, limit=limit)
+    return semantics.search(session, query, limit=limit, path_prefix=path_prefix)
 
 
 __all__ = ["SearchKind", "search_filenames", "search_text", "search_semantic"]

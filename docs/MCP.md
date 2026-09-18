@@ -88,19 +88,26 @@ All tools accept a JSON object and return an object. Paths use the vault-absolut
 | tool | parameters | result |
 |---|---|---|
 | `vault_status` | — | `{"locked","home","files","folders","by_level","semantic","auto_lock_seconds","store","daemon":{"running":true}}` |
-| `list_folder` | `path` (default `/`) | `{"path","note","entries":[{name,path,is_dir,size,mtime,sensitivity,tags,secret}]}` |
-| `read_file` | `path` (req), `encoding` (default `utf-8`) | `{"path","content","sensitivity","size"}` |
+| `list_folder` | `path` (default `/`) | `{"path","note","entries":[{name,path,is_dir,size,mtime,sensitivity,tags,note,secret}]}` |
+| `digest` | `path` (default `/`), `depth` (default 1) | one overview: `{name,path,is_dir,note,entries:[{name,path,size,sensitivity,tags,note,first_line}]}` (recursive to `depth`); replaces N+1 list/read calls |
+| `read_file` | `path` (req), `encoding` (default `utf-8`) | `{"path","content","sensitivity","size","note"}` |
 | `read_lines` | `path` (req), `start` (1-based, default 1), `count` (default 200) | `{"path","start","count","text","total_lines"}` |
 | `write_file` | `path` (req), `content` (req), `encoding`, `sensitivity` (`normal`/`secret`/`secretfile`) | `{"path","size","sensitivity","created"}` |
 | `write_lines` | `path` (req), `text` (req), `mode` (`append`/`prepend`/`insert`), `at_line` | `{"path","size","lines"}` |
 | `mkdir` | `path` (req) | `{"path","created":true}` |
 | `file_ops` | `op` (`move`/`copy`/`delete`/`mkdir`), `src` (req), `dst`, `recursive` | `{"op","src","dst","affected"}` |
 | `set_sensitivity` | `path` (req), `level` (req) | `{"path","from","to"}` — agents may only raise; lowering → `SENSITIVITY_DOWNGRADE_FORBIDDEN` |
-| `search_filenames` | `query` (req), `limit` (default 50) | `{"query","count","results":[{"logical_path","is_dir","sensitivity","size","mtime","match"}]}` |
-| `search_text` | `query` (req), `limit` (default 50) | same shape plus `snippet` (≤240 chars) and `score`; `normal` files only |
-| `search_semantic` | `query` (req), `limit` (default 50) | same as `search_text`; needs an embedding provider |
+| `search_filenames` | `query` (req), `limit` (default 50), `path_prefix` | `{"query","count","results":[{"logical_path","is_dir","sensitivity","size","mtime","match"}]}` |
+| `search_text` | `query` (req), `limit` (default 50), `path_prefix` | same shape plus `snippet` (≤240 chars), `score`, `line` and `offset` (jump straight to the match with `read_lines`); `normal` files only |
+| `search_semantic` | `query` (req), `limit` (default 50), `path_prefix` | same as `search_text`; needs an embedding provider |
 | `read_folder_note` | `path` (req) | `{"path","note"}` |
 | `write_folder_note` | `path` (req), `text` (req) | `{"path","updated":true}` |
+| `read_file_note` | `path` (req) | `{"path","note"}` |
+| `write_file_note` | `path` (req), `text` (req) | `{"path","updated":true}` |
+| `all_tags` | — | `{"tags":[{name,count}]}` (metadata) |
+| `files_by_tag` | `tag` (req) | `{"tag","count","results":[…]}` (metadata) |
+| `semantic_status` | — | `{"semantic":{enabled,available,reason,model,chunking,chunks,indexed_files,db_path}}` |
+| `semantic_reindex` | `path` (optional subtree), `force` (default true) | `{"indexed","skipped","chunks"}` — re-embed all or just one subtree |
 | `request_open_secret` | `path` (req) | `{"request_id","status":"pending","note":"…"}` — `secretfile` only; content is never returned |
 | `get_access_log` | `limit` (default 100), `offset`, `source` (`ui`/`mcp`/`socket`), `outcome` (`allow`/`deny`/`error`) | `{"count","entries":[{ts,iso,source,role,tool,target_path,outcome,code,details,session}]}` |
 
@@ -113,6 +120,11 @@ Agent-facing rules:
 * `request_open_secret` works only for `secretfile`; the user sees a desktop dialog and
   the native viewer, and the agent gets `{"status":"pending"}` with no content.
 * `search_filenames` sees names of **all** levels (names are metadata).
+* `search_filenames`/`search_text`/`search_semantic` accept `path_prefix` to scope the
+  search to one folder subtree — cheaper and immune to a huge folder crowding out a small
+  one.
+* `read_file_note`/`write_file_note`/`digest` expose the short per-file notes and a folder
+  overview; notes are user-authored metadata (both roles), file content never is.
 
 ## 5. Resources
 
@@ -140,7 +152,7 @@ When the vault is locked (or the daemon is not running):
 
 | works while locked | fails while locked |
 |---|---|
-| `vault_status`, `list_folder`, `search_filenames`, `get_access_log`, `resources/read` of `vault://status` | every content tool, `read_folder_note`, `request_open_secret`, `resources/read` of a note |
+| `vault_status`, `list_folder`, `search_filenames`, `all_tags`, `files_by_tag`, `semantic_status`, `get_access_log`, `resources/read` of `vault://status` | every content tool, `read_folder_note`, `read_file_note`, `digest`, `request_open_secret`, `resources/read` of a note |
 
 Failure is `-32000` with `data.code = "VAULT_LOCKED"` when locked, or `-32000` with
 `data.code = "VAULT_NOT_RUNNING"` when no app is running. The bridge never starts the

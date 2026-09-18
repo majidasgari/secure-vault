@@ -130,6 +130,11 @@ def run_self_test(
     else:
         session = VaultSession.create(vault_home, SELFTEST_PASSWORD)
     session._runtime = runtime
+    # Keep the (otherwise user-home) semantic cache inside the scratch dir.
+    session.meta.settings.setdefault("semantic", {})["db_path"] = str(
+        base / "semantic.db"
+    )
+    session.meta.save()
 
     session.set_semantic_provider(semantics.StubProvider())
     session.write_file("notes/hello.md", b"# Hello\n\nalpha world\n")

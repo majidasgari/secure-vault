@@ -153,4 +153,41 @@ class VaultClient:
                 raise VaultError("response_too_large")
 
 
-__all__ = ["VaultClient"]
+class RefreshingClient(VaultClient):
+    """Lazy ``VaultClient`` that re-reads the runtime token after the app restarts.
+
+    The app rotates ``runtime_dir()/tokens.json`` on every start, so a bridge spawned by
+    an agent runtime (Hermes/Claude, a long-lived gateway) is left holding a dead token
+    after the user restarts the app — every call then answers ``UNAUTHORIZED: invalid_token``
+    until the agent itself restarts. This subclass resolves the token on first use and
+    re-resolves it (then retries once) when the daemon rejects the one it holds, so no
+    denied row is ever written to the access log.
+    """
+
+    def __init__(self) -> None:
+        """Start without credentials; they are read from the runtime dir on first use."""
+        super().__init__(socket_path=None, token=None)
+        self._resolved = False
+
+    def _resolve(self) -> None:
+        """Copy socket path and token out of ``runtime_dir()`` (raises VaultNotRunning)."""
+        fresh = VaultClient.from_runtime(role="mcp")
+        self.socket_path = fresh.socket_path
+        self.token = fresh.token
+        self._resolved = True
+
+    def call(self, method: str, params: dict | None = None) -> dict:
+        """Forward one call, re-reading the token once if the daemon rotated it."""
+        if not self._resolved:
+            self._resolve()
+        try:
+            return super().call(method, params)
+        except VaultError as exc:
+            if exc.code != "UNAUTHORIZED":
+                raise
+            self._resolved = False
+            self._resolve()
+            return super().call(method, params)
+
+
+__all__ = ["RefreshingClient", "VaultClient"]

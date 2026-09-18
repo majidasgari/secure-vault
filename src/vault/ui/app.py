@@ -100,6 +100,34 @@ class ReindexProgress:
         )
 
 
+class SemanticProgress:
+    """Adapts :meth:`VaultSession.index_semantics` progress to the progress dialog's shape."""
+
+    def __init__(self) -> None:
+        """Start with an empty progress state."""
+        self.progress: dict[str, Any] = {
+            "phase": "semantic",
+            "phase_done": 0,
+            "phase_total": 0,
+            "done": 0,
+            "total": 0,
+            "percent": 0,
+            "finished": False,
+        }
+
+    def __call__(self, done: int, total: int) -> None:
+        """Record one tick (called from the worker thread)."""
+        total = max(1, int(total))
+        self.progress.update(
+            phase="semantic",
+            phase_done=int(done),
+            phase_total=total,
+            done=int(done),
+            total=total,
+            percent=int(round(100.0 * done / total)),
+        )
+
+
 def _format_duration(seconds: float) -> str:
     """Return a short, localized "time left" string."""
     total = int(max(0, round(seconds)))
@@ -166,6 +194,8 @@ class VaultApplication(QObject):
     import_finished = Signal(object)
     # Emitted from the reindex worker thread with the rebuild result.
     reindex_finished = Signal(object)
+    # Emitted from the semantic-index worker thread with the ``indexed``/``skipped`` result.
+    semantic_finished = Signal(object)
 
     def __init__(
         self,
@@ -229,6 +259,7 @@ class VaultApplication(QObject):
         self.activity_reported.connect(self._handle_activity)
         self.import_finished.connect(self._on_import_finished)
         self.reindex_finished.connect(self._on_reindex_finished)
+        self.semantic_finished.connect(self._on_semantic_finished)
 
         self._auto_lock_timer = QTimer(self)
         self._auto_lock_timer.setInterval(AUTO_LOCK_TICK_MS)
@@ -292,6 +323,7 @@ class VaultApplication(QObject):
             self.hub.subscribe(self.window.log_panel.refresh_soon)
             self.window.editor.open_in_browser.connect(self.open_in_browser)
             self.window.editor.direction_changed.connect(self._on_editor_direction)
+            self.window.editor.note_changed.connect(self.set_file_note)
             mode = self.config.data.get("editor_direction")
             if isinstance(mode, str) and mode in ("auto", "rtl", "ltr"):
                 self.window.editor.set_direction_mode(mode)
@@ -519,6 +551,23 @@ class VaultApplication(QObject):
         )
         self.hub.notify()
 
+    def file_note(self, path: str) -> str | None:
+        """Return the short note attached to a file."""
+        result = self.dispatch_ui("vault.file_note", {"path": self._api(path)})
+        return result.get("note")
+
+    def set_file_note(self, path: str, text: str) -> None:
+        """Persist the short note attached to a file."""
+        try:
+            self.dispatch_ui(
+                "vault.set_file_note", {"path": self._api(path), "text": text}
+            )
+        except VaultError as exc:
+            if self.window is not None:
+                QMessageBox.warning(self.window, i18n.tr("app.title"), error_message(exc))
+            return
+        self.hub.notify()
+
     def open_path(self, path: str) -> bool:
         """Open a file honoring the sensitivity rules (SPEC/03 §2.4)."""
         api = self._api(path)
@@ -529,14 +578,20 @@ class VaultApplication(QObject):
                 QMessageBox.warning(self.window, i18n.tr("app.title"), error_message(exc))
             return False
         level = str(entry.get("sensitivity", "normal"))
+        try:
+            note = self.file_note(api)
+        except VaultError:
+            note = None
         if level == "normal":
             content = self.read(api)
             self.window.editor.set_content(api, content, preview_enabled=True)
+            self.window.editor.set_note(note or "")
         elif level == "secret":
             if not self._confirm(level, api):
                 return False
             content = self.read(api)
             self.window.editor.set_content(api, content, preview_enabled=False)
+            self.window.editor.set_note(note or "")
             notifications.notify(
                 i18n.tr("notification.secret_opened"), api, tray=self.tray
             )
@@ -950,17 +1005,105 @@ class VaultApplication(QObject):
             ),
         )
 
-    def semantic_index_now(self) -> None:
-        """Rebuild the semantic index and report the result."""
+    def semantic_index_now(self) -> bool:
+        """Rebuild the semantic index in the background (SPEC/01 §11).
+
+        Embedding every note can take minutes, so it runs off the GUI thread with a busy
+        indicator, exactly like the full-text rebuild.
+        """
+        if self.self_test:
+            return True
+        if self.session is None or self.session.is_locked:
+            self._notify_web_problem(i18n.tr("error.VAULT_LOCKED"))
+            return False
+        if self.import_running:
+            return False
+        self.import_running = True
+        adapter = SemanticProgress()
+        self._show_semantic_progress(adapter)
+        thread = threading.Thread(
+            target=self._semantic_index_worker,
+            args=(adapter,),
+            name="vault-semantic",
+            daemon=True,
+        )
+        thread.start()
+        return True
+
+    def _semantic_index_worker(self, adapter: SemanticProgress) -> None:
+        """Run the semantic build off the GUI thread and report the result.
+
+        The provider is resolved and the corpus embedded directly on the session (like
+        the full-text rebuild), so the worker owns the progress callback and the GUI
+        thread only polls it.
+        """
         try:
-            result = self.dispatch_ui("vault.semantic_index", {"force": True})
-        except VaultError as exc:
-            QMessageBox.warning(self.window, i18n.tr("app.title"), error_message(exc))
+            result = self.session.index_semantics(force=True, progress=adapter)
+        except Exception as exc:  # noqa: BLE001 - report, never crash the UI
+            payload: dict[str, Any] = {"error": error_message(exc)}
+        else:
+            payload = dict(result)
+        adapter.progress["finished"] = True
+        self.semantic_finished.emit(payload)
+
+    def _show_semantic_progress(self, adapter: SemanticProgress) -> None:
+        """Show a determinate progress bar while the embeddings are computed."""
+        if self.self_test:
             return
-        QMessageBox.information(
-            self.window,
+        dialog = QProgressDialog(self.window)
+        dialog.setWindowTitle(i18n.tr("menu.semantic_index"))
+        dialog.setLabelText(i18n.tr("semantic.running"))
+        dialog.setRange(0, 100)
+        dialog.setValue(0)
+        dialog.setCancelButton(None)
+        dialog.setMinimumDuration(0)
+        dialog.setWindowModality(Qt.WindowModality.WindowModal)
+        dialog.show()
+        self._import_progress = dialog
+        self._import_importer = adapter
+        self._import_started_at = time.monotonic()
+        timer = QTimer(self)
+        timer.setInterval(IMPORT_POLL_MS)
+        timer.timeout.connect(self._poll_semantic_progress)
+        timer.start()
+        self._import_timer = timer
+
+    def _poll_semantic_progress(self) -> None:
+        """Show the embedding count/percentage plus a rough "time left" estimate."""
+        dialog, importer = self._import_progress, self._import_importer
+        if dialog is None or importer is None:
+            return
+        state = getattr(importer, "progress", None) or {}
+        percent = max(0, min(100, int(state.get("percent") or 0)))
+        done = int(state.get("done") or 0)
+        total = int(state.get("total") or 0)
+        dialog.setValue(percent)
+        text = i18n.tr("semantic.progress", percent=percent, done=done, total=total)
+        started = self._import_started_at or time.monotonic()
+        elapsed = max(0.001, time.monotonic() - started)
+        if 0 < done < total:
+            remaining = (elapsed / done) * (total - done)
+            text += " · " + i18n.tr("import.remaining", value=_format_duration(remaining))
+        dialog.setLabelText(text)
+
+    def _on_semantic_finished(self, payload: Any) -> None:
+        """Close the indicator and tell the user how many files were indexed."""
+        self._close_import_progress()
+        self.import_running = False
+        data = dict(payload or {})
+        if data.get("error"):
+            if self.self_test:
+                self.last_import_error = str(data["error"])
+            else:
+                QMessageBox.warning(
+                    self.window, i18n.tr("menu.semantic_index"), str(data["error"])
+                )
+            return
+        self.hub.notify()
+        notifications.notify(
             i18n.tr("menu.semantic_index"),
-            i18n.tr("settings.semantic_indexed", count=result.get("indexed", 0)),
+            i18n.tr("settings.semantic_indexed", count=int(data.get("indexed", 0))),
+            tray=self.tray,
         )
 
     def open_settings(self) -> None:

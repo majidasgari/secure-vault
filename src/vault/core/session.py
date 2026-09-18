@@ -37,6 +37,7 @@ from .security import (
     Policy,
     rank,
 )
+from .semantic_store import SemanticStore
 from .store import SecureStore
 from .vaultfs import VaultFS
 
@@ -64,9 +65,15 @@ class VaultSession:
         self._index: Index | None = None
         self._fs: VaultFS | None = None
         self._store: SecureStore | None = None
+        #: The separate, rebuildable ``semantic.db`` vector index (opened lazily).
+        self._semantic_store: SemanticStore | None = None
         self._master_key: bytearray | None = None
         self._last_activity = now_ms()
+        #: Provider injected explicitly (tests, self-test); wins over settings.
         self._semantic_provider: semantics.EmbeddingProvider | None = None
+        #: Provider built lazily from the vault settings and cached until refreshed.
+        self._semantic_auto_provider: semantics.EmbeddingProvider | None = None
+        self._semantic_resolved = False
         self._pending: dict[str, dict[str, Any]] = {}
         self.on_secret_request: SecretRequestCallback | None = None
         # SPEC/09 §7: metadata-only activity feed hook (never carries content).
@@ -168,7 +175,7 @@ class VaultSession:
                     except VaultError:
                         data = b""
                     if data:
-                        self._store.index_text(
+                        self._index_file_text(
                             int(row["id"]), data.decode("utf-8", errors="ignore")
                         )
                         indexed += 1
@@ -179,6 +186,46 @@ class VaultSession:
         finally:
             self._suppress_log = previous
         return {"dropped": dropped, "indexed": indexed, "files": len(files)}
+
+    def index_semantics(
+        self,
+        *,
+        force: bool = False,
+        progress: Callable[[int, int], None] | None = None,
+        prefix: str | None = None,
+        refresh: bool = True,
+    ) -> dict[str, int]:
+        """Rebuild the semantic (embedding) index for every ``normal`` text file.
+
+        The provider is (re)resolved from the current settings first, so a newly enabled
+        backend takes effect without restarting. ``progress(done, total)`` is called once
+        per file from whatever thread the caller is on. ``prefix`` limits the rebuild to a
+        folder subtree (or a single file); ``refresh=False`` keeps the loaded model when
+        the caller is re-embedding one file after a write.
+        """
+        if refresh:
+            self.refresh_semantic_provider()
+        return semantics.index_all(
+            self, force=force, progress=progress, prefix=prefix
+        )
+
+    def _auto_index_semantics(self, logical: str) -> None:
+        """Re-embed one path inline when semantic search is already active.
+
+        Best effort: if the semantic cache has not been opened this session, there is no
+        loaded model to reuse and the file is picked up by the next manual index.
+        """
+        if self._semantic_store is None:
+            return
+        try:
+            if not (self._require_meta().settings.get("semantic") or {}).get("enabled"):
+                return
+        except VaultError:
+            return
+        try:
+            self.index_semantics(force=True, prefix=logical, refresh=False)
+        except Exception:  # noqa: BLE001 - best effort; the manual rebuild still works
+            return
 
     def _prune_access_log(self) -> None:
         """Keep the audit log bounded (newest rows win; failures never block unlocking).
@@ -197,6 +244,9 @@ class VaultSession:
         """Flush, wipe the master key and close the store and index."""
         if self._index is not None:
             self._prune_access_log()
+        if self._semantic_store is not None:
+            self._semantic_store.close()
+            self._semantic_store = None
         if self._store is not None:
             self._store.close()
             self._store = None
@@ -226,9 +276,11 @@ class VaultSession:
         return self._home
 
     def flush(self) -> None:
-        """Re-encrypt the content store if it is open."""
+        """Re-encrypt the content store and the semantic index if they are open."""
         if self._store is not None:
             self._store.flush()
+        if self._semantic_store is not None:
+            self._semantic_store.flush()
 
     def touch(self, *, source: str = SOURCE_UI) -> None:
         """Record UI activity for the auto-lock clock (MCP activity does not count)."""
@@ -389,14 +441,122 @@ class VaultSession:
         assert self._store is not None
         return self._store
 
+    def semantic_db_path(self) -> Path:
+        """Resolve where the semantic vector cache lives.
+
+        Default: ``<user data dir>/semantic/<vault_id>.db`` (under the user's home, **not**
+        the synced vault). ``semantic.db_path`` may point at a ``.db`` file or a directory
+        (in which case ``semantic-<vault_id>.db`` is used inside it).
+        """
+        meta = self._require_meta()
+        settings = meta.settings
+        configured = (settings.get("semantic") or {}).get("db_path")
+        vault_id = str(getattr(meta, "vault_id", "") or "vault")
+        if isinstance(configured, str) and configured.strip():
+            candidate = Path(configured).expanduser()
+            if candidate.suffix.lower() == ".db":
+                return candidate
+            return candidate / f"semantic-{vault_id}.db"
+        from ..config import user_data_dir
+
+        return user_data_dir() / "semantic" / f"{vault_id}.db"
+
+    @property
+    def semantic_store(self) -> SemanticStore:
+        """The separate encrypted semantic index (requires an unlocked session).
+
+        The vector cache is a **rebuildable local cache** under the user's home (or a path
+        chosen in Settings), not part of the synced vault: it is opened on first semantic
+        use, created empty when missing, and re-derived on a new machine by re-indexing.
+        It needs the optional ``sqlite-vec`` extension.
+        """
+        self._require_unlocked()
+        if self._semantic_store is None:
+            assert self._master_key is not None
+            path = self.semantic_db_path()
+            try:
+                self._semantic_store = SemanticStore.open(
+                    path, self._master_key, self._runtime
+                )
+            except NotFound:
+                self._semantic_store = SemanticStore.create_new(
+                    path, self._master_key, self._runtime
+                )
+        return self._semantic_store
+
+    def reload_semantic_store(self) -> None:
+        """Flush and forget the open cache so the next use re-resolves its path."""
+        if self._semantic_store is not None:
+            try:
+                self._semantic_store.close()
+            except Exception:  # noqa: BLE001 - the cache is rebuildable
+                pass
+            self._semantic_store = None
+
+    def _forget_semantic(self, file_id: int) -> None:
+        """Drop a file's semantic chunks when its content stops being searchable."""
+        if self._semantic_store is not None:
+            try:
+                self._semantic_store.delete_file(int(file_id))
+            except Exception:  # noqa: BLE001 - the semantic index is a rebuildable cache
+                pass
+
+    def prune_semantic_folders(self) -> int:
+        """Drop chunks for files that are no longer inside an included folder."""
+        if self._semantic_store is None:
+            return 0
+        states = semantics.folder_states(self._require_meta().settings)
+        index = self._require_index()
+        removed = 0
+        for file_id in list(self._semantic_store.indexed_files()):
+            row = index.get_file_by_id(int(file_id))
+            if row is None or not semantics.file_included(
+                str(row["logical_path"]), states
+            ):
+                removed += self._semantic_store.delete_file(int(file_id))
+        if removed:
+            self._semantic_store.flush()
+        return removed
+
     @property
     def semantic_provider(self) -> semantics.EmbeddingProvider | None:
-        """The injected/configured embedding provider, if any."""
-        return self._semantic_provider
+        """The embedding provider, resolved lazily from the settings when not injected.
+
+        An explicitly injected provider (tests, self-test) always wins. Otherwise the
+        provider is built from the vault's ``semantic`` settings on first use and cached;
+        a missing optional backend resolves to ``None`` instead of raising, so the rest of
+        the app keeps working. Call :meth:`refresh_semantic_provider` after changing the
+        settings.
+        """
+        if self._semantic_provider is not None:
+            return self._semantic_provider
+        if not self._semantic_resolved:
+            self._semantic_resolved = True
+            self._semantic_auto_provider = self._build_semantic_provider()
+        return self._semantic_auto_provider
+
+    def _build_semantic_provider(self) -> semantics.EmbeddingProvider | None:
+        """Build a provider from the current settings, or ``None`` when unavailable."""
+        try:
+            settings = self._require_meta().settings
+        except VaultError:
+            return None
+        try:
+            return semantics.get_provider(settings)
+        except semantics.ProviderUnavailable:
+            return None
 
     def set_semantic_provider(self, provider: semantics.EmbeddingProvider | None) -> None:
         """Inject an embedding provider (tests use :class:`~vault.core.semantics.StubProvider`)."""
         self._semantic_provider = provider
+
+    def refresh_semantic_provider(self) -> None:
+        """Forget the settings-derived provider so the next use rebuilds it.
+
+        The explicitly injected provider is untouched.
+        """
+        self._semantic_auto_provider = None
+        self._semantic_resolved = False
 
     # ---------------------------------------------------------------------- status
     def status(self) -> dict[str, Any]:
@@ -410,6 +570,16 @@ class VaultSession:
             if self._store is not None
             else {"fts_rows": 0, "notes": 0, "vectors": 0, "bytes": 0}
         )
+        if self._semantic_store is not None:
+            semantic_stats = self._semantic_store.stats()
+        else:
+            semantic_stats = {
+                "chunks": 0,
+                "files": 0,
+                "model": None,
+                "chunking": None,
+                "bytes": 0,
+            }
         return {
             "locked": self.is_locked,
             "home": str(self._home),
@@ -421,6 +591,11 @@ class VaultSession:
                 "available": available,
                 "reason": reason,
                 "model": semantic_settings.get("model"),
+                "chunking": semantics.chunk_mode(meta.settings),
+                "chunks": int(semantic_stats["chunks"]),
+                "indexed_files": int(semantic_stats["files"]),
+                "bytes": int(semantic_stats["bytes"]),
+                "db_path": str(self.semantic_db_path()),
             },
             "auto_lock_seconds": int(meta.settings.get("auto_lock_seconds", 0) or 0),
             "store": store_stats,
@@ -501,6 +676,13 @@ class VaultSession:
         assert self._fs is not None
         return self._fs.read_bytes(row)
 
+    def _index_file_text(self, file_id: int, text: str) -> None:
+        """(Re)index a file's body together with its short note into FTS."""
+        store = self._store
+        note = store.get_file_note(int(file_id)) if store is not None else ""
+        if store is not None:
+            store.index_text(int(file_id), text, note=note or "")
+
     def write_file(
         self,
         path: str,
@@ -559,9 +741,10 @@ class VaultSession:
         if existing is not None and existing.get("blob_id") and existing["blob_id"] != blob_id:
             self.fs.delete_blob(existing["blob_id"])
         if desired == "normal":
-            self._store.index_text(file_id, data.decode("utf-8", errors="ignore"))
+            self._index_file_text(file_id, data.decode("utf-8", errors="ignore"))
         else:
             self._store.remove_file(file_id)
+            self._forget_semantic(file_id)
         self.flush()
         self._log(
             source=source, tool="write_file", target_path=logical, outcome="allow"
@@ -697,7 +880,7 @@ class VaultSession:
             source=source,
         )
         if row["sensitivity"] == "normal":
-            self._store.index_text(file_id, data.decode("utf-8", errors="ignore"))
+            self._index_file_text(file_id, data.decode("utf-8", errors="ignore"))
 
     def delete(
         self, path: str, *, source: str = SOURCE_UI, recursive: bool = False
@@ -711,6 +894,7 @@ class VaultSession:
             if row.get("blob_id"):
                 self.fs.delete_blob(row["blob_id"])
             self._store.remove_file(int(row["id"]))
+            self._forget_semantic(int(row["id"]))
         self.flush()
         self._log(source=source, tool="delete", target_path=logical, outcome="allow")
         self._emit_activity(
@@ -769,9 +953,10 @@ class VaultSession:
             new_row = idx.require_file(logical)
             if level == "normal":
                 data = self._read_raw(new_row)
-                self._store.index_text(int(new_row["id"]), data.decode("utf-8", "ignore"))
+                self._index_file_text(int(new_row["id"]), data.decode("utf-8", "ignore"))
             else:
                 self._store.remove_file(int(new_row["id"]))
+                self._forget_semantic(int(new_row["id"]))
         self.flush()
         self._log(source=source, tool="set_sensitivity", target_path=logical, outcome="allow")
         return new_row
@@ -806,12 +991,125 @@ class VaultSession:
             source=source, tool="set_folder_note", target_path=logical, outcome="allow"
         )
 
+    def file_note(self, path: str, *, source: str = SOURCE_UI) -> str | None:
+        """Return the short note attached to a file, if any."""
+        logical = normalize_vault_path(path)
+        self._require_unlocked()
+        row = self._require_index().require_file(logical)
+        return self._store.get_file_note(int(row["id"]))
+
+    def set_file_note(self, path: str, text: str, *, source: str = SOURCE_UI) -> None:
+        """Attach/replace the short note on a file and keep search in sync."""
+        logical = normalize_vault_path(path)
+        self._require_unlocked()
+        row = self._require_index().require_file(logical)
+        if int(row["is_dir"]):
+            raise BadRequest("is_directory", details={"path": logical})
+        file_id = int(row["id"])
+        self._store.set_file_note(file_id, text)
+        if row["sensitivity"] == "normal":
+            try:
+                data = self._read_raw(row)
+                self._index_file_text(file_id, data.decode("utf-8", errors="ignore"))
+            except VaultError:
+                pass
+            self._auto_index_semantics(logical)
+        self.flush()
+        self._log(
+            source=source, tool="set_file_note", target_path=logical, outcome="allow"
+        )
+
+    # ---------------------------------------------------------------------- digest
+    def digest(
+        self, path: str, *, depth: int = 1, source: str = SOURCE_UI
+    ) -> dict[str, Any]:
+        """Return one compact overview of a folder (or file), notes included.
+
+        Replaces the N+1 round-trips an agent needs today to understand a folder: the
+        folder's note plus, for each child (recursively up to ``depth``), its name, size,
+        sensitivity, tags, note and — for normal files — the first non-empty line.
+        """
+        logical = normalize_vault_path(path)
+        self._require_unlocked()
+        row = self._require_index().require_file(logical)
+        if int(row["is_dir"]):
+            result = self._digest_folder(logical, max(0, int(depth)))
+        else:
+            result = self._digest_file(row)
+        self._log(source=source, tool="digest", target_path=logical, outcome="allow")
+        return result
+
+    def _digest_folder(self, logical: str, depth: int) -> dict[str, Any]:
+        """Build the recursive digest payload for ``logical``."""
+        idx = self._require_index()
+        entries: list[dict[str, Any]] = []
+        for child in idx.list_dir(logical):
+            child_path = str(child["logical_path"])
+            if not int(child["is_dir"]):
+                entries.append(self._digest_file(child))
+            elif depth > 0:
+                entries.append(self._digest_folder(child_path, depth - 1))
+            else:
+                entries.append(
+                    {
+                        "name": child_path.rsplit("/", 1)[-1],
+                        "path": "/" + child_path.lstrip("/"),
+                        "is_dir": True,
+                        "size": int(child["size"]),
+                        "mtime": int(child["mtime"]),
+                        "sensitivity": child["sensitivity"],
+                        "tags": idx.get_tags(child_path),
+                        "note": self._store.get_folder_note(child_path),
+                        "entries": [],
+                    }
+                )
+        return {
+            "name": "/" if logical == "/" else logical.rsplit("/", 1)[-1],
+            "path": "/" + logical.lstrip("/"),
+            "is_dir": True,
+            "note": self._store.get_folder_note(logical),
+            "entries": entries,
+        }
+
+    def _digest_file(self, row: dict[str, Any]) -> dict[str, Any]:
+        """Build the digest payload for one file (first line only when normal)."""
+        idx = self._require_index()
+        logical = str(row["logical_path"])
+        entry: dict[str, Any] = {
+            "name": logical.rsplit("/", 1)[-1],
+            "path": "/" + logical.lstrip("/"),
+            "is_dir": False,
+            "size": int(row["size"]),
+            "mtime": int(row["mtime"]),
+            "sensitivity": row["sensitivity"],
+            "tags": idx.get_tags(logical),
+            "note": self._store.get_file_note(int(row["id"])),
+            "first_line": None,
+        }
+        if row["sensitivity"] == "normal":
+            try:
+                data = self._read_raw(row)
+            except VaultError:
+                data = b""
+            for line in data.decode("utf-8", errors="ignore").splitlines():
+                if line.strip():
+                    entry["first_line"] = line.strip()[:200]
+                    break
+        return entry
+
     # ---------------------------------------------------------------------- search
     def search_filenames(
-        self, query: str, *, limit: int = 50, source: str = SOURCE_UI
+        self,
+        query: str,
+        *,
+        limit: int = 50,
+        path_prefix: str | None = None,
+        source: str = SOURCE_UI,
     ) -> list[dict[str, Any]]:
-        """Search filenames (all levels, names only)."""
-        results = search_mod.search_filenames(self, query, limit=limit)
+        """Search filenames (all levels, names only), optionally under ``path_prefix``."""
+        results = search_mod.search_filenames(
+            self, query, limit=limit, path_prefix=path_prefix
+        )
         self._emit_activity(
             kind="search", tool="search_filenames", path=None, sensitivity=None,
             outcome="allow",
@@ -820,11 +1118,18 @@ class VaultSession:
         return results
 
     def search_text(
-        self, query: str, *, limit: int = 50, source: str = SOURCE_UI
+        self,
+        query: str,
+        *,
+        limit: int = 50,
+        path_prefix: str | None = None,
+        source: str = SOURCE_UI,
     ) -> list[dict[str, Any]]:
-        """Search literal content (``normal`` files only)."""
+        """Search literal content (``normal`` files only), optionally under a prefix."""
         self._require_unlocked()
-        results = search_mod.search_text(self, query, limit=limit)
+        results = search_mod.search_text(
+            self, query, limit=limit, path_prefix=path_prefix
+        )
         self._emit_activity(
             kind="search", tool="search_text", path=None, sensitivity=None,
             outcome="allow",
@@ -833,11 +1138,18 @@ class VaultSession:
         return results
 
     def search_semantic(
-        self, query: str, *, limit: int = 50, source: str = SOURCE_UI
+        self,
+        query: str,
+        *,
+        limit: int = 50,
+        path_prefix: str | None = None,
+        source: str = SOURCE_UI,
     ) -> list[dict[str, Any]]:
-        """Search by embedding similarity (``normal`` files only)."""
+        """Search by embedding similarity (``normal`` files only), optionally scoped."""
         self._require_unlocked()
-        results = search_mod.search_semantic(self, query, limit=limit)
+        results = search_mod.search_semantic(
+            self, query, limit=limit, path_prefix=path_prefix
+        )
         self._emit_activity(
             kind="search", tool="search_semantic", path=None, sensitivity=None,
             outcome="allow",
