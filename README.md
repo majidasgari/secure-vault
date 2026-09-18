@@ -41,10 +41,11 @@ set: Python, PySide6, `cryptography`, `argon2-cffi`, `markdown-it-py` and Pygmen
 * Semantic search is opt-in and needs the extra in `requirements-semantic.txt`
   (`sentence-transformers` + the embedded `sqlite-vec` vector index); neither is installed
   by `bootstrap.sh`. Vectors live in a **separate, rebuildable cache** under the user's
-  home (configurable in Settings) and are **never synced** (see `docs/SYNC.md`). The user
-  picks the granularity — whole document, paragraph (default) or sentence — and can tick
-  exactly which folders are included; inline `data:` URIs/base64 images are stripped
-  before embedding.
+  home (configurable in Settings) and are **never synced** (see `docs/SYNC.md`); a
+  content-addressed embedding cache means a rebuild only embeds text it has never seen.
+  The user picks the granularity — whole document, paragraph (default) or sentence — and
+  can tick exactly which folders are included; inline `data:` URIs/base64 images are
+  stripped before embedding.
 
 ## Install
 
@@ -88,7 +89,11 @@ QT_QPA_PLATFORM=offscreen PYTHONPATH=src ./.venv/bin/python -m vault --self-test
 * **Editor**: markdown source with a live preview for `normal` files, per-block
   RTL/LTR formatting (auto / RTL / LTR, `Ctrl+Shift+D`) and monospace fences. For
   `secret` files the preview is disabled; `secretfile` files never reach the editor
-  at all. **Edit in browser** opens the current note in the web UI.
+  at all. **Edit in browser** opens the current note in the web UI. Each file also has
+  a one-line **note** field shown in the file list.
+* **Version history**: every save keeps its own encrypted blob. The editor's *Version
+  history* button lists all versions and shows a git-style colored diff between any two
+  of them. History is UI-only — agents can never read old versions.
 * **Sensitivity levels**: right-click a file → *Set level* → `normal`, `secret` or
   `secretfile`. Lowering requires confirmation and is only possible from the UI.
 * **Secret viewer**: a native plain-text window (no web engine) for `secretfile`

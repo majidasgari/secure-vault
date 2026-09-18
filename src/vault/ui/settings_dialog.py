@@ -203,10 +203,32 @@ class SettingsDialog(QDialog):
         self.semantic_status = QLabel(page)
         self.semantic_status.setWordWrap(True)
         form.addRow(self.semantic_status)
+        self.cache_line = QLabel(page)
+        self.cache_line.setWordWrap(True)
+        form.addRow(self.cache_line)
+        self.clear_cache_button = QPushButton(page)
+        self.clear_cache_button.clicked.connect(self._clear_cache)
+        form.addRow(self.clear_cache_button)
         self.index_button = QPushButton(page)
         self.index_button.clicked.connect(self._index_now)
         form.addRow(self.index_button)
         self.tabs.addTab(page, "")
+
+    def _clear_cache(self) -> None:
+        """Delete the local embedding cache after a confirmation."""
+        question = QMessageBox.question(
+            self,
+            i18n.tr("settings.semantic_cache_clear"),
+            i18n.tr("settings.semantic_cache_clear_confirm"),
+        )
+        if question != QMessageBox.Yes:
+            return
+        try:
+            self._controller.dispatch_ui("vault.semantic_cache_clear", {})
+        except Exception as exc:  # noqa: BLE001 - show a friendly error
+            QMessageBox.warning(self, i18n.tr("settings.title"), str(exc))
+            return
+        self._refresh_semantic_status()
 
     def _populate_folder_tree(self) -> None:
         """Fill the folder tree with checkable items reflecting the stored scope."""
@@ -472,6 +494,7 @@ class SettingsDialog(QDialog):
         self.db_hint.setText(
             i18n.tr("settings.semantic_db_hint", path=self._default_db_path)
         )
+        self.clear_cache_button.setText(i18n.tr("settings.semantic_cache_clear"))
         self.index_button.setText(i18n.tr("settings.semantic_index"))
         self.import_button.setText(i18n.tr("settings.run_import"))
         self.reindex_button.setText(i18n.tr("settings.reindex"))
@@ -479,7 +502,7 @@ class SettingsDialog(QDialog):
         self._refresh_semantic_status()
 
     def _refresh_semantic_status(self) -> None:
-        """Update the semantic availability line."""
+        """Update the semantic availability, cache and last-reset lines."""
         try:
             status = self._controller.dispatch_ui("vault.status", {})
             semantic = status.get("semantic", {})
@@ -498,6 +521,26 @@ class SettingsDialog(QDialog):
                 i18n.tr("search.semantic_unavailable", reason=semantic.get("reason") or "")
             )
             self.index_button.setEnabled(False)
+        cache = semantic.get("cache") or {}
+        self.cache_line.setText(
+            i18n.tr(
+                "settings.semantic_cache_line",
+                entries=int(cache.get("entries") or 0),
+                mb=f"{int(cache.get('bytes') or 0) / 1048576:.1f}",
+                rate=f"{float(cache.get('hit_rate') or 0.0) * 100:.0f}",
+            )
+        )
+        self.clear_cache_button.setEnabled(bool(cache.get("path")))
+        last_reset = semantic.get("last_reset")
+        if last_reset:
+            self.semantic_status.setText(
+                self.semantic_status.text()
+                + " · "
+                + i18n.tr(
+                    "settings.semantic_last_reset",
+                    reason=str(last_reset.get("reason") or ""),
+                )
+            )
 
 
 __all__ = ["SettingsDialog"]

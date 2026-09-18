@@ -149,7 +149,12 @@ def get_provider(settings: dict[str, Any]) -> EmbeddingProvider:
     if provider == "stub":
         return StubProvider()
     if provider == "local":
-        return LocalProvider(str(semantic.get("model", "all-MiniLM-L6-v2")))
+        model = str(semantic.get("model") or "").strip()
+        if not model:
+            # No silent fallback: a default with a different dimension silently wiped
+            # the live index (the incident this guards against).
+            raise ProviderUnavailable("model_not_set")
+        return LocalProvider(model)
     raise ProviderUnavailable("unknown_provider", details={"provider": provider})
 
 
@@ -163,6 +168,8 @@ def is_available(settings: dict[str, Any]) -> tuple[bool, str]:
         return True, "stub"
     if provider != "local":
         return False, "unknown_provider"
+    if not str(semantic.get("model") or "").strip():
+        return False, "model_not_set"
     try:
         import sentence_transformers  # noqa: F401,PLC0415
     except ImportError:
@@ -251,7 +258,10 @@ def path_under(path: str, prefix: str | None) -> bool:
 
 
 def _normal_files(
-    session: Any, states: dict[str, bool], prefix: str | None = None
+    session: Any,
+    states: dict[str, bool],
+    prefix: str | None = None,
+    paths: set[str] | None = None,
 ) -> list[dict[str, Any]]:
     """Return the in-scope ``normal`` files (folders excluded by ``states`` are skipped)."""
     return [
@@ -261,6 +271,7 @@ def _normal_files(
         and row["sensitivity"] == "normal"
         and file_included(str(row["logical_path"]), states)
         and path_under(str(row["logical_path"]), prefix)
+        and (paths is None or str(row["logical_path"]) in paths)
     ]
 
 
@@ -294,18 +305,39 @@ def _read_chunks(session: Any, row: dict[str, Any], mode: str) -> list[str] | No
     return chunk_text(body, mode)
 
 
+def _cache_for(session: Any, provider: Any) -> Any:
+    """Build the content-addressed cache for ``provider`` or ``None`` on failure."""
+    try:
+        from .vector_cache import VectorCache  # noqa: PLC0415 - avoid an import cycle
+
+        settings = session.meta.settings
+        cap_mb = int((settings.get("semantic") or {}).get("cache_max_mb", 512) or 512)
+        return VectorCache.for_model(
+            provider.model, provider.dim, max_bytes=max(0, cap_mb) * 1024 * 1024
+        )
+    except Exception:  # noqa: BLE001 - the cache is an optimisation only
+        return None
+
+
 def index_all(
     session: Any,
     *,
     force: bool = False,
     progress: Callable[[int, int], None] | None = None,
     prefix: str | None = None,
-) -> dict[str, int]:
+    paths: set[str] | None = None,
+    allow_reset: bool = False,
+    reason: str | None = None,
+) -> dict[str, Any]:
     """Embed every ``normal`` text file into the encrypted semantic store.
 
-    Chunks from *many* files are accumulated and embedded in large cross-file batches:
-    calling the model once per small note is the difference between minutes and hours.
-    Returns ``{"indexed", "skipped", "chunks"}``.
+    Chunks from *many* files are accumulated and embedded in large cross-file batches.
+    Embeddings are served from the content-addressed :class:`VectorCache` when unchanged,
+    so only genuinely new text reaches the model.
+
+    A layout mismatch is **never** wiped implicitly: with ``allow_reset=False`` the call
+    returns ``ok=False`` and leaves the live index untouched. Returns
+    ``{"indexed", "skipped", "chunks", "ok", "reset", "last_reset"}``.
     """
     provider = _require_provider(session)
     session._require_unlocked()
@@ -314,9 +346,23 @@ def index_all(
     states = folder_states(settings)
     scope = normalize_vault_path(prefix) if prefix else None
     store = session.semantic_store
-    store.ensure_layout(provider.model, provider.dim, mode)
-    files = _normal_files(session, states, scope)
+    layout = store.ensure_layout(
+        provider.model, provider.dim, mode, allow_reset=allow_reset, reason=reason
+    )
+    if not layout.get("ok"):
+        # Keep the live index; the caller can tell the user why nothing was indexed.
+        return {
+            "indexed": 0,
+            "skipped": 0,
+            "chunks": 0,
+            "ok": False,
+            "reset": False,
+            "last_reset": layout.get("last_reset"),
+            "reason": layout.get("reason"),
+        }
+    files = _normal_files(session, states, scope, paths)
     existing = set() if force else store.indexed_files()
+    cache = _cache_for(session, provider)
     indexed = 0
     skipped = 0
     chunks_total = 0
@@ -330,13 +376,26 @@ def index_all(
     dirty_files: set[int] = set()
 
     def flush() -> None:
-        """Delete replaced files, then embed and insert the accumulated chunks."""
+        """Delete replaced files, then embed (cache-aware) and insert the chunks."""
         nonlocal chunks_total, pending_chars
         if dirty_files:
             store.delete_files(dirty_files)
             dirty_files.clear()
         if pending_texts:
-            vectors = provider.embed(pending_texts)
+            hits = cache.lookup(pending_texts) if cache is not None else {}
+            miss_positions = [i for i in range(len(pending_texts)) if i not in hits]
+            miss_texts = [pending_texts[i] for i in miss_positions]
+            model_vectors = provider.embed(miss_texts) if miss_texts else []
+            if cache is not None and miss_texts:
+                cache.store(miss_texts, model_vectors)
+            vectors: list[list[float]] = []
+            cursor = 0
+            for position in range(len(pending_texts)):
+                if position in hits:
+                    vectors.append(hits[position])
+                else:
+                    vectors.append(model_vectors[cursor])
+                    cursor += 1
             rows = [
                 (file_id, ord_, text, _pack(vec))
                 for (file_id, ord_, text), vec in zip(pending_rows, vectors)
@@ -367,7 +426,14 @@ def index_all(
             progress(position, total)
     flush()
     store.flush()
-    return {"indexed": indexed, "skipped": skipped, "chunks": chunks_total}
+    return {
+        "indexed": indexed,
+        "skipped": skipped,
+        "chunks": chunks_total,
+        "ok": True,
+        "reset": bool(layout.get("reset")),
+        "last_reset": layout.get("last_reset"),
+    }
 
 
 def search(

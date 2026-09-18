@@ -50,6 +50,7 @@ class SelfTestResult:
     runtime: Path
     previous_xdg: str | None = None
     previous_config: str | None = None
+    previous_data: str | None = None
 
 
 def _parse_args(argv: list[str] | None) -> argparse.Namespace:
@@ -114,10 +115,12 @@ def run_self_test(
     os.chmod(runtime, 0o700)
     previous_xdg = os.environ.get("XDG_RUNTIME_DIR")
     previous_config = os.environ.get("XDG_CONFIG_HOME")
+    previous_data = os.environ.get("XDG_DATA_HOME")
     os.environ["XDG_RUNTIME_DIR"] = str(runtime)
     config_home = base / "config"
     config_home.mkdir(parents=True, exist_ok=True)
     os.environ["XDG_CONFIG_HOME"] = str(config_home)
+    os.environ["XDG_DATA_HOME"] = str(base / "data")
 
     vault_home = Path(home) if home is not None else base / "vault"
     if VaultSession.is_initialised(vault_home):
@@ -238,6 +241,7 @@ def run_self_test(
         runtime=runtime,
         previous_xdg=previous_xdg,
         previous_config=previous_config,
+        previous_data=previous_data,
     )
 
 
@@ -275,6 +279,10 @@ def main(argv: list[str] | None = None) -> int:
             os.environ.pop("XDG_CONFIG_HOME", None)
         else:
             os.environ["XDG_CONFIG_HOME"] = result.previous_config
+        if result.previous_data is None:
+            os.environ.pop("XDG_DATA_HOME", None)
+        else:
+            os.environ["XDG_DATA_HOME"] = result.previous_data
         return 0
 
     home = resolve_home(args.home)

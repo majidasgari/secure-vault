@@ -55,6 +55,7 @@ from .models import DataHub
 from .settings_dialog import SettingsDialog
 from .tray import TrayIcon
 from .unlock import UnlockScreen
+from .versions import VersionsDialog
 
 AUTO_LOCK_TICK_MS = 1000
 #: How often the external-editor helper looks for changes to save back into the vault.
@@ -324,6 +325,7 @@ class VaultApplication(QObject):
             self.window.editor.open_in_browser.connect(self.open_in_browser)
             self.window.editor.direction_changed.connect(self._on_editor_direction)
             self.window.editor.note_changed.connect(self.set_file_note)
+            self.window.editor.history_requested.connect(self.open_versions)
             mode = self.config.data.get("editor_direction")
             if isinstance(mode, str) and mode in ("auto", "rtl", "ltr"):
                 self.window.editor.set_direction_mode(mode)
@@ -567,6 +569,28 @@ class VaultApplication(QObject):
                 QMessageBox.warning(self.window, i18n.tr("app.title"), error_message(exc))
             return
         self.hub.notify()
+
+    def versions(self, path: str) -> dict:
+        """Return the stored versions of ``path`` (UI only)."""
+        return self.dispatch_ui("vault.versions", {"path": self._api(path)})
+
+    def diff(self, path: str, from_version: int, to_version: int) -> dict:
+        """Return a git-style diff between two versions (UI only)."""
+        return self.dispatch_ui(
+            "vault.diff",
+            {
+                "path": self._api(path),
+                "from_version": int(from_version),
+                "to_version": int(to_version),
+            },
+        )
+
+    def open_versions(self, path: str) -> None:
+        """Open the version-history/diff dialog for ``path``."""
+        if self.window is None:
+            return
+        dialog = VersionsDialog(self, path, self.window)
+        dialog.exec()
 
     def open_path(self, path: str) -> bool:
         """Open a file honoring the sensitivity rules (SPEC/03 §2.4)."""
@@ -1100,11 +1124,17 @@ class VaultApplication(QObject):
                 )
             return
         self.hub.notify()
-        notifications.notify(
-            i18n.tr("menu.semantic_index"),
-            i18n.tr("settings.semantic_indexed", count=int(data.get("indexed", 0))),
-            tray=self.tray,
+        message = i18n.tr(
+            "settings.semantic_indexed", count=int(data.get("indexed", 0))
         )
+        if not data.get("ok", True):
+            message += " · " + i18n.tr(
+                "semantic.layout_refused", reason=str(data.get("reason") or "")
+            )
+        elif data.get("reset"):
+            reason = str((data.get("last_reset") or {}).get("reason") or "")
+            message += " · " + i18n.tr("semantic.reset_body", reason=reason)
+        notifications.notify(i18n.tr("menu.semantic_index"), message, tray=self.tray)
 
     def open_settings(self) -> None:
         """Open the settings dialog."""
@@ -1483,7 +1513,8 @@ class VaultApplication(QObject):
         kind = str(event.get("kind", ""))
         raw_path = event.get("path")
         path = "/" + str(raw_path).lstrip("/") if raw_path else ""
-        key = (source, kind, path)
+        query = str(event.get("query") or "").strip()
+        key = (source, kind, path, query)
         now = now_ms()
         if now - self._agent_notified.get(key, 0) < self.AGENT_NOTIFY_INTERVAL_MS:
             return
@@ -1492,7 +1523,13 @@ class VaultApplication(QObject):
         if action.startswith("web.activity_kind_"):
             action = kind
         body = i18n.tr("notification.agent_body", action=action, path=path)
-        if event.get("tool"):
+        if query:
+            body = i18n.tr(
+                "notification.agent_search",
+                tool=str(event.get("tool") or kind),
+                query=query[:160],
+            )
+        elif event.get("tool"):
             body = i18n.tr("notification.agent_body_tool", tool=str(event["tool"]), path=path)
         notifications.notify(
             i18n.tr("notification.agent_title", source=source),

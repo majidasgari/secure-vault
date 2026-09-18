@@ -52,6 +52,8 @@ def tmp_vault(
     os.chmod(runtime, 0o700)
     session = VaultSession.create(home, password, settings=settings)
     session._runtime = runtime
+    # Keep the (otherwise user-home) semantic vector cache inside the scratch dir too.
+    os.environ["XDG_DATA_HOME"] = str(base / "data")
     if session._store is not None:
         master_key = session._master_key
         session._store.close()

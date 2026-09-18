@@ -84,6 +84,8 @@
 
         <div id="view-folder" class="view-pane" hidden>
           <nav id="folder-crumbs" class="breadcrumbs"></nav>
+          <label class="note-label" for="folder-note-input" data-i18n="browser.folder_note"></label>
+          <textarea id="folder-note-input" class="note-input" dir="auto" rows="2"></textarea>
           <h2 data-i18n="web.notebooks"></h2>
           <ul id="notebook-list" class="notebook-list"></ul>
           <h2 id="notes-heading"></h2>
@@ -95,6 +97,7 @@
             <nav id="note-crumbs" class="breadcrumbs"></nav>
             <div class="note-actions">
               <button id="btn-note-edit-top" type="button" class="primary" data-i18n="menu.edit"></button>
+              <button id="btn-note-history-top" type="button" data-i18n="editor.history"></button>
               <button id="btn-note-raw-top" type="button" data-i18n="web.raw"></button>
               <button id="btn-note-delete-top" type="button" class="danger"
                       data-i18n="menu.delete"></button>
@@ -102,6 +105,8 @@
           </div>
           <h1 id="note-title" dir="auto"></h1>
           <p id="note-meta" class="meta-line"></p>
+          <label class="note-label" for="file-note-input" data-i18n="browser.file_note"></label>
+          <textarea id="file-note-input" class="note-input" dir="auto" rows="2"></textarea>
           <div id="note-tags" class="chips"></div>
           <a id="note-source" class="source-link" target="_blank" rel="noopener noreferrer" hidden></a>
           <article id="note-body" class="preview" dir="auto"></article>

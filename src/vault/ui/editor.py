@@ -48,6 +48,10 @@ _DIRECTIONS = ("auto", "rtl", "ltr")
 _PREVIEW_CHECK_MS = 1500
 #: A rendered page shorter than this means the engine produced nothing usable.
 _PREVIEW_MIN_HTML = 200
+#: How often to read a web preview's scroll position (it has no Qt scrollbar).
+_SCROLL_POLL_MS = 180
+#: Ignore the other pane's scroll events for this long after driving it.
+_SCROLL_LOCK_MS = 120
 _MODE_KEYS = {"auto": "editor.mode_auto", "rtl": "editor.mode_rtl", "ltr": "editor.mode_ltr"}
 _DIRECTION_KEYS = {"rtl": "editor.direction_rtl", "ltr": "editor.direction_ltr"}
 
@@ -132,7 +136,11 @@ def render_markdown(text: str) -> str:
     try:
         from markdown_it import MarkdownIt
 
-        body = MarkdownIt("commonmark", {"html": False}).render(text)
+        md = MarkdownIt("commonmark", {"html": False})
+        # GFM tables and strikethrough: commonmark alone renders ``|---|`` as plain text.
+        md.enable("table")
+        md.enable("strikethrough")
+        body = md.render(text)
     except Exception:  # noqa: BLE001 - never fail to show something
         body = "<pre>" + html.escape(text) + "</pre>"
     body = _BLOCK_TAG.sub(lambda m: f"<{m.group(1)} dir=\"auto\"{m.group(2)}", body)
@@ -171,6 +179,8 @@ class EditorPanel(QWidget):
     direction_changed = Signal(str)
     #: ``(path, note)`` when the user edits the short note of the open file.
     note_changed = Signal(str, str)
+    #: Emitted with the current path when the user asks for the version history.
+    history_requested = Signal(str)
 
     def __init__(self, parent: Any = None) -> None:
         """Create an empty editor."""
@@ -185,6 +195,9 @@ class EditorPanel(QWidget):
         self._formatting = False
         self._direction_mode = "auto"
         self._loading_note = False
+        self._scroll_lock = False
+        self._last_preview_fraction = 0.0
+        self._preview_poll: QTimer | None = None
         self._preview_checked = False
         self._split_applied = False
         self._preview_load_ok: bool | None = None
@@ -202,9 +215,12 @@ class EditorPanel(QWidget):
         self.browser_button.clicked.connect(self._on_browser_clicked)
         self.text_editor_button = QPushButton(self)
         self.text_editor_button.clicked.connect(self._on_text_editor_clicked)
+        self.history_button = QPushButton(self)
+        self.history_button.clicked.connect(self._on_history_clicked)
         toolbar.addWidget(self.direction_label)
         toolbar.addWidget(self.direction_combo)
         toolbar.addStretch(1)
+        toolbar.addWidget(self.history_button)
         toolbar.addWidget(self.text_editor_button)
         toolbar.addWidget(self.browser_button)
         layout.addLayout(toolbar)
@@ -241,6 +257,7 @@ class EditorPanel(QWidget):
         self.splitter.setChildrenCollapsible(False)
         self.splitter.setSizes([1, 1])
         layout.addWidget(self.splitter, 1)
+        self._setup_scroll_sync()
 
         self.status_label = QLabel(self)
         layout.addWidget(self.status_label)
@@ -310,6 +327,11 @@ class EditorPanel(QWidget):
         if not self.preview_enabled:
             return
         self.preview.setHtml(render_markdown(self.source.toPlainText()))
+        # Re-rendering resets the preview to the top; keep it aligned with the source.
+        if self.preview_kind == "web":
+            QTimer.singleShot(60, lambda: self._on_source_scroll(0))
+        else:
+            self._on_source_scroll(0)
         if not self._preview_checked:
             self._preview_checked = True
             # A web view that fails to paint (no GPU / broken sandbox) looks like a blank grey
@@ -362,6 +384,11 @@ class EditorPanel(QWidget):
         self.preview = browser
         self.preview_kind = "text"
         self.preview.setMinimumWidth(260)
+        if self._preview_poll is not None:
+            self._preview_poll.stop()
+            self._preview_poll = None
+        self.preview.verticalScrollBar().valueChanged.connect(self._on_preview_scroll)
+        self._last_preview_fraction = 0.0
         if index >= 0:
             self.splitter.insertWidget(index, browser)
         else:
@@ -377,6 +404,94 @@ class EditorPanel(QWidget):
             self.preview.setHtml("")
         except Exception:  # noqa: BLE001 - defensive
             pass
+
+    # -------------------------------------------------------------- scroll sync
+    def _setup_scroll_sync(self) -> None:
+        """Keep the source and the preview at roughly the same scroll position."""
+        self.source.verticalScrollBar().valueChanged.connect(self._on_source_scroll)
+        if self.preview_kind == "text":
+            self.preview.verticalScrollBar().valueChanged.connect(
+                self._on_preview_scroll
+            )
+        else:
+            self._preview_poll = QTimer(self)
+            self._preview_poll.setInterval(_SCROLL_POLL_MS)
+            self._preview_poll.timeout.connect(self._poll_preview_scroll)
+            self._preview_poll.start()
+
+    def _source_fraction(self) -> float:
+        """Return the source scrollbar position as a 0..1 fraction."""
+        bar = self.source.verticalScrollBar()
+        span = bar.maximum() - bar.minimum()
+        return (bar.value() - bar.minimum()) / span if span > 0 else 0.0
+
+    def _scroll_source_to(self, fraction: float) -> None:
+        """Move the source scrollbar to ``fraction`` (clamped to 0..1)."""
+        bar = self.source.verticalScrollBar()
+        span = bar.maximum() - bar.minimum()
+        bar.setValue(int(bar.minimum() + max(0.0, min(1.0, fraction)) * span))
+
+    def _release_scroll_lock(self) -> None:
+        """Allow the other pane to drive again after a programmatic sync."""
+        self._scroll_lock = False
+
+    def _on_source_scroll(self, _value: int) -> None:
+        """Source scrolled: move the preview to the same fraction."""
+        if self._scroll_lock:
+            return
+        fraction = self._source_fraction()
+        self._scroll_lock = True
+        self._last_preview_fraction = fraction
+        if self.preview_kind == "text":
+            bar = self.preview.verticalScrollBar()
+            span = bar.maximum() - bar.minimum()
+            bar.setValue(int(bar.minimum() + fraction * span))
+        else:
+            try:
+                self.preview.page().runJavaScript(
+                    "window.scrollTo(0, %f * Math.max(0, "
+                    "document.documentElement.scrollHeight - window.innerHeight));"
+                    % fraction
+                )
+            except Exception:  # noqa: BLE001 - sync is best effort
+                pass
+        QTimer.singleShot(_SCROLL_LOCK_MS, self._release_scroll_lock)
+
+    def _on_preview_scroll(self, _value: int) -> None:
+        """Text-browser preview scrolled: move the source to the same fraction."""
+        if self._scroll_lock:
+            return
+        bar = self.preview.verticalScrollBar()
+        span = bar.maximum() - bar.minimum()
+        fraction = (bar.value() - bar.minimum()) / span if span > 0 else 0.0
+        self._scroll_lock = True
+        self._scroll_source_to(fraction)
+        QTimer.singleShot(_SCROLL_LOCK_MS, self._release_scroll_lock)
+
+    def _poll_preview_scroll(self) -> None:
+        """Read the web preview's scroll fraction (it has no Qt scrollbar)."""
+        if self._scroll_lock or self.preview_kind != "web":
+            return
+        try:
+            self.preview.page().runJavaScript(
+                "(function(){var h=document.documentElement.scrollHeight-"
+                "window.innerHeight;return h>0?window.scrollY/h:0;})()",
+                self._on_preview_fraction,
+            )
+        except Exception:  # noqa: BLE001 - sync is best effort
+            pass
+
+    def _on_preview_fraction(self, value: Any) -> None:
+        """Web preview scrolled (polled): move the source to the same fraction."""
+        if self._scroll_lock or not isinstance(value, (int, float)):
+            return
+        fraction = max(0.0, min(1.0, float(value)))
+        if abs(fraction - self._last_preview_fraction) < 0.002:
+            return
+        self._last_preview_fraction = fraction
+        self._scroll_lock = True
+        self._scroll_source_to(fraction)
+        QTimer.singleShot(_SCROLL_LOCK_MS, self._release_scroll_lock)
 
     # ------------------------------------------------------------------ content
     def set_content(self, path: str, text: str, *, preview_enabled: bool) -> None:
@@ -415,6 +530,11 @@ class EditorPanel(QWidget):
         if self._loading_note or not self.current_path:
             return
         self.note_changed.emit(str(self.current_path), self.note_edit.text())
+
+    def _on_history_clicked(self) -> None:
+        """Ask for the version history of the open file."""
+        if self.current_path:
+            self.history_requested.emit(str(self.current_path))
 
     def clear(self) -> None:
         """Empty the editor."""
@@ -586,7 +706,7 @@ class EditorPanel(QWidget):
         changes left both buttons disabled forever (opening a file never re-enabled them).
         """
         enabled = self.current_path is not None and not self.locked
-        for button in (self.browser_button, self.text_editor_button):
+        for button in (self.browser_button, self.text_editor_button, self.history_button):
             button.setEnabled(enabled)
 
     # ------------------------------------------------------------------ signals
@@ -620,6 +740,7 @@ class EditorPanel(QWidget):
         self.source.setPlaceholderText(i18n.tr("editor.placeholder"))
         self.note_label.setText(i18n.tr("editor.file_note"))
         self.note_edit.setPlaceholderText(i18n.tr("editor.file_note_placeholder"))
+        self.history_button.setText(i18n.tr("editor.history"))
         self.direction_label.setText(i18n.tr("editor.direction"))
         for index, mode in enumerate(_DIRECTIONS):
             self.direction_combo.setItemText(index, i18n.tr(_MODE_KEYS[mode]))

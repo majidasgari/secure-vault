@@ -57,6 +57,10 @@ class UiSmokeTest(unittest.TestCase):
                 os.environ.pop("XDG_CONFIG_HOME", None)
             else:
                 os.environ["XDG_CONFIG_HOME"] = cls.result.previous_config
+            if cls.result.previous_data is None:
+                os.environ.pop("XDG_DATA_HOME", None)
+            else:
+                os.environ["XDG_DATA_HOME"] = cls.result.previous_data
 
     def test_package_importable(self) -> None:
         """The package and the GUI entry point import."""
@@ -413,6 +417,10 @@ class WebShellSmokeTest(unittest.TestCase):
                 os.environ.pop("XDG_CONFIG_HOME", None)
             else:
                 os.environ["XDG_CONFIG_HOME"] = result.previous_config
+            if result.previous_data is None:
+                os.environ.pop("XDG_DATA_HOME", None)
+            else:
+                os.environ["XDG_DATA_HOME"] = result.previous_data
 
     def test_web_disabled_starts_nothing(self) -> None:
         """``web.enabled=false`` leaves ``VaultApplication.web`` as None."""

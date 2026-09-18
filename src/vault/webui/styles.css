@@ -553,3 +553,24 @@ button.primary.danger { background: var(--panel2); }
 @media (max-width: 860px) {
   .row-action { opacity: 1; min-height: 38px; min-width: 38px; }
 }
+
+/* Version history / diff */
+.versions-table { width: 100%; border-collapse: collapse; margin: 0.5rem 0; font-size: 0.9rem; }
+.versions-table td { padding: 0.25rem 0.5rem; border-bottom: 1px solid var(--border, #3333); }
+.versions-picker { display: flex; gap: 0.5rem; align-items: center; margin: 0.5rem 0; }
+.diff-view { max-height: 45vh; overflow: auto; background: var(--panel2, #0002);
+  padding: 0.5rem; border-radius: 6px; font-family: monospace; white-space: pre; direction: ltr; }
+.diff-add { color: #1e8449; }
+.diff-del { color: #c0392b; }
+.diff-ctx { color: #7f8c8d; }
+
+/* File note shown inline in the folder list */
+.note-text { max-width: 46ch; overflow: hidden; text-overflow: ellipsis;
+  white-space: nowrap; opacity: 0.85; }
+
+/* Folder / file note editors */
+.note-label { display: block; margin: 0.6rem 0 0.2rem; font-size: 0.85rem;
+  color: var(--muted, #8a8a8a); }
+.note-input { width: 100%; box-sizing: border-box; resize: vertical;
+  background: var(--panel2, #0002); color: inherit; border: 1px solid var(--border, #3333);
+  border-radius: 6px; padding: 0.4rem 0.5rem; font: inherit; }

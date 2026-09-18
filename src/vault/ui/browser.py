@@ -89,13 +89,18 @@ class BrowserPanel(QWidget):
         self.list.doubleClicked.connect(self._on_file_activated)
         layout.addWidget(self.list, 3)
 
+        # One adaptive note box: it edits the selected item's note, whether that item is a
+        # folder (selected in the tree or list) or a file.
         self.note_box = QGroupBox(self)
         self.note_box.setCheckable(True)
         self.note_box.setChecked(True)
         note_layout = QVBoxLayout(self.note_box)
         self.note_edit = QPlainTextEdit(self.note_box)
+        self.note_edit.setMaximumHeight(72)
         note_layout.addWidget(self.note_edit)
         layout.addWidget(self.note_box)
+        #: ``("folder"|"file", path)`` currently bound to the note editor.
+        self._note_target: tuple[str, str] = ("folder", "/")
 
         self._note_timer = QTimer(self)
         self._note_timer.setSingleShot(True)
@@ -104,6 +109,7 @@ class BrowserPanel(QWidget):
         self.note_edit.textChanged.connect(self._on_note_changed)
         self.search_box.textChanged.connect(self._on_search)
         self.note_box.toggled.connect(self.note_edit.setVisible)
+        self.list.selectionModel().selectionChanged.connect(self._on_file_selection)
 
         self.retranslate()
         i18n.bind(self, self.retranslate)
@@ -117,6 +123,7 @@ class BrowserPanel(QWidget):
     def set_folder(self, path: str) -> None:
         """Select ``path`` and load its children and note."""
         self._current_folder = path or "/"
+        self._note_target = ("folder", self._current_folder)
         try:
             entries = self._controller.list_entries(self._current_folder)
         except Exception:  # noqa: BLE001 - a locked/absent folder shows empty
@@ -152,10 +159,27 @@ class BrowserPanel(QWidget):
         self.proxy.setFilterFixedString(text)
 
     # ------------------------------------------------------------------ note
+    def _note_kind(self) -> str:
+        """Return the kind (``folder``/``file``) currently bound to the note box."""
+        return self._note_target[0]
+
+    def _update_note_title(self) -> None:
+        """Title the box after the selected item's kind."""
+        key = (
+            "browser.folder_note"
+            if self._note_kind() == "folder"
+            else "browser.file_note"
+        )
+        self.note_box.setTitle(i18n.tr(key))
+
     def _load_note(self) -> None:
-        """Load the folder note for the current folder."""
+        """Load the note of the currently selected folder or file."""
+        kind, path = self._note_target
         try:
-            note = self._controller.folder_note(self._current_folder) or ""
+            if kind == "folder":
+                note = self._controller.folder_note(path) or ""
+            else:
+                note = self._controller.file_note(path) or ""
         except Exception:  # noqa: BLE001 - locked vault has no readable note
             note = ""
         self._loading_note = True
@@ -163,20 +187,36 @@ class BrowserPanel(QWidget):
             self.note_edit.setPlainText(note)
         finally:
             self._loading_note = False
+        self._update_note_title()
 
     def _on_note_changed(self) -> None:
-        """Schedule a debounced folder-note save."""
+        """Schedule a debounced note save."""
         if not self._loading_note:
             self._note_timer.start()
 
     def _save_note(self) -> None:
-        """Persist the folder note."""
+        """Persist the note of the currently selected folder or file."""
+        kind, path = self._note_target
         try:
-            self._controller.set_folder_note(
-                self._current_folder, self.note_edit.toPlainText()
-            )
+            if kind == "folder":
+                self._controller.set_folder_note(path, self.note_edit.toPlainText())
+            else:
+                self._controller.set_file_note(path, self.note_edit.toPlainText())
         except Exception:  # noqa: BLE001 - best effort; a locked vault cannot save
             pass
+
+    def _on_file_selection(self, *_args: Any) -> None:
+        """Bind the note box to the item selected in the file list."""
+        rows = self.list.selectionModel().selectedRows()
+        entry = self.list_model.entry_at(rows[0]) if rows else None
+        if entry is None:
+            # Nothing selected: fall back to the current folder's own note.
+            self._note_target = ("folder", self._current_folder)
+        elif entry.get("is_dir"):
+            self._note_target = ("folder", str(entry.get("path") or "/"))
+        else:
+            self._note_target = ("file", str(entry.get("path") or ""))
+        self._load_note()
 
     # ------------------------------------------------------------------ i18n
     def retranslate(self) -> None:
@@ -192,8 +232,8 @@ class BrowserPanel(QWidget):
         }
         for name, action in self.actions.items():
             action.setText(i18n.tr(labels[name]))
-        self.note_box.setTitle(i18n.tr("browser.folder_note"))
-        self.list_model.headerDataChanged.emit(Qt.Horizontal, 0, 3)
+        self._update_note_title()
+        self.list_model.headerDataChanged.emit(Qt.Horizontal, 0, 4)
 
 
 __all__ = ["BrowserPanel"]

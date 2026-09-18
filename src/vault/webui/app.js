@@ -706,6 +706,13 @@
       li.appendChild(badge);
       li.appendChild(name);
       li.appendChild(date);
+      if (entry.note) {
+        var noteSpan = document.createElement("span");
+        noteSpan.className = "meta note-text";
+        noteSpan.dir = "auto";
+        noteSpan.textContent = "📝 " + entry.note;
+        li.appendChild(noteSpan);
+      }
       li.appendChild(rowDeleteButton(entry));
       li.addEventListener("click", function () { navigateNote(entry.path); });
       notes.appendChild(li);
@@ -739,7 +746,9 @@
   function formatDate(ms) {
     try {
       var date = new Date(Number(ms));
-      return date.toISOString().slice(0, 10);
+      var pad = function (n) { return (n < 10 ? "0" : "") + n; };
+      return pad(date.getFullYear()) + "-" + pad(date.getMonth() + 1) + "-" +
+        pad(date.getDate()) + " " + pad(date.getHours()) + ":" + pad(date.getMinutes());
     } catch (e) { return ""; }
   }
 
@@ -989,6 +998,7 @@
       mtime: result.mtime,
       created: result.created || result.mtime,
       tags: result.tags || [],
+      note: result.note || "",
       source_url: result.source_url || null
     };
     state.dirty = false;
@@ -1008,6 +1018,8 @@
     var created = formatDate(state.file.created || state.file.mtime);
     $("#note-meta").textContent =
       "📅 " + t("web.updated_at") + " " + updated + " · 🕓 " + t("web.created_at") + " " + created;
+    var fileNote = $("#file-note-input");
+    if (fileNote) { fileNote.value = state.file.note || ""; }
     var sourceLink = $("#note-source");
     if (sourceLink) {
       if (state.file.source_url) {
@@ -1885,6 +1897,92 @@
   function closeModal(root) { if (root && root.parentNode) { root.parentNode.removeChild(root); } }
   function closeAllModals() { $("#modal-root").textContent = ""; }
 
+  function addDiffLine(pre, text, cls) {
+    var span = document.createElement("span");
+    span.className = "diff-" + cls;
+    span.textContent = text + "\n";
+    pre.appendChild(span);
+  }
+
+  function showVersionDiff(path, fromVersion, toVersion, pre) {
+    return call("vault.diff", {
+      path: path,
+      from_version: Number(fromVersion),
+      to_version: Number(toVersion)
+    }).then(function (result) {
+      pre.textContent = "";
+      (result.hunks || []).forEach(function (hunk) {
+        if (hunk.type === "delete" || hunk.type === "replace") {
+          hunk.a_lines.forEach(function (line) { addDiffLine(pre, "- " + line, "del"); });
+        }
+        if (hunk.type === "insert" || hunk.type === "replace") {
+          hunk.b_lines.forEach(function (line) { addDiffLine(pre, "+ " + line, "add"); });
+        }
+        if (hunk.type === "equal") {
+          hunk.a_lines.forEach(function (line) { addDiffLine(pre, "  " + line, "ctx"); });
+        }
+      });
+      if (!pre.textContent) { pre.textContent = t("versions.no_changes"); }
+    }).catch(function (err) { pre.textContent = errorText(err); });
+  }
+
+  function openVersions(path) {
+    call("vault.versions", { path: path }).then(function (result) {
+      var versions = result.versions || [];
+      var modal = buildModal(t("versions.title"));
+      var heading = document.createElement("p");
+      heading.className = "muted";
+      heading.textContent = t("versions.heading", { path: path });
+      modal.body.appendChild(heading);
+      var table = document.createElement("table");
+      table.className = "versions-table";
+      versions.forEach(function (version) {
+        var row = document.createElement("tr");
+        [String(version.version), formatDate(version.mtime),
+         humanSize(version.size), String(version.source)].forEach(function (cell) {
+          var td = document.createElement("td");
+          td.textContent = cell;
+          row.appendChild(td);
+        });
+        table.appendChild(row);
+      });
+      modal.body.appendChild(table);
+      var picker = document.createElement("div");
+      picker.className = "versions-picker";
+      var fromSel = document.createElement("select");
+      var toSel = document.createElement("select");
+      versions.forEach(function (version) {
+        fromSel.appendChild(new Option(String(version.version), version.version));
+        toSel.appendChild(new Option(String(version.version), version.version));
+      });
+      if (versions.length) {
+        fromSel.selectedIndex = Math.min(1, versions.length - 1);
+        toSel.selectedIndex = 0;
+      }
+      var showBtn = document.createElement("button");
+      showBtn.type = "button";
+      showBtn.textContent = t("versions.show_diff");
+      var pre = document.createElement("pre");
+      pre.className = "diff-view";
+      showBtn.addEventListener("click", function () {
+        showVersionDiff(path, fromSel.value, toSel.value, pre);
+      });
+      picker.appendChild(fromSel);
+      picker.appendChild(toSel);
+      picker.appendChild(showBtn);
+      modal.body.appendChild(picker);
+      modal.body.appendChild(pre);
+      addCloseButton(modal);
+      openModal(modal.root);
+      if (versions.length >= 2) {
+        showVersionDiff(path, fromSel.value, toSel.value, pre);
+      } else {
+        pre.textContent = t("versions.single");
+        showBtn.disabled = true;
+      }
+    }).catch(function (err) { showToast(errorText(err), "error"); });
+  }
+
   /* --------------------------------------------------------------- toasts */
   function showToast(message, kind) {
     var el = document.createElement("div");
@@ -2038,6 +2136,12 @@
       });
     };
     $("#btn-note-raw-top").addEventListener("click", rawHandler);
+    var historyTop = $("#btn-note-history-top");
+    if (historyTop) {
+      historyTop.addEventListener("click", function () {
+        if (state.file) { openVersions(state.file.path); }
+      });
+    }
     $("#btn-preview").addEventListener("click", function () {
       if (!state.file || state.file.sensitivity !== "normal") { return; }
       state.preview = !state.preview;
@@ -2049,6 +2153,18 @@
       noteInput.addEventListener("change", function () {
         call("vault.set_folder_note", { path: state.cwd, text: noteInput.value })
           .then(function () { showToast(t("web.saved"), "ok"); })
+          .catch(function (err) { showToast(errorText(err), "error"); });
+      });
+    }
+    var fileNoteInput = $("#file-note-input");
+    if (fileNoteInput) {
+      fileNoteInput.addEventListener("change", function () {
+        if (!state.file) { return; }
+        call("vault.set_file_note", { path: state.file.path, text: fileNoteInput.value })
+          .then(function () {
+            state.file.note = fileNoteInput.value;
+            showToast(t("web.saved"), "ok");
+          })
           .catch(function (err) { showToast(errorText(err), "error"); });
       });
     }

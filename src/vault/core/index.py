@@ -17,7 +17,7 @@ from ..errors import AlreadyExists, BadRequest, NotFound
 from ..util import atomic_write_bytes, normalize_logical_path, now_ms
 from .security import LEVELS
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS schema_meta(key TEXT PRIMARY KEY, value TEXT);
@@ -35,6 +35,20 @@ CREATE TABLE IF NOT EXISTS files(
   source TEXT NOT NULL DEFAULT 'ui'
 );
 CREATE INDEX IF NOT EXISTS idx_files_parent ON files(logical_path);
+CREATE TABLE IF NOT EXISTS file_versions(
+  id INTEGER PRIMARY KEY,
+  file_id INTEGER NOT NULL,
+  version INTEGER NOT NULL,
+  blob_id TEXT NOT NULL,
+  size INTEGER NOT NULL,
+  encrypted INTEGER NOT NULL DEFAULT 1,
+  sensitivity TEXT NOT NULL DEFAULT 'normal',
+  mtime INTEGER NOT NULL,
+  source TEXT NOT NULL DEFAULT 'ui',
+  digest TEXT
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_versions_file ON file_versions(file_id, version);
+CREATE INDEX IF NOT EXISTS idx_versions_blob ON file_versions(blob_id);
 CREATE TABLE IF NOT EXISTS tags(id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE);
 CREATE TABLE IF NOT EXISTS file_tags(
   file_id INTEGER NOT NULL REFERENCES files(id) ON DELETE CASCADE,
@@ -220,9 +234,85 @@ class Index:
         ids = [int(r["id"]) for r in rows if r is not None]
         if ids:
             placeholders = ",".join("?" for _ in ids)
+            self._conn.execute(
+                f"DELETE FROM file_versions WHERE file_id IN ({placeholders})", ids
+            )
             self._conn.execute(f"DELETE FROM files WHERE id IN ({placeholders})", ids)
             self._conn.commit()
         return [r for r in rows if r is not None]
+
+    # ------------------------------------------------------------------- versions
+    def record_version(
+        self,
+        file_id: int,
+        *,
+        blob_id: str,
+        size: int,
+        encrypted: int = 1,
+        sensitivity: str = "normal",
+        mtime: int | None = None,
+        source: str = "ui",
+        digest: str | None = None,
+    ) -> int:
+        """Append a version row for ``file_id`` and return its 1-based version number."""
+        fid = int(file_id)
+        row = self._conn.execute(
+            "SELECT MAX(version) AS last FROM file_versions WHERE file_id=?", (fid,)
+        ).fetchone()
+        version = int(row["last"] or 0) + 1
+        self._conn.execute(
+            "INSERT INTO file_versions(file_id, version, blob_id, size, encrypted, "
+            "sensitivity, mtime, source, digest) VALUES(?,?,?,?,?,?,?,?,?)",
+            (
+                fid,
+                version,
+                str(blob_id),
+                int(size),
+                int(encrypted),
+                str(sensitivity),
+                int(mtime if mtime is not None else now_ms()),
+                str(source),
+                digest,
+            ),
+        )
+        self._conn.commit()
+        return version
+
+    def version_count(self, file_id: int) -> int:
+        """Return how many versions are stored for ``file_id``."""
+        row = self._conn.execute(
+            "SELECT COUNT(*) AS n FROM file_versions WHERE file_id=?", (int(file_id),)
+        ).fetchone()
+        return int(row["n"])
+
+    def list_versions(self, file_id: int) -> list[dict[str, Any]]:
+        """Return every version of ``file_id``, newest first."""
+        cur = self._conn.execute(
+            "SELECT * FROM file_versions WHERE file_id=? ORDER BY version DESC",
+            (int(file_id),),
+        )
+        return [dict(r) for r in cur.fetchall()]
+
+    def latest_version(self, file_id: int) -> dict[str, Any] | None:
+        """Return the newest version row for ``file_id`` or None."""
+        row = self._conn.execute(
+            "SELECT * FROM file_versions WHERE file_id=? ORDER BY version DESC LIMIT 1",
+            (int(file_id),),
+        ).fetchone()
+        return dict(row) if row is not None else None
+
+    def get_version(self, file_id: int, version: int) -> dict[str, Any] | None:
+        """Return one version row or None."""
+        row = self._conn.execute(
+            "SELECT * FROM file_versions WHERE file_id=? AND version=?",
+            (int(file_id), int(version)),
+        ).fetchone()
+        return dict(row) if row is not None else None
+
+    def all_version_blob_ids(self) -> set[str]:
+        """Return every blob id referenced by a version (for blob GC)."""
+        cur = self._conn.execute("SELECT DISTINCT blob_id FROM file_versions")
+        return {str(r["blob_id"]) for r in cur.fetchall()}
 
     def list_dir(self, logical_path: str) -> list[dict[str, Any]]:
         """Return the direct children of a directory, directories first, name-sorted."""

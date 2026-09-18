@@ -192,7 +192,7 @@ class SemanticIndexTest(unittest.TestCase):
         self.session.refresh_semantic_provider()
         # Warm the store, then confirm the stale layout yields nothing.
         self.assertEqual(self.session.search_semantic("one"), [])
-        result = semantics.index_all(self.session)
+        result = semantics.index_all(self.session, allow_reset=True)
         self.assertEqual(self.session.semantic_store.meta().get("chunking"), "document")
         self.assertEqual(result["chunks"], 1)
 

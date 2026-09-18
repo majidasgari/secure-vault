@@ -11,6 +11,7 @@ loadable library that the portable build can bundle.
 from __future__ import annotations
 
 import atexit
+import json
 import os
 import sqlite3
 import uuid
@@ -19,7 +20,7 @@ from typing import Any
 
 from ..config import runtime_dir as default_runtime_dir
 from ..errors import NotFound, ProviderUnavailable
-from ..util import atomic_write_bytes
+from ..util import atomic_write_bytes, now_ms
 from .crypto import decrypt_blob, encrypt_blob
 
 SEMANTIC_BLOB_ID = "semantic.db"
@@ -272,8 +273,55 @@ class SemanticStore:
         ).fetchone()
         return row is not None
 
-    def ensure_layout(self, model: str, dim: int, chunking: str) -> None:
-        """Make the index match ``(model, dim, chunking)``, wiping it on any change."""
+    def _read_last_reset(self) -> dict[str, Any] | None:
+        """Return the recorded ``last_reset`` info, if any."""
+        raw = self.meta().get("last_reset")
+        if not raw:
+            return None
+        try:
+            value = json.loads(raw)
+        except ValueError:
+            return None
+        return value if isinstance(value, dict) else None
+
+    def _snapshot(self) -> Path | None:
+        """Persist and rename the current encrypted blob to ``<path>.bak``.
+
+        This is the only safety net before a wipe: the previous index stays recoverable
+        even though the rebuild may be abandoned.
+        """
+        try:
+            self.flush()
+        except Exception:  # noqa: BLE001 - snapshot is best effort
+            pass
+        if not self._store_path.exists():
+            return None
+        backup = Path(str(self._store_path) + ".bak")
+        try:
+            if backup.exists():
+                backup.unlink()
+            os.replace(self._store_path, backup)
+        except OSError:  # pragma: no cover - best effort
+            return None
+        return backup
+
+    def ensure_layout(
+        self,
+        model: str,
+        dim: int,
+        chunking: str,
+        *,
+        allow_reset: bool = False,
+        reason: str | None = None,
+    ) -> dict[str, Any]:
+        """Ensure the index matches ``(model, dim, chunking)``.
+
+        A mismatch is **never** wiped implicitly. Without ``allow_reset`` the call is
+        refused (``ok=False``) so the caller can skip the affected files; the live index
+        is preserved. When ``allow_reset`` is set (an explicit user rebuild), the current
+        encrypted blob is snapshotted to ``<path>.bak`` and ``last_reset`` is recorded.
+        Returns ``{"ok", "reset", "last_reset", "reason"}``.
+        """
         current = self.meta()
         if (
             current.get("model") == model
@@ -281,8 +329,46 @@ class SemanticStore:
             and current.get("chunking") == chunking
             and self._vec_exists()
         ):
-            return
+            return {"ok": True, "reset": False, "last_reset": None, "reason": None}
+        if not self._vec_exists():
+            # No searchable index yet (fresh or half-initialised): laying it out in place
+            # loses nothing, even from the auto-index path.
+            self._create_layout(model, dim, chunking)
+            return {
+                "ok": True,
+                "reset": False,
+                "last_reset": self._read_last_reset(),
+                "reason": None,
+            }
+        if not allow_reset:
+            return {
+                "ok": False,
+                "reset": False,
+                "last_reset": self._read_last_reset(),
+                "reason": reason or "layout_mismatch",
+            }
+        previous = {
+            "model": current.get("model"),
+            "dim": current.get("dim"),
+            "chunking": current.get("chunking"),
+        }
+        self._snapshot()
         self.reset()
+        reset_info = {
+            "at": now_ms(),
+            "reason": reason or "layout_mismatch",
+            "prev_model": previous["model"],
+            "prev_dim": previous["dim"],
+            "prev_chunking": previous["chunking"],
+        }
+        self._set_meta("last_reset", json.dumps(reset_info))
+        self._create_layout(model, dim, chunking)
+        return {"ok": True, "reset": True, "last_reset": reset_info, "reason": reason}
+
+    def _create_layout(self, model: str, dim: int, chunking: str) -> None:
+        """Write the layout meta and create the ``vec_chunks`` table."""
+        # Drop any chunk rows that lost their vectors with the old table.
+        self._require_conn().execute("DELETE FROM chunks")
         self._set_meta("model", model)
         self._set_meta("dim", str(int(dim)))
         self._set_meta("chunking", chunking)
@@ -445,6 +531,7 @@ class SemanticStore:
             "model": meta.get("model"),
             "chunking": meta.get("chunking"),
             "bytes": int(size),
+            "last_reset": self._read_last_reset(),
         }
 
 

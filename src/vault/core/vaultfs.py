@@ -98,6 +98,8 @@ class VaultFS:
             for row in self.index.walk("/")
             if row.get("blob_id")
         }
+        # Never collect blobs still referenced by a historical version.
+        referenced |= self.index.all_version_blob_ids()
         if not (self.home / "files").exists():
             return 0
         removed = 0

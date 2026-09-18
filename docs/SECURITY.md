@@ -30,7 +30,11 @@ Never readable without the password:
 * every byte of file **content** (except files above the plain threshold, see §6);
 * folder notes;
 * the FTS content index (inside `secure.store`) and the embedding vectors (inside the
-  separate encrypted `semantic.db`).
+  separate encrypted `semantic.db`);
+* every **historical version** of a file: each save writes a new encrypted blob, and the
+  version metadata (blob id, size, mtime) only ever lives in the plaintext index while
+  the content stays ciphertext. The version history/diff is UI-only; the `mcp` role has
+  no endpoint for it, and deleting a file erases its version blobs.
 
 This matches the original design (§12): *"in locked mode only metadata/names/level are
 visible"*. The plaintext metadata DB exists so that locked-mode listing and filename

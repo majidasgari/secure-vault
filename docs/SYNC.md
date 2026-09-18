@@ -38,6 +38,9 @@ access log, but no content.
   locally (Settings → Semantic → *Build/refresh index*). If you point it at a path inside
   the vault home, exclude it from sync by name. It can be large (one vector per chunk) and
   is never worth syncing.
+* The **embedding cache** `~/.local/share/secure-vault/semantic/cache/<model>__<dim>.db`
+  (`$XDG_DATA_HOME`) — unencrypted, content-addressed vectors, rebuildable on demand and
+  never worth syncing or backing up (Settings → Semantic → *Clear vector cache*).
 * The user config `~/.config/secure-vault/ui.json` (machine-local window state).
 * Any backup or export you make outside the vault home.
 

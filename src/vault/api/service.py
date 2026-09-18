@@ -536,6 +536,36 @@ class Service:
         depth = int(params.get("depth", 1))
         return self.session.digest(logical, depth=depth, source=role)
 
+    def _h_versions(self, params: dict, role: str, session_id: str) -> dict:
+        """List every stored version of a file (UI only; history is never exposed to MCP)."""
+        logical = normalize_vault_path(self._text(self._require(params, "path"), param="path"))
+        return self.session.versions(logical, source=role)
+
+    def _h_version_text(self, params: dict, role: str, session_id: str) -> dict:
+        """Return the text of one historical version (UI only)."""
+        logical = normalize_vault_path(self._text(self._require(params, "path"), param="path"))
+        version = int(self._require(params, "version"))
+        encoding = self._text(params.get("encoding", "utf-8"), param="encoding")
+        content = self.session.version_text(
+            logical, version, source=role, encoding=encoding
+        )
+        return {
+            "path": _api_path(logical),
+            "version": version,
+            "content": content,
+        }
+
+    def _h_diff(self, params: dict, role: str, session_id: str) -> dict:
+        """Return a git-style diff between two versions (UI only)."""
+        logical = normalize_vault_path(self._text(self._require(params, "path"), param="path"))
+        from_version = int(self._require(params, "from_version"))
+        to_version = int(self._require(params, "to_version"))
+        result = self.session.diff(
+            logical, from_version, to_version, source=role
+        )
+        result["path"] = _api_path(logical)
+        return result
+
     # ------------------------------------------------------------ handlers: search
     @staticmethod
     def _prefix(params: dict) -> str | None:
@@ -697,8 +727,10 @@ class Service:
 
     def _h_semantic_index(self, params: dict, role: str, session_id: str) -> dict:
         force = bool(params.get("force", False))
-        # Indexing resolves the provider from the current settings on its own.
-        return self.session.index_semantics(force=force)
+        # Only an explicit rebuild may reset a mismatched layout (with a snapshot).
+        return self.session.index_semantics(
+            force=force, allow_reset=True, reason="user_rebuild"
+        )
 
     def _h_semantic_status(self, params: dict, role: str, session_id: str) -> dict:
         """Return the semantic index status (model, chunks, availability)."""
@@ -708,7 +740,13 @@ class Service:
         """Re-embed everything, or just one folder/file subtree (``path``)."""
         prefix = self._prefix(params)
         force = bool(params.get("force", True))
-        return self.session.index_semantics(force=force, prefix=prefix)
+        return self.session.index_semantics(
+            force=force, prefix=prefix, allow_reset=True, reason="user_reindex"
+        )
+
+    def _h_semantic_cache_clear(self, params: dict, role: str, session_id: str) -> dict:
+        """Delete the local embedding cache (rebuildable; never synced)."""
+        return {"removed": self.session.clear_semantic_cache()}
 
     def _h_stats(self, params: dict, role: str, session_id: str) -> dict:
         status = self.session.status()
@@ -760,6 +798,8 @@ class Service:
                 "sensitivity": row["sensitivity"],
                 "size": int(row["size"]),
                 "mtime": int(row["mtime"]),
+                "note": None,
+                "_id": int(row["id"]),
                 "note_count": 0,
                 "children": [],
             }
@@ -791,6 +831,18 @@ class Service:
                 _sort(item["children"])
 
         _sort(roots)
+        if not self.session.is_locked and self.session._store is not None:
+            file_ids = [
+                int(node["_id"]) for node in nodes.values() if not node["is_dir"]
+            ]
+            file_notes = self.session.store.get_file_notes(file_ids) if file_ids else {}
+            for logical, node in nodes.items():
+                if node["is_dir"]:
+                    node["note"] = self.session.store.get_folder_note(logical)
+                else:
+                    node["note"] = file_notes.get(int(node["_id"]))
+        for node in nodes.values():
+            node.pop("_id", None)
         counts = self.session.index.count()
         return {
             "tree": roots,
@@ -841,6 +893,9 @@ class Service:
         "vault.file_note": (_h_file_note, _BOTH),
         "vault.set_file_note": (_h_set_file_note, _BOTH),
         "vault.digest": (_h_digest, _BOTH),
+        "vault.versions": (_h_versions, _UI_ONLY),
+        "vault.version_text": (_h_version_text, _UI_ONLY),
+        "vault.diff": (_h_diff, _UI_ONLY),
         "vault.search_filenames": (_h_search_filenames, _BOTH),
         "vault.search_text": (_h_search_text, _BOTH),
         "vault.search_semantic": (_h_search_semantic, _BOTH),
@@ -854,6 +909,7 @@ class Service:
         "vault.semantic_index": (_h_semantic_index, _UI_ONLY),
         "vault.semantic_status": (_h_semantic_status, _BOTH),
         "vault.semantic_reindex": (_h_semantic_reindex, _BOTH),
+        "vault.semantic_cache_clear": (_h_semantic_cache_clear, _UI_ONLY),
         "vault.stats": (_h_stats, _BOTH),
         "vault.verify_blobs": (_h_verify_blobs, _UI_ONLY),
         "vault.recent": (_h_recent, _BOTH),

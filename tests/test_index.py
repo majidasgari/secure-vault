@@ -6,7 +6,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from vault.core.index import Index
+from vault.core.index import SCHEMA_VERSION, Index
 from vault.errors import AlreadyExists, BadRequest, InvalidPath, NotFound
 
 
@@ -27,7 +27,7 @@ class IndexTest(unittest.TestCase):
             row = second.conn.execute(
                 "SELECT value FROM schema_meta WHERE key='schema_version'"
             ).fetchone()
-            self.assertEqual(row["value"], "1")
+            self.assertEqual(row["value"], str(SCHEMA_VERSION))
         finally:
             second.close()
 

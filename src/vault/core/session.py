@@ -8,6 +8,8 @@ before raising.
 
 from __future__ import annotations
 
+import difflib
+import threading
 import uuid
 from pathlib import Path
 from typing import Any, Callable
@@ -23,7 +25,7 @@ from ..errors import (
     VaultError,
     VaultLocked,
 )
-from ..util import normalize_vault_path, now_ms, wipe
+from ..util import normalize_vault_path, now_ms, sha256_hex, wipe
 from . import search as search_mod
 from . import semantics
 from . import retention
@@ -37,6 +39,7 @@ from .security import (
     Policy,
     rank,
 )
+from .semantic_queue import SemanticIndexQueue
 from .semantic_store import SemanticStore
 from .store import SecureStore
 from .vaultfs import VaultFS
@@ -67,6 +70,9 @@ class VaultSession:
         self._store: SecureStore | None = None
         #: The separate, rebuildable ``semantic.db`` vector index (opened lazily).
         self._semantic_store: SemanticStore | None = None
+        #: Serialises semantic-index runs (manual rebuild vs the auto-index worker).
+        self._semantic_lock = threading.RLock()
+        self._semantic_queue: SemanticIndexQueue | None = None
         self._master_key: bytearray | None = None
         self._last_activity = now_ms()
         #: Provider injected explicitly (tests, self-test); wins over settings.
@@ -193,27 +199,39 @@ class VaultSession:
         force: bool = False,
         progress: Callable[[int, int], None] | None = None,
         prefix: str | None = None,
+        paths: set[str] | None = None,
         refresh: bool = True,
-    ) -> dict[str, int]:
+        allow_reset: bool = False,
+        reason: str | None = None,
+    ) -> dict[str, Any]:
         """Rebuild the semantic (embedding) index for every ``normal`` text file.
 
         The provider is (re)resolved from the current settings first, so a newly enabled
         backend takes effect without restarting. ``progress(done, total)`` is called once
-        per file from whatever thread the caller is on. ``prefix`` limits the rebuild to a
-        folder subtree (or a single file); ``refresh=False`` keeps the loaded model when
-        the caller is re-embedding one file after a write.
+        per file from whatever thread the caller is on. ``prefix``/``paths`` limit the
+        rebuild; ``refresh=False`` keeps the loaded model for a per-write re-embed.
+
+        A ``(model, dim, chunking)`` mismatch is only wiped when ``allow_reset`` is set
+        (an explicit user rebuild); otherwise the run is refused and the live index kept.
         """
-        if refresh:
-            self.refresh_semantic_provider()
-        return semantics.index_all(
-            self, force=force, progress=progress, prefix=prefix
-        )
+        with self._semantic_lock:
+            if refresh:
+                self.refresh_semantic_provider()
+            return semantics.index_all(
+                self,
+                force=force,
+                progress=progress,
+                prefix=prefix,
+                paths=paths,
+                allow_reset=allow_reset,
+                reason=reason,
+            )
 
     def _auto_index_semantics(self, logical: str) -> None:
-        """Re-embed one path inline when semantic search is already active.
+        """Queue a written path for background re-embedding (never inline).
 
-        Best effort: if the semantic cache has not been opened this session, there is no
-        loaded model to reuse and the file is picked up by the next manual index.
+        Best effort: if the semantic index has not been opened this session there is no
+        loaded model to reuse and the file is picked up by the next explicit index.
         """
         if self._semantic_store is None:
             return
@@ -222,10 +240,21 @@ class VaultSession:
                 return
         except VaultError:
             return
-        try:
-            self.index_semantics(force=True, prefix=logical, refresh=False)
-        except Exception:  # noqa: BLE001 - best effort; the manual rebuild still works
+        if self.semantic_provider is None:
             return
+        if self._semantic_queue is None:
+            self._semantic_queue = SemanticIndexQueue(self._index_semantic_batch)
+        self._semantic_queue.enqueue(logical)
+
+    def _index_semantic_batch(self, paths: set[str]) -> None:
+        """Background worker: re-embed a coalesced batch without wiping the index."""
+        self.index_semantics(
+            force=True,
+            paths=set(paths),
+            refresh=False,
+            allow_reset=False,
+            reason="auto_index",
+        )
 
     def _prune_access_log(self) -> None:
         """Keep the audit log bounded (newest rows win; failures never block unlocking).
@@ -242,6 +271,9 @@ class VaultSession:
 
     def lock(self) -> None:
         """Flush, wipe the master key and close the store and index."""
+        queue, self._semantic_queue = self._semantic_queue, None
+        if queue is not None:
+            queue.stop()
         if self._index is not None:
             self._prune_access_log()
         if self._semantic_store is not None:
@@ -390,12 +422,14 @@ class VaultSession:
         outcome: str,
         bytes: int | None = None,
         session: str | None = None,
+        query: str | None = None,
     ) -> None:
         """Emit one metadata-only activity event (SPEC/09 §7).
 
-        The event carries the path, level, source, tool, outcome and byte count — never
-        any content. The transport source defaults to ``gui`` and is overridden by
-        :class:`~vault.api.service.Service` while a call is being dispatched.
+        The event carries the path, level, source, tool, outcome and byte count — never any
+        file content. ``query`` is the *request* string of a search call, so the local user
+        can see exactly what an agent searched for in the tray/activity feed; it is shown to
+        the owner only and is never written to the access log.
         """
         callback = self.on_activity
         if callback is None:
@@ -410,6 +444,7 @@ class VaultSession:
             "bytes": bytes,
             "session": session,
             "kind": kind,
+            "query": query,
         }
         try:
             callback(event)
@@ -579,6 +614,7 @@ class VaultSession:
                 "model": None,
                 "chunking": None,
                 "bytes": 0,
+                "last_reset": None,
             }
         return {
             "locked": self.is_locked,
@@ -596,10 +632,76 @@ class VaultSession:
                 "indexed_files": int(semantic_stats["files"]),
                 "bytes": int(semantic_stats["bytes"]),
                 "db_path": str(self.semantic_db_path()),
+                "last_reset": semantic_stats.get("last_reset"),
+                "cache": self.semantic_cache_stats(),
+                "queue": self._semantic_queue.stats() if self._semantic_queue else {
+                    "pending": 0,
+                    "debounce_ms": 0,
+                    "last_error": None,
+                },
             },
             "auto_lock_seconds": int(meta.settings.get("auto_lock_seconds", 0) or 0),
             "store": store_stats,
         }
+
+    def semantic_cache_stats(self) -> dict[str, Any]:
+        """Return the vector-cache stats for the currently indexed model, if known.
+
+        Read-only: it never creates the cache file and never prunes on a status poll.
+        """
+        empty = {
+            "entries": 0,
+            "bytes": 0,
+            "hits": 0,
+            "misses": 0,
+            "hit_rate": 0.0,
+            "path": None,
+        }
+        model = None
+        dim = None
+        if self._semantic_store is not None:
+            meta = self._semantic_store.meta()
+            model = meta.get("model")
+            dim = meta.get("dim")
+        if not model:
+            model = (self._require_meta().settings.get("semantic") or {}).get("model")
+        if not model or not dim:
+            return empty
+        try:
+            from .vector_cache import VectorCache  # noqa: PLC0415
+
+            path = VectorCache.default_path(str(model), int(dim))
+            if not path.exists():
+                result = dict(empty)
+                result["path"] = str(path)
+                return result
+            cap = int(
+                (self._require_meta().settings.get("semantic") or {}).get(
+                    "cache_max_mb", 512
+                )
+                or 512
+            )
+            cache = VectorCache(
+                path,
+                model=str(model),
+                dim=int(dim),
+                max_bytes=max(0, cap) * 1024 * 1024,
+                prune_on_open=False,
+            )
+            stats = cache.stats()
+            cache.close()
+            return stats
+        except Exception:  # noqa: BLE001 - stats are informational only
+            return empty
+
+    def clear_semantic_cache(self, *, source: str = SOURCE_UI) -> int:
+        """Delete the on-disk embedding cache and reset its stats."""
+        try:
+            from .vector_cache import VectorCache  # noqa: PLC0415
+
+            return VectorCache.clear_all()
+        except Exception:  # noqa: BLE001 - best effort
+            return 0
 
     # ----------------------------------------------------------------------- files
     def list_folder(self, path: str, *, source: str = SOURCE_UI) -> dict[str, Any]:
@@ -683,6 +785,49 @@ class VaultSession:
         if store is not None:
             store.index_text(int(file_id), text, note=note or "")
 
+    @staticmethod
+    def _record_version(
+        idx: Index,
+        file_id: int,
+        new_row: dict[str, Any],
+        existing: dict[str, Any] | None,
+        data: bytes,
+        blob_id: str,
+        source: str,
+    ) -> None:
+        """Append a content version, seeding the previous content the first time.
+
+        Every save keeps its own blob (the old blob is never deleted here), so the full
+        history stays browsable; identical content does not create a new version.
+        """
+        digest = sha256_hex(data)
+        if (
+            existing is not None
+            and existing.get("blob_id")
+            and idx.version_count(file_id) == 0
+        ):
+            idx.record_version(
+                file_id,
+                blob_id=str(existing["blob_id"]),
+                size=int(existing.get("size") or 0),
+                encrypted=int(existing.get("encrypted") or 1),
+                sensitivity=str(existing.get("sensitivity") or "normal"),
+                mtime=int(existing.get("mtime") or now_ms()),
+                source=str(existing.get("source") or "ui"),
+            )
+        latest = idx.latest_version(file_id)
+        if latest is None or latest.get("digest") != digest:
+            idx.record_version(
+                file_id,
+                blob_id=str(blob_id),
+                size=int(new_row["size"]),
+                encrypted=int(new_row["encrypted"]),
+                sensitivity=str(new_row["sensitivity"]),
+                mtime=int(new_row["mtime"]),
+                source=source,
+                digest=digest,
+            )
+
     def write_file(
         self,
         path: str,
@@ -738,8 +883,8 @@ class VaultSession:
             sensitivity=desired,
             source=source,
         )
-        if existing is not None and existing.get("blob_id") and existing["blob_id"] != blob_id:
-            self.fs.delete_blob(existing["blob_id"])
+        new_row = idx.require_file(logical)
+        self._record_version(idx, file_id, new_row, existing, data, blob_id, source)
         if desired == "normal":
             self._index_file_text(file_id, data.decode("utf-8", errors="ignore"))
         else:
@@ -757,7 +902,7 @@ class VaultSession:
             outcome="allow",
             bytes=size,
         )
-        return self._require_index().require_file(logical)
+        return new_row
 
     def write_lines(
         self,
@@ -870,7 +1015,8 @@ class VaultSession:
             self._deny("copy", row["logical_path"], source, "content_forbidden", None)
         data = self._read_raw(row)
         blob_id, size, encrypted = self.fs.write_blob(data, sensitivity=row["sensitivity"])
-        file_id = self._require_index().upsert_file(
+        idx = self._require_index()
+        file_id = idx.upsert_file(
             dest_path,
             blob_id=blob_id,
             is_dir=False,
@@ -878,6 +1024,17 @@ class VaultSession:
             encrypted=encrypted,
             sensitivity=row["sensitivity"],
             source=source,
+        )
+        new_row = idx.require_file(dest_path)
+        idx.record_version(
+            file_id,
+            blob_id=blob_id,
+            size=int(new_row["size"]),
+            encrypted=int(new_row["encrypted"]),
+            sensitivity=str(new_row["sensitivity"]),
+            mtime=int(new_row["mtime"]),
+            source=source,
+            digest=sha256_hex(data),
         )
         if row["sensitivity"] == "normal":
             self._index_file_text(file_id, data.decode("utf-8", errors="ignore"))
@@ -889,10 +1046,17 @@ class VaultSession:
         logical = normalize_vault_path(path)
         self._require_unlocked()
         idx = self._require_index()
+        # Gather every blob (current + historical) before the rows disappear.
+        blobs: list[str] = []
+        for candidate in idx.walk(logical):
+            if candidate.get("blob_id"):
+                blobs.append(str(candidate["blob_id"]))
+            for version in idx.list_versions(int(candidate["id"])):
+                blobs.append(str(version.get("blob_id") or ""))
         removed = idx.delete_file(logical, recursive=recursive)
+        for blob_id in blobs:
+            self.fs.delete_blob(blob_id)
         for row in removed:
-            if row.get("blob_id"):
-                self.fs.delete_blob(row["blob_id"])
             self._store.remove_file(int(row["id"]))
             self._forget_semantic(int(row["id"]))
         self.flush()
@@ -946,8 +1110,7 @@ class VaultSession:
                     sensitivity=level,
                     source=source,
                 )
-                if blob_id != row["blob_id"]:
-                    self.fs.delete_blob(row["blob_id"])
+                # The previous blob is kept: historical versions still reference it.
             else:
                 idx.set_sensitivity(logical, level)
             new_row = idx.require_file(logical)
@@ -959,6 +1122,13 @@ class VaultSession:
                 self._forget_semantic(int(new_row["id"]))
         self.flush()
         self._log(source=source, tool="set_sensitivity", target_path=logical, outcome="allow")
+        self._emit_activity(
+            kind="write",
+            tool="set_sensitivity",
+            path=logical,
+            sensitivity=str(new_row["sensitivity"]),
+            outcome="allow",
+        )
         return new_row
 
     def set_tags(
@@ -973,6 +1143,13 @@ class VaultSession:
         self._log(source=source, tool="set_tags", target_path=logical, outcome="allow")
         row = idx.require_file(logical)
         row["tags"] = idx.get_tags(logical)
+        self._emit_activity(
+            kind="write",
+            tool="set_tags",
+            path=logical,
+            sensitivity=str(row["sensitivity"]),
+            outcome="allow",
+        )
         return row
 
     def folder_note(self, path: str, *, source: str = SOURCE_UI) -> str | None:
@@ -989,6 +1166,14 @@ class VaultSession:
         self.flush()
         self._log(
             source=source, tool="set_folder_note", target_path=logical, outcome="allow"
+        )
+        self._emit_activity(
+            kind="write",
+            tool="set_folder_note",
+            path=logical,
+            sensitivity=None,
+            outcome="allow",
+            bytes=len(text.encode("utf-8")),
         )
 
     def file_note(self, path: str, *, source: str = SOURCE_UI) -> str | None:
@@ -1017,6 +1202,14 @@ class VaultSession:
         self.flush()
         self._log(
             source=source, tool="set_file_note", target_path=logical, outcome="allow"
+        )
+        self._emit_activity(
+            kind="write",
+            tool="set_file_note",
+            path=logical,
+            sensitivity=str(row["sensitivity"]),
+            outcome="allow",
+            bytes=len(text.encode("utf-8")),
         )
 
     # ---------------------------------------------------------------------- digest
@@ -1097,6 +1290,81 @@ class VaultSession:
                     break
         return entry
 
+    # -------------------------------------------------------------------- versions
+    def versions(self, path: str, *, source: str = SOURCE_UI) -> dict[str, Any]:
+        """Return every stored version of a file, newest first."""
+        logical = normalize_vault_path(path)
+        self._require_unlocked()
+        row = self._require_index().require_file(logical)
+        if int(row["is_dir"]):
+            raise BadRequest("is_directory", details={"path": logical})
+        rows = self._require_index().list_versions(int(row["id"]))
+        return {
+            "path": logical,
+            "count": len(rows),
+            "versions": [
+                {
+                    "version": int(v["version"]),
+                    "mtime": int(v["mtime"]),
+                    "size": int(v["size"]),
+                    "sensitivity": str(v["sensitivity"]),
+                    "source": str(v["source"]),
+                }
+                for v in rows
+            ],
+        }
+
+    def version_text(
+        self,
+        path: str,
+        version: int,
+        *,
+        source: str = SOURCE_UI,
+        encoding: str = "utf-8",
+    ) -> str:
+        """Return the decoded content of one historical version."""
+        logical = normalize_vault_path(path)
+        self._require_unlocked()
+        row = self._require_index().require_file(logical)
+        version_row = self._require_index().get_version(int(row["id"]), int(version))
+        if version_row is None:
+            raise NotFound(
+                "version_not_found", details={"path": logical, "version": version}
+            )
+        return self.fs.read_bytes(version_row).decode(encoding, errors="replace")
+
+    def diff(
+        self,
+        path: str,
+        from_version: int,
+        to_version: int,
+        *,
+        source: str = SOURCE_UI,
+    ) -> dict[str, Any]:
+        """Return a git-style line diff between any two versions of a file."""
+        logical = normalize_vault_path(path)
+        before = self.version_text(logical, from_version).splitlines()
+        after = self.version_text(logical, to_version).splitlines()
+        hunks: list[dict[str, Any]] = []
+        for tag, a1, a2, b1, b2 in difflib.SequenceMatcher(
+            a=before, b=after
+        ).get_opcodes():
+            hunks.append(
+                {
+                    "type": tag,  # equal | replace | delete | insert
+                    "a_start": a1 + 1,
+                    "a_lines": before[a1:a2],
+                    "b_start": b1 + 1,
+                    "b_lines": after[b1:b2],
+                }
+            )
+        return {
+            "path": logical,
+            "from": int(from_version),
+            "to": int(to_version),
+            "hunks": hunks,
+        }
+
     # ---------------------------------------------------------------------- search
     def search_filenames(
         self,
@@ -1112,7 +1380,7 @@ class VaultSession:
         )
         self._emit_activity(
             kind="search", tool="search_filenames", path=None, sensitivity=None,
-            outcome="allow",
+            outcome="allow", query=query,
         )
         self._log(source=source, tool="search_filenames", outcome="allow")
         return results
@@ -1132,7 +1400,7 @@ class VaultSession:
         )
         self._emit_activity(
             kind="search", tool="search_text", path=None, sensitivity=None,
-            outcome="allow",
+            outcome="allow", query=query,
         )
         self._log(source=source, tool="search_text", outcome="allow")
         return results
@@ -1152,7 +1420,7 @@ class VaultSession:
         )
         self._emit_activity(
             kind="search", tool="search_semantic", path=None, sensitivity=None,
-            outcome="allow",
+            outcome="allow", query=query,
         )
         self._log(source=source, tool="search_semantic", outcome="allow")
         return results

@@ -322,6 +322,25 @@ class ServiceNotesAndDigestTest(unittest.TestCase):
         self.assertEqual(by_name["a.md"]["first_line"], "# Title")
         self.assertEqual(by_name["b.md"]["first_line"], "beta")
 
+    def test_version_history_is_ui_only(self) -> None:
+        """The UI can list versions and diff them; the mcp role cannot."""
+        self.session.write_file("notes/v.md", b"v1")
+        self.session.write_file("notes/v.md", b"v2")
+        listing = self.service.dispatch(
+            "vault.versions", {"path": "/notes/v.md"}, role="ui", session_id="t"
+        )
+        self.assertEqual(listing["count"], 2)
+        diff = self.service.dispatch(
+            "vault.diff",
+            {"path": "/notes/v.md", "from_version": 1, "to_version": 2},
+            role="ui", session_id="t",
+        )
+        self.assertIn("hunks", diff)
+        with self.assertRaises(PermissionDenied):
+            self.service.dispatch(
+                "vault.versions", {"path": "/notes/v.md"}, role="mcp", session_id="t"
+            )
+
     def test_tags_are_readable_by_agents(self) -> None:
         """all_tags and files_by_tag are read-only but open to the mcp role."""
         self.service.dispatch(
