@@ -87,6 +87,7 @@ class MainWindow(QMainWindow):
         self.lock_label = QLabel(self)
         self.path_label = QLabel(self)
         self.count_label = QLabel(self)
+        self.sync_label = QLabel(self)
         self.mcp_label = QLabel(self)
         bar = self.statusBar()
         # Inside a Persian window the mixed Latin/Persian pieces must not be re-ordered by the
@@ -99,6 +100,7 @@ class MainWindow(QMainWindow):
         bar.addWidget(self.lock_label)
         bar.addWidget(self.path_label, 1)
         bar.addPermanentWidget(self.count_label)
+        bar.addPermanentWidget(self.sync_label)
         bar.addPermanentWidget(self.mcp_label)
 
     def refresh_status(self) -> None:
@@ -113,6 +115,16 @@ class MainWindow(QMainWindow):
         )
         self.path_label.setText("\u200e" + str(self.controller.vault_home) + "\u200e")
         self.count_label.setText(i18n.tr("status.files", count=status.get("files", 0)))
+        sync = status.get("sync") or {}
+        if not sync.get("configured"):
+            sync_text = i18n.tr("status.sync_off")
+        elif sync.get("readonly"):
+            sync_text = i18n.tr("status.sync_readonly")
+        elif sync.get("last_error"):
+            sync_text = i18n.tr("status.sync_error")
+        else:
+            sync_text = i18n.tr("status.sync_owned")
+        self.sync_label.setText("\u200e" + sync_text + "\u200e")
         try:
             connections = int(self.controller.connection_count())
         except Exception:  # noqa: BLE001
@@ -174,17 +186,28 @@ class MainWindow(QMainWindow):
         add(view_menu, "preview", None,
             lambda checked: self.editor.set_preview_enabled(checked), checkable=True)
         self.actions["preview"].setChecked(True)
+        # The editor toolbar has its own Preview button; keep the menu check in step with it.
+        self.editor.preview_changed.connect(self._on_preview_changed)
 
         tools_menu = self.menuBar().addMenu("")
         self._menus["tools"] = tools_menu
         add(tools_menu, "settings", None, self.controller.open_settings)
         add(tools_menu, "verify", None, self.controller.verify_integrity)
         add(tools_menu, "semantic_index", None, self.controller.semantic_index_now)
+        tools_menu.addSeparator()
+        add(tools_menu, "sync", None, self.controller.sync_now)
+        add(tools_menu, "take_control", None, self.controller.take_write_access)
 
         help_menu = self.menuBar().addMenu("")
         self._menus["help"] = help_menu
         add(help_menu, "about", None, self.controller.about)
         add(help_menu, "open_log", None, self.controller.open_log_file)
+
+    def _on_preview_changed(self, enabled: bool) -> None:
+        """Mirror the editor's Preview button state onto the View menu check."""
+        action = self.actions.get("preview")
+        if action is not None and action.isChecked() != bool(enabled):
+            action.setChecked(bool(enabled))
 
     # ------------------------------------------------------------------ files
     @property
@@ -367,6 +390,8 @@ class MainWindow(QMainWindow):
             "settings": "menu.settings",
             "verify": "menu.verify",
             "semantic_index": "menu.semantic_index",
+            "sync": "menu.sync",
+            "take_control": "tray.take_control",
             "about": "menu.about",
             "open_log": "menu.open_log",
         }

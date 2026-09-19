@@ -56,6 +56,8 @@ class TrayIcon(QObject):
         on_quit: Callable[[], None] | None = None,
         on_recent: Callable[[str], None] | None = None,
         on_search: Callable[[], None] | None = None,
+        on_sync: Callable[[], None] | None = None,
+        on_take_control: Callable[[], None] | None = None,
         parent: Any = None,
     ) -> None:
         """Try to install a tray icon; degrade silently when unavailable."""
@@ -65,6 +67,7 @@ class TrayIcon(QObject):
         self.actions: dict[str, QAction] = {}
         self.recent_menu: QMenu | None = None
         self._locked = False
+        self._sync_readonly = False
         self._last_read: dict[str, Any] | None = None
         self._events: list[dict[str, Any]] = []
         self.secret_recent = False
@@ -80,12 +83,19 @@ class TrayIcon(QObject):
                 ("show", on_show),
                 ("open_web", on_open_web),
                 ("copy_link", on_copy_link),
+                ("sync", on_sync),
             ):
                 action = QAction(menu)
                 if callback is not None:
                     action.triggered.connect(callback)
                 menu.addAction(action)
                 self.actions[name] = action
+            take = QAction(menu)
+            if on_take_control is not None:
+                take.triggered.connect(on_take_control)
+            take.setVisible(False)
+            menu.addAction(take)
+            self.actions["take_control"] = take
             self.recent_menu = menu.addMenu("")
             menu.addSeparator()
             for name, callback in (
@@ -198,6 +208,8 @@ class TrayIcon(QObject):
                     path="/" + str(self._last_read.get("path", "")).lstrip("/"),
                     seconds=age,
                 )
+        if self._sync_readonly and not self._locked:
+            text = i18n.tr("status.sync_readonly") + " — " + text
         if self.secret_recent:
             text = "🔑 " + text
         self.tray.setToolTip(text)
@@ -205,6 +217,14 @@ class TrayIcon(QObject):
     def set_locked(self, locked: bool) -> None:
         """Update the tooltip to reflect the lock state."""
         self._locked = bool(locked)
+        self._apply_tooltip()
+
+    def set_sync_readonly(self, readonly: bool) -> None:
+        """Show the "take write access" action only while the vault is read-only."""
+        self._sync_readonly = bool(readonly)
+        action = self.actions.get("take_control")
+        if action is not None:
+            action.setVisible(bool(readonly))
         self._apply_tooltip()
 
     def hide(self) -> None:
@@ -218,6 +238,8 @@ class TrayIcon(QObject):
             "show": "tray.show",
             "open_web": "tray.open_web",
             "copy_link": "tray.copy_link",
+            "sync": "tray.sync",
+            "take_control": "tray.take_control",
             "lock": "tray.lock",
             "settings": "tray.settings",
             "quit": "tray.quit",

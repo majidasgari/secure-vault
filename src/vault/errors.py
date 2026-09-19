@@ -100,6 +100,18 @@ class ProviderUnavailable(VaultError):
     code = "PROVIDER_UNAVAILABLE"
 
 
+class SyncError(VaultError):
+    """An S3 sync operation failed (network, credentials, bucket, object layout)."""
+
+    code = "SYNC_ERROR"
+
+
+class SyncReadOnly(VaultError):
+    """The vault is read-only because another S3 client holds the write lock."""
+
+    code = "SYNC_READONLY"
+
+
 __all__ = [
     "VaultError",
     "VaultLocked",
@@ -113,4 +125,6 @@ __all__ = [
     "BadRequest",
     "Unauthorized",
     "ProviderUnavailable",
+    "SyncError",
+    "SyncReadOnly",
 ]

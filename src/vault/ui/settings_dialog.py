@@ -28,8 +28,10 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from ..config import load_sync_config
 from ..core.chunking import CHUNK_MODES, DEFAULT_CHUNK_MODE
 from ..core.semantics import folder_included, normalize_folder_key
+from ..util import is_within
 from . import i18n
 
 _LEVELS = ("normal", "secret", "secretfile")
@@ -60,6 +62,7 @@ class SettingsDialog(QDialog):
         self._build_semantic()
         self._build_importer()
         self._build_web()
+        self._build_sync()
         self._build_log()
 
         self.buttons = QDialogButtonBox(self)
@@ -359,6 +362,98 @@ class SettingsDialog(QDialog):
         form.addRow(self._label("settings.web_url"), self.web_url)
         self.tabs.addTab(page, "")
 
+    def _build_sync(self) -> None:
+        """Build the S3 sync tab (coordinates in the vault, keys machine-local)."""
+        page = QWidget(self)
+        form = QFormLayout(page)
+        sync = self._settings.get("sync") or {}
+        credentials = load_sync_config()
+        self.sync_enabled = QCheckBox(page)
+        self.sync_enabled.setChecked(bool(sync.get("enabled")))
+        form.addRow(self._label("settings.sync_enabled"), self.sync_enabled)
+        self.sync_bucket = QLineEdit(str(sync.get("bucket", "")), page)
+        form.addRow(self._label("settings.sync_bucket"), self.sync_bucket)
+        self.sync_prefix = QLineEdit(str(sync.get("prefix", "")), page)
+        form.addRow(self._label("settings.sync_prefix"), self.sync_prefix)
+        self.sync_endpoint = QLineEdit(str(sync.get("endpoint", "")), page)
+        self.sync_endpoint.setPlaceholderText("https://s3.example.com")
+        form.addRow(self._label("settings.sync_endpoint"), self.sync_endpoint)
+        self.sync_region = QLineEdit(str(sync.get("region", "")), page)
+        form.addRow(self._label("settings.sync_region"), self.sync_region)
+        self.sync_access = QLineEdit(str(credentials.get("access_key", "")), page)
+        self.sync_access.setEchoMode(QLineEdit.EchoMode.Password)
+        form.addRow(self._label("settings.sync_access_key"), self.sync_access)
+        self.sync_secret = QLineEdit(str(credentials.get("secret_key", "")), page)
+        self.sync_secret.setEchoMode(QLineEdit.EchoMode.Password)
+        form.addRow(self._label("settings.sync_secret_key"), self.sync_secret)
+        self.sync_hint = QLabel(page)
+        self.sync_hint.setWordWrap(True)
+        form.addRow(self.sync_hint)
+        self.sync_state = QLabel(page)
+        self.sync_state.setWordWrap(True)
+        form.addRow(self.sync_state)
+        buttons = QHBoxLayout()
+        self.sync_test_button = QPushButton(page)
+        self.sync_test_button.clicked.connect(self._sync_test)
+        self.sync_now_button = QPushButton(page)
+        self.sync_now_button.clicked.connect(self._sync_now)
+        self.sync_acquire_button = QPushButton(page)
+        self.sync_acquire_button.clicked.connect(self._sync_acquire)
+        self.sync_release_button = QPushButton(page)
+        self.sync_release_button.clicked.connect(self._sync_release)
+        buttons.addWidget(self.sync_test_button)
+        buttons.addWidget(self.sync_now_button)
+        buttons.addWidget(self.sync_acquire_button)
+        buttons.addWidget(self.sync_release_button)
+        form.addRow(buttons)
+        self.tabs.addTab(page, "")
+
+    def _sync_test(self) -> None:
+        """Persist the settings, then test the S3 connection."""
+        self._on_accept()
+        self._controller.test_sync_connection()
+
+    def _sync_now(self) -> None:
+        """Persist the settings, then run the mirror in the background."""
+        self._on_accept()
+        self._controller.sync_now()
+
+    def _sync_acquire(self) -> None:
+        """Persist the settings, then force-acquire the write lock."""
+        self._on_accept()
+        self._controller.take_write_access()
+
+    def _sync_release(self) -> None:
+        """Persist the settings, then release the write lock."""
+        self._on_accept()
+        self._controller.release_write_access()
+
+    def _refresh_sync_state(self) -> None:
+        """Update the sync state line and enable/disable the action buttons."""
+        try:
+            sync = self._controller.dispatch_ui("vault.sync_status", {}).get("sync") or {}
+        except Exception:  # noqa: BLE001 - a locked vault still shows the tab
+            sync = {}
+        if not sync.get("configured"):
+            state = i18n.tr("status.sync_off")
+        elif sync.get("readonly"):
+            held = (sync.get("held_by") or {}).get("host") or "?"
+            state = i18n.tr("status.sync_readonly") + " · " + i18n.tr(
+                "sync.held_by", host=held
+            )
+        elif sync.get("last_error"):
+            state = i18n.tr("status.sync_error") + " · " + str(sync.get("last_error"))
+        else:
+            state = i18n.tr("status.sync_owned")
+        backend = sync.get("backend")
+        if backend:
+            state = f"{state} · {backend}"
+        self.sync_state.setText(i18n.tr("settings.sync_state", state=state))
+        readonly = bool(sync.get("readonly"))
+        self.sync_acquire_button.setVisible(readonly)
+        self.sync_release_button.setVisible(not readonly and bool(sync.get("owned")))
+        self.sync_now_button.setEnabled(bool(sync.get("configured")) and not readonly)
+
     def _build_log(self) -> None:
         """Build the Log tab."""
         page = QWidget(self)
@@ -430,6 +525,28 @@ class SettingsDialog(QDialog):
         """Persist the settings through the service."""
         language = self.language_combo.currentData()
         self._controller.set_language(str(language))
+        db_path = self.db_path_edit.text().strip()
+        if db_path and is_within(Path(db_path), self._controller.vault_home):
+            QMessageBox.warning(
+                self,
+                i18n.tr("settings.title"),
+                i18n.tr("settings.semantic_db_inside"),
+            )
+            return
+        sync_payload: dict[str, Any] = {
+            "enabled": bool(self.sync_enabled.isChecked()),
+            "bucket": self.sync_bucket.text().strip(),
+            "prefix": self.sync_prefix.text().strip(),
+            "endpoint": self.sync_endpoint.text().strip(),
+            "region": self.sync_region.text().strip(),
+        }
+        # Only overwrite stored credentials when a value was actually typed/prefilled.
+        access_key = self.sync_access.text().strip()
+        secret_key = self.sync_secret.text().strip()
+        if access_key:
+            sync_payload["access_key"] = access_key
+        if secret_key:
+            sync_payload["secret_key"] = secret_key
         payload = {
             "language": str(language),
             "auto_lock_seconds": int(self.autolock_spin.value()) * 60,
@@ -439,8 +556,9 @@ class SettingsDialog(QDialog):
                 "model": self.semantic_model.text().strip(),
                 "chunking": str(self.chunk_combo.currentData()),
                 "folder_states": dict(self._folder_states),
-                "db_path": self.db_path_edit.text().strip(),
+                "db_path": db_path,
             },
+            "sync": sync_payload,
             "import_joplin": {
                 "mirror_root": self.mirror_edit.text().strip(),
                 "sensitive_globs": [
@@ -478,7 +596,8 @@ class SettingsDialog(QDialog):
         self.tabs.setTabText(2, i18n.tr("settings.tab_semantic"))
         self.tabs.setTabText(3, i18n.tr("settings.tab_importer"))
         self.tabs.setTabText(4, i18n.tr("settings.tab_web"))
-        self.tabs.setTabText(5, i18n.tr("settings.tab_log"))
+        self.tabs.setTabText(5, i18n.tr("settings.tab_sync"))
+        self.tabs.setTabText(6, i18n.tr("settings.tab_log"))
         self.language_combo.setItemText(0, i18n.tr("language.fa"))
         self.language_combo.setItemText(1, i18n.tr("language.en"))
         for index, level in enumerate(_LEVELS):
@@ -499,7 +618,13 @@ class SettingsDialog(QDialog):
         self.import_button.setText(i18n.tr("settings.run_import"))
         self.reindex_button.setText(i18n.tr("settings.reindex"))
         self.open_log_button.setText(i18n.tr("settings.open_log"))
+        self.sync_hint.setText(i18n.tr("settings.sync_hint"))
+        self.sync_test_button.setText(i18n.tr("settings.sync_test"))
+        self.sync_now_button.setText(i18n.tr("settings.sync_now"))
+        self.sync_acquire_button.setText(i18n.tr("settings.sync_acquire"))
+        self.sync_release_button.setText(i18n.tr("settings.sync_release"))
         self._refresh_semantic_status()
+        self._refresh_sync_state()
 
     def _refresh_semantic_status(self) -> None:
         """Update the semantic availability, cache and last-reset lines."""

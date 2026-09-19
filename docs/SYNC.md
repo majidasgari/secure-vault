@@ -1,76 +1,162 @@
 # Secure Vault — Syncing the vault folder
 
-Secure Vault does not sync anything itself. It stores all data in a single folder (the
-**vault home**, default `/data/Cloud/SecureVault`) that you can put inside Dropbox,
-OneDrive, Google Drive, Syncthing, etc. This document explains what is safe to sync, what
-is not, and how the app behaves when two machines touch the same folder.
+Secure Vault stores everything in a single folder (the **vault home**, default
+`/data/Cloud/SecureVault`). It can mirror that whole folder to any S3-compatible bucket
+(AWS S3, MinIO, Backblaze B2 via its S3 API, …) with a built-in two-way sync and a
+cooperative write lock, or you can sync the folder yourself with Dropbox/OneDrive/Google
+Drive/Syncthing. This document covers both.
 
-## 1. What may be synced
+## 0. The one rule: only one writer at a time
 
-The **entire vault home** is designed to be synced:
+`files/`, `secure.store` and `meta.sqlite` are **not** designed to merge. The built-in
+sync therefore uses a **lock object** in the bucket (`.secure-vault.lock`):
+
+* When the vault is unlocked, the client tries to acquire the lock.
+* If another client holds it, this session becomes **read-only**: every write (edit,
+  create, move, delete, note, tag, level change, search-index rebuild) is refused.
+* The **Take write access** button forces the lock to this device (use it after a crash
+  or when you know the other device is gone). It overwrites the lock object.
+* On lock/quit the client releases the lock so the other device can take over.
+
+The lock is a plain JSON object (`owner`, `host`, `pid`, `acquired_at`, `heartbeat_at`);
+the credentials are never in it.
+
+## 1. Enabling S3 sync
+
+No extra package is required: the app signs requests itself with AWS SigV4 over
+`http.client`. (`requirements-s3.txt` offers `boto3` as an optional alternative backend
+when it is available; the two are interchangeable.)
+
+1. Open **Settings → S3 sync** and fill in the bucket, optional prefix (folder in the
+   bucket), endpoint URL (for non-AWS providers) and region. Tick *Sync this vault with
+   S3* and enter the access key/secret.
+
+   * The bucket/prefix/endpoint/region are stored in the vault settings (they are
+     coordinates, not secrets).
+   * The **access key and secret are stored machine-locally** in
+     `~/.config/secure-vault/s3.json` (mode `0600`) and are **never** written into the
+     vault, so they cannot leak through the cloud client.
+
+2. Press **Sync now**. On the first run everything is uploaded; later runs only transfer
+   changed files.
+
+## 2. Locking and read-only mode in practice
+
+* **Unlocking** a synced vault does not make it writable until the lock is acquired. If
+  the bucket is unreachable or held by another device, the app opens read-only — this is
+  deliberate: refusing to write is always safer than overwriting a peer's work.
+* The status bar shows `S3: synced`, `S3: read-only`, `S3: off` or `S3: error`. The web
+  UI shows a red read-only banner naming the holder.
+* Use **Take write access** (Tools menu / tray / web banner / Settings tab) to force the
+  lock to this device.
+* Sync is refused while read-only, so run it after taking access.
+
+## 3. What is synced (and what never is)
+
+The **entire vault home** is synced:
 
 ```
 <vault home>/
 ├── .vault-meta.json     KDF salt/params + canary (no secrets)
 ├── meta.sqlite          plaintext metadata: names, levels, tags, access log, kv
-├── secure.store         encrypted content store (FTS index, folder notes)
+├── secure.store         encrypted content store (FTS index, folder/file notes)
 └── files/<aa>/<blob>.enc   AES-256-GCM blobs (or plain blobs > 10 MB)
 ```
 
-The semantic vector cache is **not** here by default: it lives in the user's data dir
-(`$XDG_DATA_HOME/secure-vault/semantic/<vault_id>.db`, i.e. under the user's home), which
-is outside the synced folder. See §2.
+Never synced (excluded by the engine even if they end up in the folder):
 
-Everything except the metadata DB is ciphertext. The metadata DB and `.vault-meta.json`
-are plaintext by design (see `docs/SECURITY.md`); they leak names, levels, tags and the
-access log, but no content.
+* **Semantic vectors** — `semantic*.db` / any `*.db`. They are derived data and live
+  outside the vault by default (`$XDG_DATA_HOME/secure-vault/semantic/`). Settings
+  refuses to store a vector-cache path inside the vault home.
+* **Embedding cache** — `*.db` under the user data dir (see §6).
+* Runtime leftovers (`*.dec`, `store.*`, `*.tmp`, `*.sqlite-wal`, `*.sqlite-shm`,
+  `.DS_Store`, the lock object itself).
 
-## 2. What must never be synced
+The runtime directory (`$XDG_RUNTIME_DIR/secure-vault/` or `/tmp/secure-vault-<uid>/`)
+holds the decrypted store, the socket and the token; it is outside the vault and is
+never uploaded. Never copy `store.*.dec` anywhere.
 
-* The **runtime directory** `$XDG_RUNTIME_DIR/secure-vault/` (fallback
-  `/tmp/secure-vault-<uid>/`), which contains:
-  * `store.<pid>.<rand>.dec` — the **decrypted** content store;
-  * `daemon.sock` — the local Unix socket;
-  * `tokens.json` — the per-daemon MCP token.
-* The **semantic vector cache** — encrypted, but a **derived, rebuildable cache**, not
-  data. It lives under the user's home by default (Settings → Semantic shows and lets you
-  change the path), so it is never swept up by the cloud client; each machine rebuilds it
-  locally (Settings → Semantic → *Build/refresh index*). If you point it at a path inside
-  the vault home, exclude it from sync by name. It can be large (one vector per chunk) and
-  is never worth syncing.
-* The **embedding cache** `~/.local/share/secure-vault/semantic/cache/<model>__<dim>.db`
-  (`$XDG_DATA_HOME`) — unencrypted, content-addressed vectors, rebuildable on demand and
-  never worth syncing or backing up (Settings → Semantic → *Clear vector cache*).
-* The user config `~/.config/secure-vault/ui.json` (machine-local window state).
-* Any backup or export you make outside the vault home.
+## 4. How the mirror resolves changes
 
-The runtime directory is outside the vault home precisely so it is never swept up by the
-cloud client. Never copy `store.*.dec` or `semantic.*.dec` anywhere.
+The sync is three-way: it compares the local files, the bucket and a machine-local
+manifest of the last successful sync (`$XDG_DATA_HOME/secure-vault/sync/<vault>.json`).
 
-> Rebuilding the semantic index needs the embedding model available locally and downloads
-> it once (see `requirements-semantic.txt`). Until it is rebuilt, semantic search simply
-> returns nothing on that machine; full-text and filename search keep working.
+* New/changed on one side → transferred to the other side.
+* Deleted on one side → deleted on the other (this is why the manifest is kept).
+* Changed on both sides at once → the local writer wins and the path is reported in
+  `conflicts`; this should not happen while the lock works correctly.
+* `.sqlite` WAL is checkpointed into `meta.sqlite` before upload so the single file is
+  self-contained; `-wal`/`-shm` side files are never uploaded.
 
-## 3. Conflict behaviour
+`meta.sqlite` grows one access-log row per call, so two syncs in a row may each upload a
+changed `meta.sqlite`; large content is only transferred once.
 
-* **`files/*.enc` blobs** are effectively immutable: a content change writes a *new*
-  random `blob_id`, and the old blob is deleted only after the metadata row is updated.
-  Two machines editing different files therefore never collide at the blob level.
-* **`meta.sqlite` and `secure.store` are single files**, so a cloud client resolves
-  concurrent changes with its usual **last-writer-wins** policy. If two machines edit the
-  vault while both are unlocked, one machine's index/store can overwrite the other's; the
-  losing machine's blobs may still exist on disk but become unreferenced.
-* The SQLite databases use WAL mode; cloud clients do not understand WAL and may sync
-  `-wal`/`-shm` side files inconsistently. Prefer to let a sync finish while the app is
-  **locked**, when no writes are in flight.
-* A note removed on one machine is never deleted from the vault by the Joplin importer;
-  ordinary deletes are explicit UI/agent actions.
+## 5. Sync from the app or the web
+
+* **Desktop app**: Tools → *Sync now* (`menu.sync`), the tray *Sync now* action, or the
+  **Sync now** button on **Settings → S3 sync**. A notification reports the counts.
+* **Web UI**: the **Sync** button in the header. A read-only banner appears with a
+  **Take write access** button when another device holds the lock.
+
+The sync runs in a **background thread** and never holds the service lock, so the app and
+the browser stay responsive. Both show live progress (uploaded/downloaded/deleted
+counters and the current path) while it runs, and writes are refused with
+`sync_in_progress` until it finishes (no half-written vault). Locking the vault cancels a
+running sync.
+
+**Test connection**: *Settings → S3 sync → Test connection* lists the bucket and reports
+whether the endpoint, bucket and credentials are correct, without transferring anything.
+It is also available over the API as `vault.sync_test`.
+
+## 6. Moving the embedding cache to a flash drive (no re-embedding)
+
+The paragraph→vector cache is **content-addressed** and keys vectors by
+`HMAC(salt, model|dim|normalizer_version|sha256(text))`. The salt lives inside each cache
+database, so moving a cache file intact keeps every key valid and the system reuses the
+vectors instead of recomputing them.
+
+Manual recipe:
+
+1. Close Secure Vault (or at least stop indexing) on both machines.
+2. Copy the whole per-model cache file, not just part of it:
+
+   ```bash
+   mkdir -p /media/flash/secure-vault-cache
+   cp ~/.local/share/secure-vault/semantic/cache/*.db* /media/flash/secure-vault-cache/
+   ```
+
+   (The filename encodes the model and dimension, e.g.
+   `BAAI__bge-m3__1024.db`. Copy the `-wal`/`-shm` siblings too if present.)
+3. On the machine that should use the moved cache, point `XDG_DATA_HOME` at the flash
+   (or copy the file back to `~/.local/share/secure-vault/semantic/cache/`). The cache
+   directory is `<XDG_DATA_HOME>/secure-vault/semantic/cache/`.
+
+Because the key includes the model, the dimension and the normalizer version, a cache is
+only reused by a matching model; changing chunking mode (paragraph ↔ sentence ↔
+document) does **not** invalidate it. If the salt is missing or the file is corrupted,
+the affected entries are simply re-embedded (a cache miss), never an error.
+
+The cache holds only derived vectors (no vault content), is unencrypted on purpose,
+and is **never synced** — moving it by hand is the supported way to avoid paying the
+embedding cost again. You can clear it from **Settings → Semantic search → Clear vector
+cache**.
+
+## 7. Alternative: cloud-drive sync (no built-in client)
+
+If you prefer a Dropbox/Drive client, put the vault home inside it and follow the same
+single-writer rule. The old caveats still apply:
+
+* Do **not** run two daemons against the same synced folder on two machines at the same
+  time.
+* Prefer to let a sync finish while the app is **locked**.
+* `meta.sqlite` and `secure.store` are single files: a cloud client resolves concurrent
+  changes last-writer-wins, so one side's changes can be lost.
 
 ### Cleaning up orphan blobs
 
 After a conflict, `files/` can contain blobs no longer referenced by `meta.sqlite`. The
-app exposes a garbage collector in the core (`VaultFS.gc_orphans`); run it from a shell
-while the vault is unlocked, with the app closed on every other machine:
+core exposes `VaultFS.gc_orphans`; run it from a shell while the vault is unlocked, with
+the app closed on every other machine:
 
 ```bash
 read -r -s -p "master password: " SV_PW; echo
@@ -89,13 +175,10 @@ print(f"removed {removed} orphan blob(s)")
 PY
 ```
 
-This only ever deletes files under `files/` that no metadata row references; it never
-touches the metadata DB or the store.
+This only deletes files under `files/` that no metadata row references.
 
-## 4. Recommendation: one daemon at a time
+## 8. Recommendation
 
-Do **not** run two daemons (two GUI instances or a GUI plus a headless daemon) on two
-machines against the same synced folder at the same time. The design is single-writer:
-one process owns the key and the content store, and the socket/token are per-machine.
-Use one machine as the writer, let the cloud client finish, then unlock on the other.
-If you need read-only access elsewhere, lock the vault first.
+Keep the lock discipline: one writer, the others read-only, sync before you switch
+machines. The built-in S3 sync plus the lock is the supported path; the cloud-drive
+recipe is only a fallback.

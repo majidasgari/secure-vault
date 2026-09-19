@@ -9,6 +9,7 @@ before raising.
 from __future__ import annotations
 
 import difflib
+import logging
 import threading
 import uuid
 from pathlib import Path
@@ -21,11 +22,13 @@ from ..errors import (
     DowngradeForbidden,
     NotFound,
     PermissionDenied,
+    SyncError,
+    SyncReadOnly,
     Unauthorized,
     VaultError,
     VaultLocked,
 )
-from ..util import normalize_vault_path, now_ms, sha256_hex, wipe
+from ..util import is_within, normalize_vault_path, now_ms, sha256_hex, wipe
 from . import search as search_mod
 from . import semantics
 from . import retention
@@ -46,6 +49,8 @@ from .vaultfs import VaultFS
 
 SecretRequestCallback = Callable[[dict[str, Any]], Any]
 ActivityCallback = Callable[[dict[str, Any]], Any]
+
+LOG = logging.getLogger(__name__)
 
 
 class VaultSession:
@@ -81,6 +86,12 @@ class VaultSession:
         self._semantic_auto_provider: semantics.EmbeddingProvider | None = None
         self._semantic_resolved = False
         self._pending: dict[str, dict[str, Any]] = {}
+        #: S3 sync manager (lock + mirror); created on unlock and when S3 is configured.
+        self._sync_manager: Any | None = None
+        #: Optional injected S3 client (tests/self-test); wins over boto3.
+        self._sync_client: Any | None = None
+        #: True while a background S3 mirror is running (writes are refused meanwhile).
+        self._syncing = False
         self.on_secret_request: SecretRequestCallback | None = None
         # SPEC/09 §7: metadata-only activity feed hook (never carries content).
         self.on_activity: ActivityCallback | None = None
@@ -120,6 +131,7 @@ class VaultSession:
         )
         session._store = SecureStore.open(home, master_key, session._runtime)
         session.touch()
+        session._init_sync()
         return session
 
     @staticmethod
@@ -155,6 +167,7 @@ class VaultSession:
         self._store = SecureStore.open(self._home, master_key, self._runtime)
         self._prune_access_log()
         self.touch()
+        self._init_sync()
 
     def reindex_search(
         self, progress: Callable[[str, int, int], None] | None = None
@@ -166,6 +179,7 @@ class VaultSession:
         inline images (measured: a 253 MB store for 48 MB of notes).
         """
         self._require_unlocked()
+        self._require_writable("reindex_search")
         idx = self._require_index()
         assert self._store is not None
         previous = getattr(self, "_suppress_log", False)
@@ -271,6 +285,20 @@ class VaultSession:
 
     def lock(self) -> None:
         """Flush, wipe the master key and close the store and index."""
+        manager = self._sync_manager
+        if manager is not None and manager.syncing:
+            # Stop a background mirror before the store/index close under it.
+            try:
+                manager.cancel()
+                manager.wait(timeout=3.0)
+            except Exception:  # noqa: BLE001 - locking must never block on sync
+                pass
+        if manager is not None and manager.owned:
+            # Auto-release the S3 write lock so another machine can take over cleanly.
+            try:
+                manager.release()
+            except Exception:  # noqa: BLE001 - a failed release must not block locking
+                pass
         queue, self._semantic_queue = self._semantic_queue, None
         if queue is not None:
             queue.stop()
@@ -358,6 +386,59 @@ class VaultSession:
         """Raise :class:`VaultLocked` when the vault is locked."""
         if self.is_locked or self._fs is None or self._store is None:
             raise VaultLocked("vault_locked")
+
+    # ---------------------------------------------------------------------- sync
+    def sync_manager(self) -> Any:
+        """Return (creating) the S3 sync manager for this session."""
+        from .sync import SyncManager  # noqa: PLC0415 - avoid an import cycle
+
+        if self._sync_manager is None:
+            self._sync_manager = SyncManager(self, client=self._sync_client)
+        return self._sync_manager
+
+    def set_sync_client(self, client: Any | None) -> dict[str, Any]:
+        """Inject an S3 client (tests/self-test) and re-run the startup lock check."""
+        self._sync_client = client
+        self._sync_manager = None
+        return self._init_sync()
+
+    def _init_sync(self) -> dict[str, Any]:
+        """Resolve the sync config and try to acquire the S3 write lock.
+
+        Called on unlock. A vault with sync disabled stays fully writable; a configured
+        bucket that is locked (or unreachable) resolves to read-only.
+        """
+        manager = self.sync_manager()
+        try:
+            manager.startup()
+        except Exception:  # noqa: BLE001 - startup must never block unlocking
+            manager.readonly = bool(manager.config.configured)
+        return manager.status()
+
+    def _require_writable(self, tool: str) -> None:
+        """Refuse a mutation when another S3 client holds the write lock.
+
+        This is the single gate every write path goes through: the check runs at write
+        time (not only at startup), so it stays correct even if S3 is configured later
+        in the session.
+        """
+        if getattr(self, "_syncing", False):
+            raise SyncError(
+                "sync_in_progress", details={"hint": "wait for the sync to finish"}
+            )
+        manager = self._sync_manager
+        if manager is None or not manager.readonly:
+            return
+        self._log(
+            source=SOURCE_UI,
+            tool=tool,
+            outcome="deny",
+            code=SyncReadOnly.code,
+            details="sync_readonly",
+        )
+        raise SyncReadOnly(
+            "sync_readonly", details={"held_by": manager.lock_info}
+        )
 
     def _log(
         self,
@@ -487,14 +568,28 @@ class VaultSession:
         settings = meta.settings
         configured = (settings.get("semantic") or {}).get("db_path")
         vault_id = str(getattr(meta, "vault_id", "") or "vault")
-        if isinstance(configured, str) and configured.strip():
-            candidate = Path(configured).expanduser()
-            if candidate.suffix.lower() == ".db":
-                return candidate
-            return candidate / f"semantic-{vault_id}.db"
         from ..config import user_data_dir
 
-        return user_data_dir() / "semantic" / f"{vault_id}.db"
+        default = user_data_dir() / "semantic" / f"{vault_id}.db"
+        if isinstance(configured, str) and configured.strip():
+            candidate = Path(configured).expanduser()
+            target = (
+                candidate
+                if candidate.suffix.lower() == ".db"
+                else candidate / f"semantic-{vault_id}.db"
+            )
+            # Vectors are derived data and must live outside the synced vault; a path
+            # inside the home is ignored (settings refuse to store one, but old configs
+            # or symlinks could still point there).
+            if is_within(target, self._home):
+                LOG.warning(
+                    "semantic db_path %s is inside the vault; using %s instead",
+                    target,
+                    default,
+                )
+                return default
+            return target
+        return default
 
     @property
     def semantic_store(self) -> SemanticStore:
@@ -642,7 +737,19 @@ class VaultSession:
             },
             "auto_lock_seconds": int(meta.settings.get("auto_lock_seconds", 0) or 0),
             "store": store_stats,
+            "sync": self.sync_manager().status(),
         }
+
+    def apply_sync_settings(self) -> dict[str, Any]:
+        """Re-read the sync settings/credentials and re-run the startup lock check."""
+        manager = self.sync_manager()
+        manager.set_client(self._sync_client)
+        manager.reload_config()
+        try:
+            return manager.startup()
+        except Exception:  # noqa: BLE001 - never let a bad bucket break settings save
+            manager.readonly = bool(manager.config.configured)
+            return manager.status()
 
     def semantic_cache_stats(self) -> dict[str, Any]:
         """Return the vector-cache stats for the currently indexed model, if known.
@@ -846,6 +953,7 @@ class VaultSession:
         """
         logical = normalize_vault_path(path)
         self._require_unlocked()
+        self._require_writable("write_file")
         if logical == "/":
             raise BadRequest("cannot_write_root")
         idx = self._require_index()
@@ -953,6 +1061,7 @@ class VaultSession:
         """Create a directory (and any missing parents) and return its row."""
         logical = normalize_vault_path(path)
         self._require_unlocked()
+        self._require_writable("mkdir")
         if logical == "/":
             raise AlreadyExists("root_exists")
         idx = self._require_index()
@@ -972,6 +1081,7 @@ class VaultSession:
         source_path = normalize_vault_path(src)
         dest_path = normalize_vault_path(dst)
         self._require_unlocked()
+        self._require_writable("move")
         idx = self._require_index()
         idx.require_file(source_path)
         idx.move(source_path, dest_path)
@@ -987,6 +1097,7 @@ class VaultSession:
         source_path = normalize_vault_path(src)
         dest_path = normalize_vault_path(dst)
         self._require_unlocked()
+        self._require_writable("copy")
         idx = self._require_index()
         row = idx.require_file(source_path)
         if idx.get_file(dest_path) is not None:
@@ -1045,6 +1156,7 @@ class VaultSession:
         """Delete a file (or directory) and its blobs/content rows."""
         logical = normalize_vault_path(path)
         self._require_unlocked()
+        self._require_writable("delete")
         idx = self._require_index()
         # Gather every blob (current + historical) before the rows disappear.
         blobs: list[str] = []
@@ -1078,6 +1190,7 @@ class VaultSession:
         if level not in LEVELS:
             raise BadRequest("unknown_level", details={"level": level})
         self._require_unlocked()
+        self._require_writable("set_sensitivity")
         idx = self._require_index()
         row = idx.require_file(logical)
         old_level = row["sensitivity"]
@@ -1137,6 +1250,7 @@ class VaultSession:
         """Replace a file's tags and return its row with ``tags`` attached."""
         logical = normalize_vault_path(path)
         self._require_unlocked()
+        self._require_writable("set_tags")
         idx = self._require_index()
         idx.set_tags(logical, tags)
         self.flush()
@@ -1162,6 +1276,7 @@ class VaultSession:
         """Attach/replace the note on a folder."""
         logical = normalize_vault_path(path)
         self._require_unlocked()
+        self._require_writable("set_folder_note")
         self._store.set_folder_note(logical, text)
         self.flush()
         self._log(
@@ -1187,6 +1302,7 @@ class VaultSession:
         """Attach/replace the short note on a file and keep search in sync."""
         logical = normalize_vault_path(path)
         self._require_unlocked()
+        self._require_writable("set_file_note")
         row = self._require_index().require_file(logical)
         if int(row["is_dir"]):
             raise BadRequest("is_directory", details={"path": logical})

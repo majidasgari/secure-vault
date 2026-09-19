@@ -51,6 +51,15 @@ def default_settings() -> dict[str, Any]:
             "mirror_root": _DEFAULT_IMPORT_MIRROR,
             "sensitive_globs": [],
         },
+        # S3 folder sync (docs/SYNC.md). Only non-secret coordinates live here; the
+        # access key/secret are machine-local (``<config>/s3.json``) and never synced.
+        "sync": {
+            "enabled": False,
+            "bucket": "",
+            "prefix": "",
+            "endpoint": "",
+            "region": "",
+        },
     }
 
 

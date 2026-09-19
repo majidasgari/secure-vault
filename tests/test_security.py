@@ -24,7 +24,8 @@ _CAN_READ = {
 _CAN_REQUEST = {
     "normal": {SOURCE_UI: False, SOURCE_MCP: True, SOURCE_IMPORTER: False},
     "secret": {SOURCE_UI: False, SOURCE_MCP: False, SOURCE_IMPORTER: False},
-    "secretfile": {SOURCE_UI: False, SOURCE_MCP: True, SOURCE_IMPORTER: False},
+    # The web UI (role ``ui``) may hand a secretfile to the desktop native viewer.
+    "secretfile": {SOURCE_UI: True, SOURCE_MCP: True, SOURCE_IMPORTER: False},
 }
 
 _ALL_SOURCES = (SOURCE_UI, SOURCE_MCP, SOURCE_IMPORTER)

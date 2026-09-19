@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -21,6 +22,9 @@ DEFAULT_AUTO_LOCK_SECONDS = 900
 
 DEFAULT_LANGUAGE = "fa"
 """Default UI language."""
+
+SYNC_CONFIG_FILENAME = "s3.json"
+"""Machine-local S3 credentials + client id (never synced into the vault home)."""
 
 
 def runtime_dir() -> Path:
@@ -133,6 +137,57 @@ def user_config() -> UserConfig:
     return UserConfig(path=path, data=data)
 
 
+def sync_config_path() -> Path:
+    """Return the machine-local S3 credentials file (``<config>/s3.json``)."""
+    return user_config_dir() / SYNC_CONFIG_FILENAME
+
+
+def load_sync_config() -> dict[str, Any]:
+    """Load the machine-local S3 credentials, tolerating a missing/corrupt file.
+
+    The file is **never** written into the vault home: it holds the secret access key,
+    which must not be swept up by the cloud client that syncs the vault.
+    """
+    path = sync_config_path()
+    data: dict[str, Any] = {}
+    if path.exists():
+        try:
+            loaded = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                data = loaded
+        except (OSError, ValueError):
+            data = {}
+    return data
+
+
+def save_sync_config(data: dict[str, Any]) -> None:
+    """Atomically persist the machine-local S3 credentials with mode ``0600``."""
+    path = sync_config_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8")
+    atomic_write_bytes(path, payload)
+    try:
+        os.chmod(path, 0o600)
+    except OSError:  # pragma: no cover - best effort on exotic filesystems
+        pass
+
+
+def sync_client_id() -> str:
+    """Return this machine's stable client id, creating it on first use.
+
+    The id names the S3 lock owner, so it must survive restarts but stay machine-local
+    (that is also why it lives in ``s3.json`` next to the credentials, not in the vault).
+    """
+    data = load_sync_config()
+    identifier = data.get("client_id")
+    if isinstance(identifier, str) and identifier.strip():
+        return identifier.strip()
+    identifier = uuid.uuid4().hex
+    data["client_id"] = identifier
+    save_sync_config(data)
+    return identifier
+
+
 @dataclass(frozen=True)
 class AppPaths:
     """Filesystem locations of the repository's static assets."""
@@ -157,11 +212,16 @@ __all__ = [
     "DEFAULT_PLAIN_THRESHOLD",
     "DEFAULT_AUTO_LOCK_SECONDS",
     "DEFAULT_LANGUAGE",
+    "SYNC_CONFIG_FILENAME",
     "runtime_dir",
     "user_config_dir",
     "user_data_dir",
     "UserConfig",
     "user_config",
+    "sync_config_path",
+    "load_sync_config",
+    "save_sync_config",
+    "sync_client_id",
     "AppPaths",
     "app_paths",
 ]

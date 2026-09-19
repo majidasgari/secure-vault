@@ -14,6 +14,7 @@ import json
 import threading
 from collections import deque
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Callable, Iterable
 
 from ..core.chunking import CHUNK_MODES
@@ -26,7 +27,7 @@ from ..errors import (
     VaultError,
     VaultLocked,
 )
-from ..util import normalize_vault_path, now_ms
+from ..util import is_within, normalize_vault_path, now_ms
 
 ROLE_UI = SOURCE_UI
 ROLE_MCP = SOURCE_MCP
@@ -46,6 +47,7 @@ QUIET_METHODS = frozenset(
         "vault.ping",
         "vault.recent",
         "vault.i18n",
+        "vault.sync_status",
     }
 )
 
@@ -602,9 +604,13 @@ class Service:
     # ----------------------------------------------------------- handlers: secrets
     def _h_request_open_secret(self, params: dict, role: str, session_id: str) -> dict:
         logical = normalize_vault_path(self._text(self._require(params, "path"), param="path"))
+        source = ROLE_MCP if role == ROLE_MCP else ROLE_UI
         result = self.session.request_open_secret(
-            logical, source=ROLE_MCP, session=session_id
+            logical, source=source, session=session_id
         )
+        # ``handler`` is False when no desktop app is attached (headless web/daemon), so the
+        # browser can say "open the app" instead of silently doing nothing.
+        result["handler"] = self.session.on_secret_request is not None
         result["note"] = (
             "The user is asked to display it on their desktop; the content is never "
             "returned to the agent."
@@ -677,7 +683,13 @@ class Service:
                 current["chunking"] = mode
             db_path = semantic.get("db_path")
             if db_path is not None:
-                current["db_path"] = self._text(db_path, param="semantic.db_path")
+                text = self._text(db_path, param="semantic.db_path").strip()
+                # Vectors are derived data and must never sit inside the synced vault.
+                if text and is_within(Path(text).expanduser(), self.session.home):
+                    raise BadRequest(
+                        "semantic_path_inside_vault", details={"path": text}
+                    )
+                current["db_path"] = text
             states = semantic.get("folder_states")
             if states is not None:
                 if not isinstance(states, dict):
@@ -716,7 +728,31 @@ class Service:
                 current["allow_lan"] = bool(web["allow_lan"])
             if "open_browser_on_start" in web:
                 current["open_browser_on_start"] = bool(web["open_browser_on_start"])
+        sync = params.get("sync")
+        if isinstance(sync, dict):
+            current = settings.setdefault("sync", {})
+            if "enabled" in sync:
+                current["enabled"] = bool(sync["enabled"])
+            for key in ("bucket", "prefix", "endpoint", "region"):
+                if key in sync:
+                    current[key] = self._text(sync[key], param=f"sync.{key}").strip()
+            # Credentials never go into the synced vault: persist them machine-locally.
+            if "access_key" in sync or "secret_key" in sync:
+                from ..config import load_sync_config, save_sync_config  # noqa: PLC0415
+
+                credentials = load_sync_config()
+                if "access_key" in sync:
+                    credentials["access_key"] = self._text(
+                        sync["access_key"], param="sync.access_key"
+                    ).strip()
+                if "secret_key" in sync:
+                    credentials["secret_key"] = self._text(
+                        sync["secret_key"], param="sync.secret_key"
+                    ).strip()
+                save_sync_config(credentials)
         self.session.meta.save()
+        if isinstance(sync, dict):
+            self.session.apply_sync_settings()
         if isinstance(semantic, dict):
             self.session.refresh_semantic_provider()
             if "db_path" in semantic:
@@ -747,6 +783,33 @@ class Service:
     def _h_semantic_cache_clear(self, params: dict, role: str, session_id: str) -> dict:
         """Delete the local embedding cache (rebuildable; never synced)."""
         return {"removed": self.session.clear_semantic_cache()}
+
+    # --------------------------------------------------------------- handlers: sync
+    def _h_sync_status(self, params: dict, role: str, session_id: str) -> dict:
+        """Return the S3 sync/lock state (no network I/O)."""
+        return {"sync": self.session.sync_manager().status()}
+
+    def _h_sync_now(self, params: dict, role: str, session_id: str) -> dict:
+        """Start the two-way S3 mirror in the background and return immediately.
+
+        The client polls ``vault.sync_status`` for progress; the worker never holds the
+        service lock, so polling and normal reads stay responsive.
+        """
+        self.session._require_unlocked()
+        return self.session.sync_manager().start_sync()
+
+    def _h_sync_test(self, params: dict, role: str, session_id: str) -> dict:
+        """Test the S3 connection/credentials without starting a sync."""
+        return {"connection": self.session.sync_manager().test_connection()}
+
+    def _h_sync_acquire(self, params: dict, role: str, session_id: str) -> dict:
+        """Acquire the write lock; ``force`` takes it from another client."""
+        force = bool(params.get("force", False))
+        return {"sync": self.session.sync_manager().acquire(force=force)}
+
+    def _h_sync_release(self, params: dict, role: str, session_id: str) -> dict:
+        """Release the write lock (if this client holds it)."""
+        return {"sync": self.session.sync_manager().release()}
 
     def _h_stats(self, params: dict, role: str, session_id: str) -> dict:
         status = self.session.status()
@@ -899,7 +962,7 @@ class Service:
         "vault.search_filenames": (_h_search_filenames, _BOTH),
         "vault.search_text": (_h_search_text, _BOTH),
         "vault.search_semantic": (_h_search_semantic, _BOTH),
-        "vault.request_open_secret": (_h_request_open_secret, _MCP_ONLY),
+        "vault.request_open_secret": (_h_request_open_secret, _BOTH),
         "vault.resolve_open_secret": (_h_resolve_open_secret, _UI_ONLY),
         "vault.pending_requests": (_h_pending_requests, _UI_ONLY),
         "vault.read_secret": (_h_read_secret, _UI_ONLY),
@@ -910,6 +973,11 @@ class Service:
         "vault.semantic_status": (_h_semantic_status, _BOTH),
         "vault.semantic_reindex": (_h_semantic_reindex, _BOTH),
         "vault.semantic_cache_clear": (_h_semantic_cache_clear, _UI_ONLY),
+        "vault.sync_status": (_h_sync_status, _BOTH),
+        "vault.sync_test": (_h_sync_test, _UI_ONLY),
+        "vault.sync_now": (_h_sync_now, _UI_ONLY),
+        "vault.sync_acquire": (_h_sync_acquire, _UI_ONLY),
+        "vault.sync_release": (_h_sync_release, _UI_ONLY),
         "vault.stats": (_h_stats, _BOTH),
         "vault.verify_blobs": (_h_verify_blobs, _UI_ONLY),
         "vault.recent": (_h_recent, _BOTH),

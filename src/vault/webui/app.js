@@ -30,6 +30,8 @@
     theme: "dark",
     catalogue: {},
     session: null,
+    sync: null,
+    syncTimer: null,
     index: { tree: [], tags: [], counts: {} },
     cwd: "/",
     languages: ["fa", "en"],
@@ -178,7 +180,9 @@
       if (r.status === 401) { onUnauthorized(); throw new ApiError("UNAUTHORIZED", 401); }
       if (!r.ok || !r.data || r.data.ok === false) {
         var err = (r.data && r.data.error) || { code: "ERROR", message: "", details: {} };
-        throw new ApiError(err.code, r.status, err);
+        // Carry the *inner* details (path, sensitivity, requires_approval, reason, …) so
+        // callers can branch on them; passing the whole envelope left err.details.details.
+        throw new ApiError(err.code, r.status, err.details || {});
       }
       return r.data.result;
     });
@@ -308,6 +312,8 @@
     return request("GET", "/api/session").then(function (r) {
       if (r.status === 401) { onUnauthorized(); throw new ApiError("UNAUTHORIZED", 401); }
       state.session = r.data || {};
+      state.sync = state.session.sync || null;
+      renderSyncState();
       if (state.session && state.session.language && !sessionStorage.getItem(LANG_KEY)) {
         state.lang = state.session.language;
         applyDirection();
@@ -970,7 +976,13 @@
 
   function openFile(entry) {
     if (state.dirty && !window.confirm(t("editor.unsaved_text"))) { return; }
-    if (entry.sensitivity === "secret" || entry.sensitivity === "secretfile") {
+    // A secretfile is never rendered in the browser: ask the desktop app to show it in
+    // its native viewer. A secret file may be opened here after confirmation.
+    if (entry.sensitivity === "secretfile") {
+      requestNative(entry.path);
+      return;
+    }
+    if (entry.sensitivity === "secret") {
       openPlainViewer(entry.path);
       return;
     }
@@ -982,7 +994,11 @@
       showNoteResult(result);
     }).catch(function (err) {
       if (err.code === "PERMISSION_DENIED" && err.details && err.details.requires_approval) {
-        openPlainViewer(err.details.path || entry.path);
+        if (err.details.sensitivity === "secretfile") {
+          requestNative(err.details.path || entry.path);
+        } else {
+          openPlainViewer(err.details.path || entry.path);
+        }
         return;
       }
       showToast(errorText(err), "error");
@@ -1072,6 +1088,18 @@
     });
     $("#level-select").value = state.file.sensitivity;
     $("#level-select").hidden = false;
+  }
+
+  function requestNative(path) {
+    // Hand a secretfile to the desktop app: the native viewer owns the content and the
+    // browser never receives it. The agent-request flow is reused, with this tab as source.
+    call("vault.request_open_secret", { path: path }).then(function (result) {
+      if (result && result.handler === false) {
+        showToast(t("web.secret_needs_app"), "warn");
+      } else {
+        showToast(t("web.secret_sent_to_app"), "ok");
+      }
+    }).catch(function (err) { showToast(errorText(err), "error"); });
   }
 
   function openPlainViewer(path) {
@@ -1637,6 +1665,8 @@
     }
     item(t("menu.open"), function () { navigateNote(entry.path); });
     if (entry.sensitivity === "secretfile") {
+      item(t("menu.open_native"), function () { requestNative(entry.path); });
+    } else if (entry.sensitivity === "secret") {
       item(t("menu.open_native"), function () { openPlainViewer(entry.path); });
     }
     item(t("menu.rename"), function () { renameEntry(entry); });
@@ -1734,6 +1764,119 @@
   }
 
   /* -------------------------------------------------------------- settings */
+  /* ---------------------------------------------------------------- sync */
+  function renderSyncState() {
+    var sync = state.sync || {};
+    var banner = $("#readonly-banner");
+    var text = $("#readonly-text");
+    if (banner && text) {
+      if (sync.configured && sync.readonly) {
+        var host = (sync.held_by && sync.held_by.host) || "?";
+        text.textContent = t("sync.readonly_banner", { host: host });
+        banner.hidden = false;
+      } else {
+        banner.hidden = true;
+      }
+    }
+    var button = $("#btn-sync");
+    if (button) {
+      button.disabled = !sync.configured;
+      button.title = sync.configured ? t("web.sync_now") : t("sync.not_configured");
+    }
+    renderSyncProgress(sync.job);
+    // Resume polling if a sync is already running (e.g. the tab was reloaded).
+    if (sync.job && sync.job.running && !state.syncTimer) {
+      state.syncTimer = window.setInterval(pollSync, 700);
+    }
+  }
+
+  function refreshSync() {
+    return loadSession().then(renderSyncState).catch(function () { /* ignore */ });
+  }
+
+  function renderSyncProgress(job) {
+    var box = $("#sync-progress");
+    var text = $("#sync-progress-text");
+    var bar = $("#sync-progress-bar");
+    if (!box) { return; }
+    if (!job || !job.running) {
+      box.hidden = true;
+      return;
+    }
+    var upload = job.upload || { done: 0, total: 0 };
+    var download = job.download || { done: 0, total: 0 };
+    var del = job.delete || { done: 0, total: 0 };
+    var total = (upload.total || 0) + (download.total || 0) + (del.total || 0);
+    var done = (upload.done || 0) + (download.done || 0) + (del.done || 0);
+    if (text) {
+      var line = t("sync.progress_line", {
+        up_done: upload.done || 0, up_total: upload.total || 0,
+        down_done: download.done || 0, down_total: download.total || 0,
+        del_done: del.done || 0, del_total: del.total || 0
+      });
+      if (job.current) { line += " — " + job.current; }
+      text.textContent = line;
+    }
+    if (bar) { bar.max = Math.max(1, total); bar.value = done; }
+    box.hidden = false;
+  }
+
+  function stopSyncPoll() {
+    if (state.syncTimer) {
+      window.clearInterval(state.syncTimer);
+      state.syncTimer = null;
+    }
+    renderSyncProgress(null);
+  }
+
+  function pollSync() {
+    call("vault.sync_status", {}).then(function (result) {
+      var sync = (result && result.sync) || {};
+      state.sync = sync;
+      renderSyncState();
+      var job = sync.job || {};
+      renderSyncProgress(job);
+      if (!job.finished) { return; }
+      stopSyncPoll();
+      if (!job.ok) {
+        showToast(t("web.sync_failed") + (job.error ? " — " + job.error : ""), "error");
+        return;
+      }
+      var data = job.result || {};
+      showToast(t("sync.done", { up: data.uploaded || 0, down: data.downloaded || 0 }), "ok");
+      if ((data.conflicts || []).length) {
+        showToast(t("sync.conflicts", { count: data.conflicts.length }), "warn");
+      }
+      loadIndex();
+    }).catch(function () { /* keep polling: a transient error is not fatal */ });
+  }
+
+  function doSync() {
+    if (!state.sync || !state.sync.configured) {
+      showToast(t("web.sync_not_configured"), "warn");
+      return;
+    }
+    if (state.sync.readonly) {
+      showToast(t("error.SYNC_READONLY"), "warn");
+      return;
+    }
+    showToast(t("sync.syncing"), "warn");
+    call("vault.sync_now", {}).then(function () {
+      if (!state.syncTimer) {
+        state.syncTimer = window.setInterval(pollSync, 700);
+      }
+      pollSync();
+    }).catch(function (err) { showToast(errorText(err) || t("web.sync_failed"), "error"); });
+  }
+
+  function doTakeControl() {
+    pushBusy();
+    call("vault.sync_acquire", { force: true }).then(function () {
+      showToast(t("web.synced"), "ok");
+      return refreshSync();
+    }).catch(function (err) { showToast(errorText(err), "error"); }).then(popBusy);
+  }
+
   /* --------------------------------------------------------- status / SSE */
   function refreshStatusBar() {
     var locked = state.session ? !!state.session.locked : true;
@@ -1822,6 +1965,9 @@
     state.session = state.session || {};
     state.session.locked = true;
     state.session.counts = null;
+    state.sync = null;
+    stopSyncPoll();
+    renderSyncState();
     state.file = null;
     state.dirty = false;
     state.index = { tree: [], tags: [], counts: {} };
@@ -2042,6 +2188,10 @@
     $("#btn-lock").addEventListener("click", function () {
       request("POST", "/api/session/lock", {}).then(function () { handleLockEvent(); });
     });
+    var syncButton = $("#btn-sync");
+    if (syncButton) { syncButton.addEventListener("click", doSync); }
+    var takeButton = $("#btn-take-control");
+    if (takeButton) { takeButton.addEventListener("click", doTakeControl); }
     $("#btn-theme").addEventListener("click", toggleTheme);
     $("#global-search-form").addEventListener("submit", function (ev) {
       ev.preventDefault();

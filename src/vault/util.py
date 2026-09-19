@@ -101,6 +101,20 @@ def normalize_logical_path(raw: str) -> str:
     return result
 
 
+def is_within(path: Path | str, root: Path | str) -> bool:
+    """Return True when ``path`` resolves to ``root`` or a location inside it.
+
+    Symlinks are resolved, so an in-vault path cannot be hidden behind a link. Used to
+    keep derived caches (the semantic vector DB) out of the synced vault folder.
+    """
+    try:
+        resolved = Path(path).expanduser().resolve()
+        root_resolved = Path(root).expanduser().resolve()
+    except (OSError, RuntimeError):  # pragma: no cover - unresolvable paths
+        return False
+    return resolved == root_resolved or root_resolved in resolved.parents
+
+
 def is_loopback(host: str) -> bool:
     """Return True for ``localhost`` and any loopback IP literal.
 
@@ -202,6 +216,7 @@ __all__ = [
     "atomic_write_bytes",
     "normalize_logical_path",
     "normalize_fa",
+    "is_within",
     "human_size",
     "now_ms",
     "sha256_hex",

@@ -23,6 +23,7 @@ from ..errors import (
     BadRequest,
     DowngradeForbidden,
     PermissionDenied,
+    SyncReadOnly,
     Unauthorized,
     VaultError,
     VaultLocked,
@@ -55,6 +56,9 @@ MUTATING_METHODS = frozenset(
         "vault.set_file_note",
         "vault.set_settings",
         "vault.semantic_index",
+        "vault.sync_now",
+        "vault.sync_acquire",
+        "vault.sync_release",
     }
 )
 
@@ -88,7 +92,7 @@ def _bad_request(message: str, **details: Any) -> Response:
 
 def _outcome_for(exc: VaultError) -> str:
     """Map a vault error to the access-log outcome it represents."""
-    if isinstance(exc, (PermissionDenied, DowngradeForbidden, VaultLocked)):
+    if isinstance(exc, (PermissionDenied, DowngradeForbidden, SyncReadOnly, VaultLocked)):
         return "deny"
     return "error"
 
@@ -278,6 +282,10 @@ class WebAPI:
             "default_sensitivity": settings.get("default_sensitivity", "normal"),
             "semantic": settings.get("semantic", {}),
         }
+        try:
+            sync = session.sync_manager().status()
+        except Exception:  # noqa: BLE001 - sync state must never break the session call
+            sync = {"configured": False, "enabled": False, "readonly": False}
         return json_response(
             200,
             {
@@ -288,6 +296,7 @@ class WebAPI:
                 "counts": counts,
                 "version": __version__,
                 "ui": ui,
+                "sync": sync,
             },
         )
 

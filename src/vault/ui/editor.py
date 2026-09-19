@@ -4,9 +4,15 @@ The preview is a :class:`QWebEngineView` when QtWebEngine imports, otherwise a
 :class:`QTextBrowser`. ``preview_enabled`` is False for ``secret``/``secretfile`` files
 and secret text is never handed to the preview widget.
 
+The preview is refreshed **on demand** (the toolbar Preview button, the View menu or when a
+file is opened) instead of after every keystroke: re-rendering a large note on each edit was
+slow and stole the caret.
+
 SPEC/08 adds bidi-correct editing: every block gets its own text direction/alignment
 (``auto`` follows :mod:`vault.ui.bidi`, ``rtl``/``ltr`` force the whole document) and
-fenced code is rendered monospace. The formatting pass never marks the document dirty.
+fenced code is rendered monospace. Editing only reformats the block under the caret — a full
+document pass on every keystroke re-laid out (and janked) large notes. The formatting pass
+never marks the document dirty.
 """
 
 from __future__ import annotations
@@ -40,7 +46,6 @@ _LOG = logging.getLogger(__name__)
 web_views_created = 0
 """Count of :class:`QWebEngineView` instances created (used by the smoke test)."""
 
-_PREVIEW_DEBOUNCE_MS = 400
 _BIDI_DEBOUNCE_MS = 150
 _MONOSPACE = "ui-monospace, DejaVu Sans Mono, Consolas, monospace"
 _DIRECTIONS = ("auto", "rtl", "ltr")
@@ -181,12 +186,15 @@ class EditorPanel(QWidget):
     note_changed = Signal(str, str)
     #: Emitted with the current path when the user asks for the version history.
     history_requested = Signal(str)
+    #: Emitted when the preview pane is shown/hidden, so the View menu can follow the button.
+    preview_changed = Signal(bool)
 
     def __init__(self, parent: Any = None) -> None:
         """Create an empty editor."""
         super().__init__(parent)
         self.current_path: str | None = None
         self.preview_enabled = True
+        self.preview_allowed = True
         self.preview_kind = "text"
         self.web_port: int | None = None
         self.locked = True
@@ -211,6 +219,8 @@ class EditorPanel(QWidget):
             self.direction_combo.addItem("", mode)
         self.direction_combo.currentIndexChanged.connect(self._on_direction_changed)
         self.direction_label = QLabel(self)
+        self.preview_button = QPushButton(self)
+        self.preview_button.clicked.connect(self._on_preview_clicked)
         self.browser_button = QPushButton(self)
         self.browser_button.clicked.connect(self._on_browser_clicked)
         self.text_editor_button = QPushButton(self)
@@ -220,6 +230,7 @@ class EditorPanel(QWidget):
         toolbar.addWidget(self.direction_label)
         toolbar.addWidget(self.direction_combo)
         toolbar.addStretch(1)
+        toolbar.addWidget(self.preview_button)
         toolbar.addWidget(self.history_button)
         toolbar.addWidget(self.text_editor_button)
         toolbar.addWidget(self.browser_button)
@@ -262,15 +273,10 @@ class EditorPanel(QWidget):
         self.status_label = QLabel(self)
         layout.addWidget(self.status_label)
 
-        self._render_timer = QTimer(self)
-        self._render_timer.setSingleShot(True)
-        self._render_timer.setInterval(_PREVIEW_DEBOUNCE_MS)
-        self._render_timer.timeout.connect(self._render_preview)
-
         self._bidi_timer = QTimer(self)
         self._bidi_timer.setSingleShot(True)
         self._bidi_timer.setInterval(_BIDI_DEBOUNCE_MS)
-        self._bidi_timer.timeout.connect(self._apply_bidi)
+        self._bidi_timer.timeout.connect(self._apply_current_block_bidi)
 
         self.source.textChanged.connect(self._on_text_changed)
         self.source.cursorPositionChanged.connect(self._update_status)
@@ -279,6 +285,7 @@ class EditorPanel(QWidget):
         self._direction_shortcut.activated.connect(self.cycle_direction)
         i18n.bind(self, self.retranslate)
         self.retranslate()
+        self._refresh_actions()
 
     # ------------------------------------------------------------------ preview
     def _create_preview(self) -> QWidget:
@@ -498,6 +505,7 @@ class EditorPanel(QWidget):
         """Load ``text`` for ``path``; the preview is disabled for secret levels."""
         self.current_path = path
         self.preview_enabled = bool(preview_enabled)
+        self.preview_allowed = bool(preview_enabled)
         self._loading = True
         try:
             self.source.setPlainText(text)
@@ -516,6 +524,7 @@ class EditorPanel(QWidget):
             self.preview.setVisible(False)
         self._refresh_actions()
         self._update_status()
+        self.preview_changed.emit(self.preview_enabled)
 
     def set_note(self, text: str) -> None:
         """Show the short note of the currently open file."""
@@ -544,19 +553,34 @@ class EditorPanel(QWidget):
         finally:
             self._loading = False
         self.current_path = None
+        self.preview_allowed = True
         self._dirty = False
         self.set_note("")
         self._clear_preview()
         self._refresh_actions()
 
     def set_preview_enabled(self, enabled: bool) -> None:
-        """Toggle the preview pane (used by the View menu)."""
-        self.preview_enabled = bool(enabled)
+        """Toggle the preview pane (used by the View menu).
+
+        ``preview_allowed`` is False for ``secret``/``secretfile`` files: the View menu must
+        never be able to hand secret text to the preview widget.
+        """
+        self.preview_enabled = bool(enabled) and self.preview_allowed
         self.preview.setVisible(self.preview_enabled)
         if self.preview_enabled:
             self._render_preview()
         else:
             self._clear_preview()
+        self.preview_changed.emit(self.preview_enabled)
+
+    def _on_preview_clicked(self) -> None:
+        """Show and re-render the preview on demand (edits no longer refresh it live)."""
+        if not self.preview_allowed:
+            return
+        if not self.preview_enabled:
+            self.set_preview_enabled(True)
+        else:
+            self._render_preview()
 
     # ------------------------------------------------------------------- bidi
     def direction_mode(self) -> str:
@@ -598,8 +622,37 @@ class EditorPanel(QWidget):
             return "ltr"
         return bidi.block_direction(text, in_fence=in_fence, previous=previous)
 
+    def _format_block(
+        self,
+        cursor: QTextCursor,
+        block: Any,
+        previous: str | None,
+        in_fence: bool,
+    ) -> str:
+        """Set one block's layout direction/alignment and return the chosen direction."""
+        direction = self._block_direction(block.text(), in_fence, previous)
+        fmt = QTextBlockFormat()
+        fmt.setLayoutDirection(
+            Qt.LayoutDirection.RightToLeft
+            if direction == "rtl"
+            else Qt.LayoutDirection.LeftToRight
+        )
+        # AlignAbsolute keeps the alignment from being mirrored by the widget's own layout
+        # direction, which is what left the Persian text on the wrong side.
+        fmt.setAlignment(
+            (
+                Qt.AlignmentFlag.AlignRight
+                if direction == "rtl"
+                else Qt.AlignmentFlag.AlignLeft
+            )
+            | Qt.AlignmentFlag.AlignAbsolute
+        )
+        cursor.setPosition(block.position())
+        cursor.setBlockFormat(fmt)
+        return direction
+
     def _apply_bidi(self) -> None:
-        """Apply per-block direction/alignment (SPEC/08 §A.2).
+        """Apply per-block direction/alignment to the whole document (SPEC/08 §A.2).
 
         Character formats are owned by :class:`~vault.ui.highlight.MarkdownHighlighter`; this
         pass only sets each block's layout direction and alignment, so the two never fight.
@@ -619,39 +672,51 @@ class EditorPanel(QWidget):
             previous: str | None = None
             while block.isValid():
                 number = block.blockNumber()
-                text = block.text()
                 in_fence = flags[number] if number < len(flags) else False
-                direction = self._block_direction(text, in_fence, previous)
-                previous = direction
-                fmt = QTextBlockFormat()
-                fmt.setLayoutDirection(
-                    Qt.LayoutDirection.RightToLeft
-                    if direction == "rtl"
-                    else Qt.LayoutDirection.LeftToRight
-                )
-                # AlignAbsolute keeps the alignment from being mirrored by the widget's own
-                # layout direction, which is what left the Persian text on the wrong side.
-                fmt.setAlignment(
-                    (
-                        Qt.AlignmentFlag.AlignRight
-                        if direction == "rtl"
-                        else Qt.AlignmentFlag.AlignLeft
-                    )
-                    | Qt.AlignmentFlag.AlignAbsolute
-                )
-                cursor.setPosition(block.position())
-                cursor.setBlockFormat(fmt)
+                previous = self._format_block(cursor, block, previous, in_fence)
                 block = block.next()
             cursor.endEditBlock()
         except Exception as exc:  # noqa: BLE001 - formatting must never hide the text
             _LOG.warning("bidi pass failed: %s", exc)
         finally:
             self._formatting = False
-            self._dirty = False
             try:
                 self.source.document().setModified(False)
             except Exception:  # noqa: BLE001 - defensive
                 pass
+
+    def _apply_current_block_bidi(self) -> None:
+        """Apply the direction format to the block under the caret only (SPEC/08 §A.2).
+
+        The full-document pass is reserved for loading a note and mode changes. Re-running it
+        on every keystroke re-laid out the whole note (over a second for a large file) and made
+        the caret jump; an edit only ever changes the block being typed in. ``in_fence`` comes
+        from the highlighter's block state, so no document-wide scan is needed.
+        """
+        if self._formatting:
+            return
+        self._formatting = True
+        try:
+            block = self.source.textCursor().block()
+            if not block.isValid():
+                return
+            previous: str | None = None
+            previous_block = block.previous()
+            if previous_block.isValid():
+                previous = (
+                    "rtl"
+                    if previous_block.blockFormat().layoutDirection()
+                    == Qt.LayoutDirection.RightToLeft
+                    else "ltr"
+                )
+            cursor = QTextCursor(block)
+            cursor.beginEditBlock()
+            self._format_block(cursor, block, previous, self.highlighter.in_fence(block))
+            cursor.endEditBlock()
+        except Exception as exc:  # noqa: BLE001 - formatting must never hide the text
+            _LOG.warning("bidi pass failed: %s", exc)
+        finally:
+            self._formatting = False
 
     def _update_status(self) -> None:
         """Show the current block direction, line/column and code state."""
@@ -659,9 +724,7 @@ class EditorPanel(QWidget):
         block = cursor.block()
         line = block.blockNumber() + 1
         column = cursor.positionInBlock() + 1
-        lines = self.source.toPlainText().split("\n")
-        flags = _fence_flags(lines)
-        in_fence = flags[block.blockNumber()] if block.blockNumber() < len(flags) else False
+        in_fence = self.highlighter.in_fence(block)
         direction = self._block_direction(block.text(), in_fence)
         text = i18n.tr(
             "editor.status",
@@ -700,7 +763,7 @@ class EditorPanel(QWidget):
         self._refresh_actions()
 
     def _refresh_actions(self) -> None:
-        """Re-evaluate the enablement of the two "open elsewhere" buttons.
+        """Re-evaluate the enablement of the toolbar buttons.
 
         Called whenever the lock state *or* the current path changes: refreshing only on lock
         changes left both buttons disabled forever (opening a file never re-enabled them).
@@ -708,17 +771,16 @@ class EditorPanel(QWidget):
         enabled = self.current_path is not None and not self.locked
         for button in (self.browser_button, self.text_editor_button, self.history_button):
             button.setEnabled(enabled)
+        self.preview_button.setEnabled(enabled and self.preview_allowed)
 
     # ------------------------------------------------------------------ signals
     def _on_text_changed(self) -> None:
-        """Track dirty state and schedule preview + bidi refreshes."""
+        """Track dirty state and re-apply the bidi format to the edited block."""
         if self._loading or self._formatting:
             return
         self._dirty = True
         self.content_changed.emit()
         self._bidi_timer.start()
-        if self.preview_enabled:
-            self._render_timer.start()
         self._update_status()
 
     def is_dirty(self) -> bool:
@@ -744,6 +806,8 @@ class EditorPanel(QWidget):
         self.direction_label.setText(i18n.tr("editor.direction"))
         for index, mode in enumerate(_DIRECTIONS):
             self.direction_combo.setItemText(index, i18n.tr(_MODE_KEYS[mode]))
+        self.preview_button.setText(i18n.tr("editor.preview"))
+        self.preview_button.setToolTip(i18n.tr("editor.preview_tooltip"))
         self.browser_button.setText(i18n.tr("editor.edit_in_browser"))
         self.text_editor_button.setText(i18n.tr("editor.open_text_editor"))
         # The highlighter rewrites character formats and Qt reports that as a text

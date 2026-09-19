@@ -62,6 +62,8 @@ AUTO_LOCK_TICK_MS = 1000
 EXTERNAL_POLL_MS = 1500
 #: How often the import dialog refreshes its percentage from the importer's progress state.
 IMPORT_POLL_MS = 400
+#: How often the GUI polls the background S3 sync job for progress.
+SYNC_POLL_MS = 500
 
 #: Importer phase name -> i18n key (used by the progress dialog).
 _PHASE_KEYS = {
@@ -70,6 +72,17 @@ _PHASE_KEYS = {
     "assets": "import.phase_assets",
     "strays": "import.phase_strays",
     "reindex": "import.phase_reindex",
+}
+
+#: Activity kind -> i18n key (a static table so no runtime-built key escapes the catalogue).
+_ACTIVITY_KIND_KEYS = {
+    "read": "web.activity_kind_read",
+    "write": "web.activity_kind_write",
+    "delete": "web.activity_kind_delete",
+    "move": "web.activity_kind_move",
+    "mkdir": "web.activity_kind_mkdir",
+    "list": "web.activity_kind_list",
+    "search": "web.activity_kind_search",
 }
 
 
@@ -253,6 +266,9 @@ class VaultApplication(QObject):
         self._last_browser_open: tuple[str, float] = ("", 0.0)
         self.import_running = False
         self._import_progress: QProgressDialog | None = None
+        # S3 sync runs in the core background thread; the GUI only polls its job state.
+        self._sync_progress: QProgressDialog | None = None
+        self._sync_timer: QTimer | None = None
 
         i18n.set_language(language)
         theme.apply(qapp, language)
@@ -352,9 +368,14 @@ class VaultApplication(QObject):
             on_search=self._show_search,
             on_settings=self.open_settings,
             on_recent=self.open_in_browser,
+            on_sync=self.sync_now,
+            on_take_control=self.take_write_access,
             on_quit=self.quit,
         )
         self.tray.set_locked(not (self.session is None or self.session.is_locked))
+        sync = self.sync_status()
+        if self.tray.available:
+            self.tray.set_sync_readonly(bool(sync.get("readonly")))
         if self.tray.available:
             self.tray.set_activity(self.activity.events())
         if self.daemon_conflict is not None:
@@ -1136,6 +1157,214 @@ class VaultApplication(QObject):
             message += " · " + i18n.tr("semantic.reset_body", reason=reason)
         notifications.notify(i18n.tr("menu.semantic_index"), message, tray=self.tray)
 
+    # ----------------------------------------------------------------------- sync
+    def sync_status(self) -> dict[str, Any]:
+        """Return the S3 sync/lock state (or a safe empty state on failure)."""
+        try:
+            return dict(self.dispatch_ui("vault.sync_status", {}).get("sync") or {})
+        except Exception:  # noqa: BLE001 - status is informational only
+            return {}
+
+    def sync_now(self) -> bool:
+        """Start the two-way S3 mirror in the core background thread and poll progress."""
+        if self.session is None or self.session.is_locked:
+            self._notify_web_problem(i18n.tr("error.VAULT_LOCKED"))
+            return False
+        manager = self.session.sync_manager()
+        if not manager.config.configured:
+            notifications.notify(
+                i18n.tr("notification.sync_title"),
+                i18n.tr("sync.not_configured"),
+                tray=self.tray,
+            )
+            return False
+        if not manager.is_write_allowed():
+            notifications.notify(
+                i18n.tr("notification.sync_title"),
+                i18n.tr("error.SYNC_READONLY"),
+                tray=self.tray,
+            )
+            return False
+        try:
+            result = self.dispatch_ui("vault.sync_now", {})
+        except Exception as exc:  # noqa: BLE001 - show a friendly error
+            notifications.notify(
+                i18n.tr("notification.sync_title"),
+                error_message(exc),
+                tray=self.tray,
+            )
+            return False
+        if not result.get("started") and not self.self_test:
+            notifications.notify(
+                i18n.tr("notification.sync_title"),
+                i18n.tr("sync.syncing"),
+                tray=self.tray,
+            )
+        self._start_sync_poll()
+        return True
+
+    def _start_sync_poll(self) -> None:
+        """Show a determinate progress dialog and poll the core job state."""
+        if self.self_test:
+            return
+        if self._sync_progress is None:
+            dialog = QProgressDialog(self.window)
+            dialog.setWindowTitle(i18n.tr("notification.sync_title"))
+            dialog.setLabelText(i18n.tr("sync.syncing"))
+            dialog.setRange(0, 0)
+            dialog.setCancelButton(None)
+            dialog.setMinimumDuration(0)
+            dialog.setWindowModality(Qt.WindowModality.WindowModal)
+            dialog.show()
+            self._sync_progress = dialog
+        if self._sync_timer is None:
+            timer = QTimer(self)
+            timer.setInterval(SYNC_POLL_MS)
+            timer.timeout.connect(self._poll_sync)
+            timer.start()
+            self._sync_timer = timer
+
+    def _poll_sync(self) -> None:
+        """Update the progress dialog from ``vault.sync_status`` (never blocks on sync)."""
+        sync = self.sync_status()
+        job = dict(sync.get("job") or {})
+        dialog = self._sync_progress
+        if dialog is not None and not job.get("finished"):
+            upload = job.get("upload") or {}
+            download = job.get("download") or {}
+            delete = job.get("delete") or {}
+            total = int(upload.get("total", 0)) + int(download.get("total", 0)) + int(
+                delete.get("total", 0)
+            )
+            done = int(upload.get("done", 0)) + int(download.get("done", 0)) + int(
+                delete.get("done", 0)
+            )
+            if total > 0:
+                dialog.setRange(0, total)
+                dialog.setValue(done)
+            else:
+                dialog.setRange(0, 0)
+            dialog.setLabelText(self._sync_progress_text(job))
+        if not job.get("finished"):
+            return
+        self._stop_sync_poll()
+        self._on_sync_finished(job)
+
+    @staticmethod
+    def _sync_progress_text(job: dict[str, Any]) -> str:
+        """Render the current phase/counters for the progress dialog."""
+        upload = job.get("upload") or {}
+        download = job.get("download") or {}
+        delete = job.get("delete") or {}
+        text = i18n.tr(
+            "sync.progress_line",
+            up_done=int(upload.get("done", 0)),
+            up_total=int(upload.get("total", 0)),
+            down_done=int(download.get("done", 0)),
+            down_total=int(download.get("total", 0)),
+            del_done=int(delete.get("done", 0)),
+            del_total=int(delete.get("total", 0)),
+        )
+        current = job.get("current")
+        if current:
+            text += "\n" + str(current)
+        return text
+
+    def _stop_sync_poll(self) -> None:
+        """Stop and clear the progress dialog/timer."""
+        timer, self._sync_timer = self._sync_timer, None
+        if timer is not None:
+            timer.stop()
+            timer.deleteLater()
+        dialog, self._sync_progress = self._sync_progress, None
+        if dialog is not None:
+            dialog.close()
+            dialog.deleteLater()
+
+    def _on_sync_finished(self, job: dict[str, Any]) -> None:
+        """Refresh the UI and tell the user what the mirror did."""
+        self.hub.notify()
+        if not job.get("ok"):
+            notifications.notify(
+                i18n.tr("notification.sync_title"),
+                i18n.tr(
+                    "notification.sync_failed",
+                    reason=str(job.get("error") or ""),
+                ),
+                tray=self.tray,
+            )
+            return
+        data = dict(job.get("result") or {})
+        message = i18n.tr(
+            "notification.sync_done",
+            up=int(data.get("uploaded", 0)),
+            down=int(data.get("downloaded", 0)),
+        )
+        conflicts = list(data.get("conflicts") or [])
+        if conflicts:
+            message += " · " + i18n.tr("sync.conflicts", count=len(conflicts))
+        notifications.notify(i18n.tr("notification.sync_title"), message, tray=self.tray)
+
+    def test_sync_connection(self) -> dict[str, Any]:
+        """Test the S3 connection and show the result (Settings button)."""
+        try:
+            result = self.dispatch_ui("vault.sync_test", {}).get("connection") or {}
+        except Exception as exc:  # noqa: BLE001 - show a friendly error
+            result = {"ok": False, "error": error_message(exc)}
+        if self.window is not None:
+            if result.get("ok"):
+                QMessageBox.information(
+                    self.window,
+                    i18n.tr("settings.sync_test"),
+                    i18n.tr(
+                        "sync.test_ok", objects=int(result.get("objects", 0))
+                    ),
+                )
+            else:
+                QMessageBox.warning(
+                    self.window,
+                    i18n.tr("settings.sync_test"),
+                    i18n.tr(
+                        "sync.test_failed",
+                        reason=str(result.get("error") or ""),
+                    ),
+                )
+        return result
+
+    def take_write_access(self) -> bool:
+        """Force-acquire the S3 write lock so this client may edit."""
+        try:
+            result = self.dispatch_ui("vault.sync_acquire", {"force": True})
+        except Exception as exc:  # noqa: BLE001 - show a friendly error
+            if self.window is not None:
+                QMessageBox.warning(
+                    self.window, i18n.tr("notification.sync_title"), error_message(exc)
+                )
+            return False
+        self.hub.notify()
+        sync = result.get("sync") or {}
+        if self.tray is not None and self.tray.available:
+            self.tray.set_sync_readonly(bool(sync.get("readonly")))
+        if sync.get("readonly"):
+            notifications.notify(
+                i18n.tr("notification.sync_title"),
+                i18n.tr("error.SYNC_READONLY"),
+                tray=self.tray,
+            )
+            return False
+        return True
+
+    def release_write_access(self) -> bool:
+        """Release the S3 write lock so another device may edit."""
+        try:
+            self.dispatch_ui("vault.sync_release", {})
+        except Exception:  # noqa: BLE001 - best effort
+            return False
+        self.hub.notify()
+        if self.tray is not None and self.tray.available:
+            self.tray.set_sync_readonly(bool(self.sync_status().get("readonly")))
+        return True
+
     def open_settings(self) -> None:
         """Open the settings dialog."""
         if self.window is None:
@@ -1519,9 +1748,8 @@ class VaultApplication(QObject):
         if now - self._agent_notified.get(key, 0) < self.AGENT_NOTIFY_INTERVAL_MS:
             return
         self._agent_notified[key] = now
-        action = i18n.tr("web.activity_kind_" + kind)
-        if action.startswith("web.activity_kind_"):
-            action = kind
+        action_key = _ACTIVITY_KIND_KEYS.get(kind)
+        action = i18n.tr(action_key) if action_key else kind
         body = i18n.tr("notification.agent_body", action=action, path=path)
         if query:
             body = i18n.tr(

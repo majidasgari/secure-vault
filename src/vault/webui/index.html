@@ -48,6 +48,7 @@
       </form>
       <span class="spacer"></span>
       <div class="header-actions">
+        <button id="btn-sync" type="button" data-i18n="web.sync" data-i18n-title="web.sync_now"></button>
         <button id="btn-theme" type="button" class="icon-btn" data-i18n-title="web.theme">◐</button>
         <select id="lang-select" class="lang-select header-select" data-i18n-title="web.language"
                 hidden></select>
@@ -55,6 +56,14 @@
       </div>
     </header>
 
+    <p id="readonly-banner" class="stale-banner readonly-banner" hidden>
+      <span id="readonly-text"></span>
+      <button id="btn-take-control" type="button" data-i18n="sync.take_control"></button>
+    </p>
+    <div id="sync-progress" class="sync-progress" hidden>
+      <span id="sync-progress-text"></span>
+      <progress id="sync-progress-bar" value="0" max="1"></progress>
+    </div>
     <p id="stale-banner" class="stale-banner" hidden></p>
     <div id="mobile-backdrop" class="mobile-backdrop" hidden></div>
     <main class="layout">

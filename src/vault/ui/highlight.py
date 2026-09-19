@@ -148,6 +148,14 @@ class MarkdownHighlighter(QSyntaxHighlighter):
         self._build_formats()
         self.rehighlight()
 
+    def in_fence(self, block: Any) -> bool:
+        """Return True when ``block`` is inside a fenced code region.
+
+        The block state is written by :meth:`highlightBlock`; the editor reads it to format
+        the block under the caret without rescanning the whole document on every keystroke.
+        """
+        return block.userState() == self._fence_state
+
     # ------------------------------------------------------------------- pass
     def highlightBlock(self, text: str) -> None:  # noqa: N802 - Qt naming
         """Colour one block; fenced code keeps its formatting across lines."""

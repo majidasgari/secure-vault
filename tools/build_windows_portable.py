@@ -57,6 +57,9 @@ IMPORT_TO_DIST = {
 # Lazy/opt-in imports that are intentionally not in requirements.txt.
 OPTIONAL_IMPORTS = {
     "sentence_transformers": "sentence-transformers (requirements-semantic.txt)",
+    "sqlite_vec": "sqlite-vec (requirements-semantic.txt)",
+    "boto3": "boto3 (requirements-s3.txt)",
+    "botocore": "boto3 (requirements-s3.txt)",
 }
 
 FIRST_PARTY = {"vault"}
@@ -64,6 +67,7 @@ FIRST_PARTY = {"vault"}
 REQUIRED_LAYOUT = (
     "requirements.txt",
     "requirements-semantic.txt",
+    "requirements-s3.txt",
     "pyproject.toml",
     "README.md",
     "LICENSE",

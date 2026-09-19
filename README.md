@@ -38,6 +38,11 @@ set: Python, PySide6, `cryptography`, `argon2-cffi`, `markdown-it-py` and Pygmen
   Fonts, RTL, tray, notifications and the KDE menu icon must be checked by hand.
 * The Windows portable build is **produced but not verified on Windows** (see
   `docs/WINDOWS.md`).
+* S3 folder sync is opt-in and needs no extra package (boto3 is an optional alternative
+  backend in `requirements-s3.txt`): a two-way mirror with a cooperative
+  lock file, read-only mode plus a manual *Take write access* button, and a **Sync now**
+  button on both the desktop app and the web UI. Only non-secret coordinates live in the
+  vault; access keys are machine-local. Vectors and the embedding cache are never synced.
 * Semantic search is opt-in and needs the extra in `requirements-semantic.txt`
   (`sentence-transformers` + the embedded `sqlite-vec` vector index); neither is installed
   by `bootstrap.sh`. Vectors live in a **separate, rebuildable cache** under the user's
@@ -193,11 +198,22 @@ explicit non-goal: passwords belong in `secretfile` files. See
 
 ## Syncing
 
-Sync the encrypted `files/`, `secure.store` and the plaintext `meta.sqlite` with
-Dropbox/OneDrive/Google Drive. Never sync the runtime directory
-(`$XDG_RUNTIME_DIR/secure-vault`, which holds `store.*.dec`, the socket and the token),
-and **never sync `semantic.db`** — it is a rebuildable local vector cache, recomputed on
-each machine. Do not run two daemons against the same synced folder on two machines.
+The whole vault folder can be mirrored to any S3-compatible bucket with a built-in
+two-way sync (**Settings → S3 sync**; no extra package needed — requests are signed
+in-process with AWS SigV4, and `requirements-s3.txt` offers boto3 as an optional
+alternative backend). A lock object in the bucket makes the design single-writer:
+if another device holds the lock, this session opens **read-only** and every write is
+refused until you press **Take write access**; the lock is released on lock/quit.
+**Sync now** lives on the app Tools menu, the tray and the web header; it runs in a
+background thread and both UIs show live progress (uploaded/downloaded counts), so the
+app never freezes. **Settings → S3 sync → Test connection** verifies the endpoint,
+bucket and credentials without transferring anything. The web UI shows a read-only
+banner with the take-control button. Semantic vectors and the
+embedding cache live outside the vault and are **never synced**; Settings refuses a
+vector-cache path inside the vault. You can also sync the folder with
+Dropbox/OneDrive/Google Drive as before — never sync the runtime directory
+(`$XDG_RUNTIME_DIR/secure-vault`, which holds `store.*.dec`, the socket and the token)
+or `semantic.db`, and do not run two daemons against the same synced folder at once.
 See `docs/SYNC.md`.
 
 ## Security notes

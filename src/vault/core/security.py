@@ -66,10 +66,17 @@ class Policy:
 
     @staticmethod
     def can_request_open_secret(level: str, source: str) -> bool:
-        """MCP may request display of ``normal`` and ``secretfile`` (never ``secret``)."""
+        """Whether ``source`` may ask the desktop UI to display a file.
+
+        MCP may request ``normal`` and ``secretfile`` (never ``secret``). The UI role may
+        request ``secretfile`` so the browser can hand a ``secretfile`` off to the native
+        viewer instead of ever putting its content in an HTML page.
+        """
         _require_level(level)
         if source == SOURCE_MCP:
             return level != "secret"
+        if source == SOURCE_UI:
+            return level == "secretfile"
         return False
 
     @staticmethod

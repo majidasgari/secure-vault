@@ -99,6 +99,19 @@ class Index:
         """The underlying sqlite connection (used by tests and later phases)."""
         return self._conn
 
+    def checkpoint(self) -> None:
+        """Fold the WAL back into ``meta.sqlite`` so the single file is self-contained.
+
+        Called before an S3 sync: syncing the ``-wal``/``-shm`` side files inconsistently
+        is what corrupts a naive cloud copy, so we make the main DB complete and upload
+        only it.
+        """
+        try:
+            self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            self._conn.commit()
+        except sqlite3.Error:  # pragma: no cover - housekeeping is best effort
+            pass
+
     def close(self) -> None:
         """Close the underlying database connection."""
         try:

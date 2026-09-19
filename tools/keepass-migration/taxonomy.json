@@ -1,0 +1,679 @@
+{
+  "default_category": "سایر",
+  "ignore_groups": [
+    "Recycle Bin",
+    "RecycleBin"
+  ],
+  "flat_categories": [
+    "مرورگر — ورودهای ذخیره‌شده",
+    "بایگانی LastPass"
+  ],
+  "_comment": "group_categories: his own KeePass group -> category (longest prefix wins); category_rules: host/keyword fallback; overrides keyed by KeePass UUID",
+  "categories": [
+    "بانک و پرداخت",
+    "ارز دیجیتال و صرافی",
+    "ایمیل",
+    "شبکه‌های اجتماعی و پیام‌رسان",
+    "اپل، سامسونگ و دستگاه‌ها",
+    "کار — نجم",
+    "کار — شرکت‌ها و مشتری‌ها",
+    "سرور و زیرساخت",
+    "اینترنت، شبکه و VPN",
+    "ابزار و خدمات آنلاین",
+    "آموزش",
+    "خرید",
+    "بازی و سرگرمی",
+    "مرورگر — ورودهای ذخیره‌شده",
+    "بایگانی LastPass",
+    "سایر"
+  ],
+  "group_categories": {
+    "Root/Banks": "بانک و پرداخت",
+    "Root/Crypto": "ارز دیجیتال و صرافی",
+    "Root/Emails": "ایمیل",
+    "Root/Social Networks": "شبکه‌های اجتماعی و پیام‌رسان",
+    "Root/Phone Sellers": "اپل، سامسونگ و دستگاه‌ها",
+    "Root/Najm": "کار — نجم",
+    "Root/Arusha": "کار — شرکت‌ها و مشتری‌ها",
+    "Root/Johd": "کار — شرکت‌ها و مشتری‌ها",
+    "Root/Business": "کار — شرکت‌ها و مشتری‌ها",
+    "Root/Blog": "کار — شرکت‌ها و مشتری‌ها",
+    "Root/Servers/Kazemi": "کار — شرکت‌ها و مشتری‌ها",
+    "Root/Servers/Arusha": "کار — شرکت‌ها و مشتری‌ها",
+    "Root/Servers/Johd": "کار — شرکت‌ها و مشتری‌ها",
+    "Root/Servers/NSAtech": "کار — شرکت‌ها و مشتری‌ها",
+    "Root/Servers/ArtStory :-|": "کار — شرکت‌ها و مشتری‌ها",
+    "Root/Servers": "سرور و زیرساخت",
+    "Root/Home Server": "سرور و زیرساخت",
+    "Root/Development": "سرور و زیرساخت",
+    "Root/Development/Versioning": "ابزار و خدمات آنلاین",
+    "Root/Services": "ابزار و خدمات آنلاین",
+    "Root/Productivity": "ابزار و خدمات آنلاین",
+    "Root/Education": "آموزش",
+    "Root/Shopping": "خرید",
+    "Root/Games": "بازی و سرگرمی",
+    "Root/Entertainment": "بازی و سرگرمی",
+    "Root/VPN": "اینترنت، شبکه و VPN",
+    "Root/KeePassXC-Browser Passwords": "مرورگر — ورودهای ذخیره‌شده",
+    "Root/LastPass": "بایگانی LastPass"
+  },
+  "category_rules": [
+    {
+      "category": "کار — نجم",
+      "host": true,
+      "match": [
+        "najm.ac",
+        "thiqat.org"
+      ]
+    },
+    {
+      "category": "کار — شرکت‌ها و مشتری‌ها",
+      "host": true,
+      "match": [
+        "arusha.dev",
+        "arusha.ir",
+        "johd.ir",
+        "snappteach.ir",
+        "billionsapp.solutions",
+        "vkado.net"
+      ]
+    },
+    {
+      "category": "ایمیل",
+      "host": true,
+      "match": [
+        "mail.google.com",
+        "accounts.google.com",
+        "gmail.com",
+        "proton.me",
+        "passport.yandex.com",
+        "login.live.com",
+        "account.microsoft.com",
+        "asgari.info",
+        "asgari.me",
+        "zoho.com",
+        "mail.yahoo.com"
+      ]
+    },
+    {
+      "category": "شبکه‌های اجتماعی و پیام‌رسان",
+      "host": true,
+      "match": [
+        "facebook.com",
+        "instagram.com",
+        "x.com",
+        "twitter.com",
+        "linkedin.com",
+        "telegram.org",
+        "t.me",
+        "whatsapp.com",
+        "reddit.com",
+        "pinterest.com",
+        "foursquare.com",
+        "livejournal.com",
+        "tumblr.com",
+        "discord.com",
+        "youtube.com"
+      ]
+    },
+    {
+      "category": "ارز دیجیتال و صرافی",
+      "host": true,
+      "match": [
+        "nobitex.ir",
+        "abantether.com",
+        "bitpin.ir",
+        "changelly.com",
+        "cryptomus.com",
+        "nicehash.co",
+        "perfectmoney.com",
+        "binance.com",
+        "metamask.io",
+        "tronlink.org",
+        "exodus.com",
+        "bitpay.com",
+        "coinsbee.com",
+        "irfarabi.com",
+        "windsorbrokers.finance",
+        "alpari",
+        "usdtolp.com"
+      ]
+    },
+    {
+      "category": "بانک و پرداخت",
+      "host": true,
+      "match": [
+        "sb24.ir",
+        "bpi.ir",
+        "bankmellat.ir",
+        "rqb.ir",
+        "banksepah.ir",
+        "bmi.ir",
+        "paypal.com",
+        "shaparak",
+        "zarinpal",
+        "idpay",
+        "sadad.ir"
+      ]
+    },
+    {
+      "category": "اپل، سامسونگ و دستگاه‌ها",
+      "host": true,
+      "match": [
+        "apple.com",
+        "icloud.com",
+        "samsung.com",
+        "sony.com",
+        "sonyentertainmentnetwork.com",
+        "playstation.net"
+      ]
+    },
+    {
+      "category": "سرور و زیرساخت",
+      "host": true,
+      "match": [
+        "hetzner.com",
+        "digitalocean.com",
+        "aradcloud.com",
+        "my.parspack.com",
+        "my.parsvds.com",
+        "my.abrha.net",
+        "gcore.com",
+        "cloudflare.com",
+        "pasdan",
+        "hikvision"
+      ]
+    },
+    {
+      "category": "اینترنت، شبکه و VPN",
+      "host": true,
+      "match": [
+        "shecan.ir",
+        "freedns.afraid.org",
+        "domains4bitcoins.com",
+        "asiatech.ir",
+        "shatel.ir",
+        "mci.ir",
+        "irancell.ir"
+      ]
+    },
+    {
+      "category": "ابزار و خدمات آنلاین",
+      "host": true,
+      "match": [
+        "atlassian.com",
+        "github.com",
+        "gitlab.com",
+        "notion.so",
+        "wordpress.com",
+        "dropbox.com",
+        "evernote.com",
+        "mendeley.com",
+        "clockify",
+        "toggl.com",
+        "rescuetime.com",
+        "mega.nz",
+        "bitwarden.com",
+        "lastpass.com",
+        "joplinapp.org",
+        "anytype.io",
+        "skype.com",
+        "kaspersky.com",
+        "eset.com",
+        "editorialmanager.com",
+        "onenote.com",
+        "hipchat.com"
+      ]
+    },
+    {
+      "category": "آموزش",
+      "host": true,
+      "match": [
+        "coursera.org",
+        "udemy.com",
+        "researchgate.net",
+        "stanford.edu",
+        "goodreads.com",
+        "slideshare.net",
+        "fidibo.com",
+        "grammarly.com",
+        "sina.bmn.ir"
+      ]
+    },
+    {
+      "category": "خرید",
+      "host": true,
+      "match": [
+        "digikala.com",
+        "emofid.com",
+        "ikco.ir",
+        "iranecar.com",
+        "eneba.com",
+        "license-market.ir",
+        "divar.ir",
+        "tapsi.ir",
+        "snapp.ir",
+        "snapp.taxi",
+        "jobinja.ir",
+        "1544.ir",
+        "numberland.ir",
+        "netafraz.com",
+        "satraa.com",
+        "xaas.ir"
+      ]
+    },
+    {
+      "category": "بازی و سرگرمی",
+      "host": true,
+      "match": [
+        "steampowered.com",
+        "twitch.tv",
+        "netflix.com",
+        "spotify.com",
+        "last.fm",
+        "secondlife.com",
+        "replika.com",
+        "quizofkings.palang.co",
+        "ea.com",
+        "epicgames.com",
+        "battle.net",
+        "gog.com",
+        "riotgames.com"
+      ]
+    },
+    {
+      "category": "سرور و زیرساخت",
+      "host": true,
+      "match": [
+        "arvancloud.ir",
+        "arvancloud.com",
+        "iranserver.com",
+        "hostiran.net",
+        "talahost.com",
+        "sarvdata.com",
+        "cherryservers.com",
+        "kavenegar.com",
+        "irandns.com",
+        "my.0-1.ir",
+        "parsijoo.ir",
+        "inoor.ir",
+        "kplab.ir",
+        "cnit.io"
+      ]
+    },
+    {
+      "category": "اینترنت، شبکه و VPN",
+      "host": true,
+      "match": [
+        "windscribe.com",
+        "protonvpn.com",
+        "adsl.tci.ir",
+        "shatelmobile.ir"
+      ]
+    },
+    {
+      "category": "ارز دیجیتال و صرافی",
+      "host": true,
+      "match": [
+        "etoro.com",
+        "tradingview.com",
+        "coingate.com",
+        "bitlaunch.io",
+        "bitbarg.com",
+        "topchange.net"
+      ]
+    },
+    {
+      "category": "بانک و پرداخت",
+      "host": true,
+      "match": [
+        "iranicard.ir",
+        "sadad.ir",
+        "epayment.bmi.ir",
+        "baam.bmi.ir",
+        "bmi.ir"
+      ]
+    },
+    {
+      "category": "آموزش",
+      "host": true,
+      "match": [
+        "ldc.upenn.edu",
+        "sharif.edu",
+        "iust.ac.ir",
+        "irandoc.ac.ir",
+        "elra.info",
+        "hindawi.com",
+        "daneshbonyan.ir",
+        "elmsource.com",
+        "jaspersoft.com",
+        "mslc.gov.ir",
+        "researchgate.net",
+        "goodreads.com"
+      ]
+    },
+    {
+      "category": "ابزار و خدمات آنلاین",
+      "host": true,
+      "match": [
+        "taskulu.ir",
+        "trello.com",
+        "figma.com",
+        "zeplin.io",
+        "hubspot.com",
+        "imglarger.com",
+        "deep-image.ai",
+        "karboom.io",
+        "theneo.io",
+        "wikidata.org",
+        "bitdefender.com",
+        "bertina.us",
+        "sammobile.com",
+        "eset.com",
+        "vivaldi.net",
+        "zeplin",
+        "jobinja.ir"
+      ]
+    },
+    {
+      "category": "بازی و سرگرمی",
+      "host": true,
+      "match": [
+        "euronews.com",
+        "footballi.net",
+        "tarafdari.com",
+        "thefa.com",
+        "beeptunes.com",
+        "aniplus.fun"
+      ]
+    },
+    {
+      "category": "کار — شرکت‌ها و مشتری‌ها",
+      "host": true,
+      "match": [
+        "snapteach.ir",
+        "snapteach3.ir",
+        "snapppteach.ir",
+        "thiqat.org",
+        "arazcloud.com",
+        "time4vps.com"
+      ]
+    },
+    {
+      "category": "ایمیل",
+      "host": true,
+      "match": [
+        "account.live.com",
+        "proton.me",
+        "yandex.com",
+        "mail.asgari.me",
+        "mail.asgari.info",
+        "asgari.me"
+      ]
+    },
+    {
+      "category": "سرور و زیرساخت",
+      "match": [
+        "سرور",
+        "server",
+        "ssh",
+        "root@",
+        "vps",
+        "nas",
+        "bitlocker",
+        "dmlab",
+        "a100",
+        "gmiddleware",
+        "esxi",
+        "zabbix",
+        "wiki",
+        "cloud",
+        "proxy",
+        "vault",
+        "keepass",
+        "کیونپ",
+        "ollama",
+        "اولاما"
+      ]
+    },
+    {
+      "category": "اینترنت، شبکه و VPN",
+      "match": [
+        "wifi",
+        "wi-fi",
+        "وایرلس",
+        "مودم",
+        "modem",
+        "router",
+        "روتر",
+        "vpn",
+        "wireguard",
+        "openvpn",
+        "wlan",
+        "شکن",
+        "shecan"
+      ]
+    },
+    {
+      "category": "اپل، سامسونگ و دستگاه‌ها",
+      "match": [
+        "apple",
+        "آیفون",
+        "icloud",
+        "samsung",
+        "tablet",
+        "تبلت",
+        "لپ‌تاپ",
+        "laptop",
+        "session app",
+        "vivaldi",
+        "firefox",
+        "browser",
+        "barana",
+        "برانا"
+      ]
+    },
+    {
+      "category": "کار — نجم",
+      "match": [
+        "najm",
+        "نجم",
+        "trbn",
+        "torabian",
+        "ترابیان",
+        "langufuse",
+        "langfuse"
+      ]
+    },
+    {
+      "category": "کار — شرکت‌ها و مشتری‌ها",
+      "match": [
+        "arusha",
+        "آروشا",
+        "thiqat",
+        "ثقت",
+        "johd",
+        "جهد",
+        "nstech",
+        "nsatech",
+        "kazemi",
+        "کاظمی",
+        "performai",
+        "meysam"
+      ]
+    },
+    {
+      "category": "شبکه‌های اجتماعی و پیام‌رسان",
+      "match": [
+        "facebook",
+        "فیس‌بوک",
+        "instagram",
+        "اینستاگرام",
+        "twitter",
+        "توییتر",
+        "linkedin",
+        "لینکدین",
+        "telegram",
+        "تلگرام",
+        "whatsapp",
+        "واتساپ",
+        "reddit",
+        "pinterest"
+      ]
+    },
+    {
+      "category": "بانک و پرداخت",
+      "match": [
+        "بانک",
+        "کارت",
+        "حساب",
+        "شتاب",
+        "درگاه",
+        "metatrader",
+        "meta trader",
+        "وی‌پاد",
+        "wepod"
+      ]
+    }
+  ],
+  "site_from_host": {
+    "blubank.sb24.ir": "بلوبانک",
+    "ib.sb24.ir": "بانک سامان",
+    "sb24.ir": "بانک سامان",
+    "bankmellat.ir": "بانک ملت",
+    "ebanking.bankmellat.ir": "بانک ملت",
+    "ib.bpi.ir": "بانک پاسارگاد",
+    "oauth.bpi.ir": "بانک پاسارگاد",
+    "bpi.ir": "بانک پاسارگاد",
+    "ibank.rqb.ir": "بانک رسالت",
+    "rqb.ir": "بانک رسالت",
+    "vbank.banksepah.ir": "بانک سپه",
+    "banksepah.ir": "بانک سپه",
+    "accounts.google.com": "گوگل",
+    "mail.google.com": "جیمیل",
+    "gmail.com": "جیمیل",
+    "id.apple.com": "اپل",
+    "appleid.apple.com": "اپل",
+    "idmsa.apple.com": "اپل",
+    "icloud.com": "اپل",
+    "instagram.com": "اینستاگرام",
+    "facebook.com": "فیسبوک",
+    "www.facebook.com": "فیسبوک",
+    "x.com": "توییتر (X)",
+    "twitter.com": "توییتر (X)",
+    "api.twitter.com": "توییتر (X)",
+    "store.steampowered.com": "استیم",
+    "steampowered.com": "استیم",
+    "mail.najm.ac": "ایمیل نجم",
+    "id.najm.ac": "Najm ID",
+    "sso.najm.ac": "Najm ID",
+    "storage.najm.ac": "استوریج نجم",
+    "nic.ir": "IRNIC",
+    "my.parspack.com": "پارس‌پک",
+    "my.parsvds.com": "پارس‌وی‌دی‌اس",
+    "my.abrha.net": "ابرها",
+    "dash.cloudflare.com": "کلودفلر",
+    "cloudflare.com": "کلودفلر",
+    "github.com": "گیت‌هاب",
+    "gitlab.com": "گیت‌لب",
+    "accounts.hetzner.com": "هتزنر",
+    "hetzner.com": "هتزنر",
+    "digitalocean.com": "دیجیتال‌اوشن",
+    "profile.oracle.com": "اوراکل",
+    "id.atlassian.com": "اتلاسیان",
+    "nobitex.ir": "نوبیتکس",
+    "abantether.com": "آبان‌تتر",
+    "bitpin.ir": "بیت‌پین",
+    "paypal.com": "پی‌پال",
+    "app.changelly.com": "چنجلی",
+    "nicehash.com": "نایس‌هش",
+    "my.shecan.ir": "شکن",
+    "sso.billionsapp.solutions": "بیلیونز‌اپ",
+    "my.replika.com": "رپلیکا",
+    "reader.fidibo.com": "فیدیبو",
+    "fidibo.com": "فیدیبو",
+    "quizofkings.palang.co": "کوییز آف کینگز",
+    "account.samsung.com": "سامسونگ",
+    "panel.aradcloud.com": "ابر آراد",
+    "app.cryptomus.com": "کریپتوموس"
+  },
+  "site_aliases": {
+    "najm": "نجم",
+    "arusha": "آروشا",
+    "johd": "جهد",
+    "kazemi": "کاظمی",
+    "thiqat": "ثقت",
+    "plusplanet": "پلاس‌پلنت",
+    "plus planet": "پلاس‌پلنت",
+    "snappteach": "اسنپتیچ",
+    "billionsapp": "بیلیونز‌اپ",
+    "vkado": "وی‌کادو",
+    "parspack": "پارس‌پک",
+    "parsvds": "پارس‌وی‌دی‌اس",
+    "aradcloud": "ابر آراد",
+    "hetzner": "هتزنر",
+    "digitalocean": "دیجیتال‌اوشن",
+    "cloudflare": "کلودفلر",
+    "github": "گیت‌هاب",
+    "metamask": "متامسک",
+    "nobitex": "نوبیتکس",
+    "bitlocker": "بیت‌لاکر",
+    "nas": "NAS",
+    "esxi": "ESXi"
+  },
+  "overrides": {
+    "A2vg46ZMRVu3ZPV64mzN6w==": {
+      "category": "سرور و زیرساخت",
+      "site": "سرور sarvar",
+      "filename": "sarvar"
+    },
+    "VR10Z82LRWmWh2xhCH4vxw==": {
+      "category": "ارز دیجیتال و صرافی",
+      "site": "Nexo",
+      "filename": "nexo"
+    },
+    "Wsg+jIj8QwWebofX2Yiz3g==": {
+      "category": "ایمیل",
+      "site": "مایکروسافت",
+      "filename": "Live"
+    },
+    "XEVlZfP8SFWZtrJzLbl5GA==": {
+      "category": "ارز دیجیتال و صرافی",
+      "site": "بیت‌برگ",
+      "filename": "Bitbarg"
+    },
+    "CmclX4MXSdyjg8yUE3gw1w==": {
+      "category": "ابزار و خدمات آنلاین",
+      "site": "بیت‌واردن",
+      "filename": "Bitwarden"
+    },
+    "81PUJ8WSTCWOx7sMOAKTag==": {
+      "category": "اینترنت، شبکه و VPN",
+      "site": "دوربین درب",
+      "filename": "Doorbin Camera دوربین زشپثقش"
+    },
+    "ufg1DGAZTZmoOnt+GWbjbg==": {
+      "category": "ایمیل",
+      "site": "گوگل",
+      "filename": "Dhika"
+    },
+    "bJIHlrbmQCC2HIICmBzQig==": {
+      "category": "سرور و زیرساخت",
+      "site": "پاسدان",
+      "filename": "پاسدان | Pasdan"
+    },
+    "LPZxaVxuT+2p6TYI+6l3xw==": {
+      "category": "بانک و پرداخت",
+      "site": "پی‌پال",
+      "filename": "PayPal"
+    }
+  },
+  "dedupe_categories": [
+    "مرورگر — ورودهای ذخیره‌شده",
+    "بایگانی LastPass"
+  ],
+  "priority_groups": {
+    "Root/LastPass": "بایگانی LastPass"
+  },
+  "dedupe_all": true
+}

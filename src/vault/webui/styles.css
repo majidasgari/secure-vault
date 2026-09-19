@@ -299,6 +299,19 @@ input[type="checkbox"] { min-height: auto; width: 18px; height: 18px; }
   margin: 0; padding: 8px 14px; background: var(--danger, #b3261e); color: #fff;
   font-size: 0.9rem; text-align: center;
 }
+.readonly-banner {
+  display: flex; align-items: center; justify-content: center; gap: 10px;
+}
+.readonly-banner button {
+  background: rgba(255, 255, 255, 0.15); color: #fff; border: 1px solid rgba(255, 255, 255, 0.5);
+  border-radius: 6px; padding: 3px 10px; cursor: pointer;
+}
+.sync-progress {
+  display: flex; align-items: center; gap: 10px; padding: 6px 14px;
+  background: var(--panel2, #262932); color: var(--text, #d6d8de); font-size: 0.85rem;
+  border-bottom: 1px solid var(--border, #33363f);
+}
+.sync-progress progress { flex: 1 1 auto; height: 10px; }
 .format-toolbar button { cursor: pointer; }
 
 /* ------------------------------------------------------------ header/sidebar polish */

@@ -28,6 +28,12 @@
   `vault:/attachments/...`).
 * بسته‌بندی: `tools/bootstrap.sh`، لانچرها، نصب دسکتاپ، سازنده‌ی portable ویندوز،
   `pyproject.toml` و مستندات.
+* سینک S3 اختیاری (بدون نیاز به بستهٔ اضافه — امضای SigV4 درون‌برنامه‌ای است؛
+  `requirements-s3.txt` فقط برای بک‌اند اختیاری boto3): آینه‌سازی دوطرفه‌ی کل پوشه‌ی گاوصندوق با
+  قفل فایل در سبد؛ اگر دستگاه دیگری قفل را داشته باشد، نشست **فقط‌خواندنی** می‌شود تا
+  دکمه‌ی «گرفتن دسترسی نوشتن» را بزنید. دکمه‌ی «همگام‌سازی» هم در اپ و هم در رابط وب
+  هست. بردارهای معنایی و کش جای‌گذاری بیرون گاوصندوق‌اند و هرگز سینک نمی‌شوند؛ تنظیمات
+  مسیر داخلی برای کش بردار را رد می‌کند. جزئیات در `docs/SYNC.md`.
 
 ## اجرا
 
@@ -146,6 +152,7 @@ printf '%s' 'گذرواژه‌ی‌اصلی' > /tmp/sv.pw && chmod 600 /tmp/sv.p
 ./.venv/bin/python tests/run_tests.py --only test_web       # تست رابط وب
 ./.venv/bin/python tests/run_tests.py --only test_activity  # فید فعالیت
 ./.venv/bin/python tests/run_tests.py --only test_bidi      # جهت متن ویرایشگر
+./.venv/bin/python tests/run_tests.py --only test_sync      # سینک S3 و قفل
 QT_QPA_PLATFORM=offscreen ./.venv/bin/python tests/test_ui_smoke.py
 ./.venv/bin/python tools/smoke_e2e.py
 ./.venv/bin/python tools/smoke_mcp.py

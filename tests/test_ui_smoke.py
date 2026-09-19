@@ -241,6 +241,71 @@ class EditorBidiTest(unittest.TestCase):
 
 
 @unittest.skipUnless(HAVE_QT, "PySide6 is not installed")
+class EditorPreviewTest(unittest.TestCase):
+    """The preview refreshes on demand, never on every keystroke (large-file fix)."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        """Ensure a single offscreen QApplication exists."""
+        from PySide6.QtWidgets import QApplication
+
+        cls.app = QApplication.instance() or QApplication(["editor-preview-test"])
+
+    def test_typing_does_not_render_the_preview(self) -> None:
+        """An edit schedules the bidi pass but must not re-render the preview."""
+        from vault.ui.editor import EditorPanel
+
+        editor = EditorPanel()
+        editor.set_content("/notes/big.md", "سلام\n\nEnglish\n", preview_enabled=True)
+        calls: list[int] = []
+        editor._render_preview = lambda: calls.append(1)  # type: ignore[method-assign]
+        editor.source.insertPlainText("more")
+        editor._bidi_timer.timeout.emit()
+        self.assertEqual(calls, [])
+
+    def test_preview_button_renders_on_demand(self) -> None:
+        """The toolbar button shows/refreshes the preview when the user asks."""
+        from vault.ui.editor import EditorPanel
+
+        editor = EditorPanel()
+        editor.set_content("/notes/big.md", "hello", preview_enabled=True)
+        editor.preview_enabled = False
+        calls: list[int] = []
+        editor._render_preview = lambda: calls.append(1)  # type: ignore[method-assign]
+        editor._on_preview_clicked()
+        self.assertTrue(editor.preview_enabled)
+        self.assertEqual(calls, [1])
+        editor._on_preview_clicked()
+        self.assertEqual(calls, [1, 1])
+
+    def test_editing_only_formats_the_current_block(self) -> None:
+        """The per-keystroke bidi pass keeps the caret and leaves other blocks alone."""
+        from PySide6.QtCore import Qt
+
+        from vault.ui.editor import EditorPanel
+
+        editor = EditorPanel()
+        editor.set_content(
+            "/notes/x.md",
+            "متن فارسی\n\nEnglish text\n\nمتن دیگر",
+            preview_enabled=False,
+        )
+        document = editor.source.document()
+        untouched = document.begin().next().next()
+        before = untouched.blockFormat().layoutDirection()
+        cursor = editor.source.textCursor()
+        cursor.setPosition(document.begin().next().position() + 2)
+        editor.source.setTextCursor(cursor)
+        editor._apply_current_block_bidi()
+        self.assertEqual(editor.source.textCursor().position(), cursor.position())
+        self.assertEqual(untouched.blockFormat().layoutDirection(), before)
+        self.assertEqual(
+            editor.source.textCursor().block().blockFormat().layoutDirection(),
+            Qt.LeftToRight,
+        )
+
+
+@unittest.skipUnless(HAVE_QT, "PySide6 is not installed")
 class SemanticProgressUiTest(unittest.TestCase):
     """The semantic build shows a determinate, count-based progress bar."""
 

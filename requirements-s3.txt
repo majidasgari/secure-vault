@@ -1,0 +1,6 @@
+# Optional extra for the built-in S3 folder sync (docs/SYNC.md).
+#
+# Sync works WITHOUT this file: the app ships a dependency-free stdlib S3 client (AWS
+# SigV4 over http.client) that covers get/put/delete/list. Install boto3 only if you
+# prefer the AWS SDK backend on a machine where it is available.
+boto3>=1.34

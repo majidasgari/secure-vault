@@ -96,6 +96,12 @@ CASES: list[tuple[str, str, dict, str, object]] = [
      {"path": "/secrets/keys.md"}, "mcp", _expect_value("status", "pending")),
     ("request_open_secret_secret_mcp", "vault.request_open_secret",
      {"path": "/notes/secret.md"}, "mcp", PermissionDenied),
+    # The web UI (role ``ui``) may hand a secretfile to the desktop native viewer; with no
+    # attached desktop it reports handler=False so the browser can say "open the app".
+    ("request_open_secret_ui", "vault.request_open_secret",
+     {"path": "/secrets/keys.md"}, "ui", _expect_value("handler", False)),
+    ("request_open_secret_secret_ui", "vault.request_open_secret",
+     {"path": "/notes/secret.md"}, "ui", PermissionDenied),
     ("pending_requests_ui", "vault.pending_requests", {}, "ui",
      _expect_keys("requests")),
     ("access_log_ui", "vault.access_log", {"limit": 5}, "ui",
