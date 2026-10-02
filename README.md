@@ -38,6 +38,9 @@ set: Python, PySide6, `cryptography`, `argon2-cffi`, `markdown-it-py` and Pygmen
 * Core, socket API, MCP bridge, Qt UI, browser web UI (with Joplin-mirror parity),
   Joplin importer, tray shell, desktop integration and the Windows portable
   **builder** are implemented.
+* Two-way S3 sync with a cooperative write lock, **restore-from-S3** (adopt the vault
+  that is already in the bucket, `secure-vault-import` on headless machines) and safety
+  rails that refuse to mirror one vault onto another (docs/SYNC.md §8/§9).
 * The **tray is the always-on shell**: it starts the web UI automatically in-process,
   gates `secret`/`secretfile` reads with a Copy dialog, and always shows which file is
   being read right now (activity feed + tooltip + SSE). The Qt markdown editor is

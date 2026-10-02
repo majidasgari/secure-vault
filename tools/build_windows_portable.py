@@ -73,6 +73,7 @@ REQUIRED_LAYOUT = (
     "README.md",
     "LICENSE",
     "bin/secure-vault",
+    "bin/secure-vault-import",
     "bin/secure-vault-mcp",
     "src/vault/__init__.py",
     "src/vault/__main__.py",
@@ -349,11 +350,19 @@ if "%SECURE_VAULT_DEBUG%"=="1" (
 )
 endlocal
 """
+    restore = """@echo off
+setlocal
+set "HERE=%~dp0"
+set "PYTHONPATH=%HERE%src"
+"%HERE%python.exe" -m vault.import_cli %*
+endlocal
+"""
     _write_crlf(dest / "run.cmd", run)
     _write_crlf(dest / "run.bat", run)
     _write_crlf(dest / "secure-vault.cmd", run)
+    _write_crlf(dest / "secure-vault-import.cmd", restore)
     _write_crlf(dest / "secure-vault-mcp.cmd", mcp)
-    print("wrote run.cmd, run.bat, secure-vault.cmd, secure-vault-mcp.cmd")
+    print("wrote run.cmd, run.bat, secure-vault.cmd, secure-vault-import.cmd, secure-vault-mcp.cmd")
 
 
 README_TXT = """\
@@ -368,7 +377,10 @@ Secure Vault — portable Windows build
   2. در اجرای اول، پوشه‌ی گاوصندوق (vault home) و گذرواژه‌ی اصلی را انتخاب/وارد کنید.
      گذرواژه ذخیره نمی‌شود و هیچ راهی برای بازیابی آن وجود ندارد؛ آن را جای امنی
      نگه دارید.
-  3. برای اتصال ایجنت‌ها، مسیر کامل secure-vault-mcp.cmd را به‌عنوان فرمان MCP در
+  3. برای برگرداندن گاوصندوقی که از قبل روی سرویس S3 دارید، از secure-vault-import.cmd
+     استفاده کنید (docs/SYNC.md §8) — مثلاً:
+       secure-vault-import.cmd --home D:\Vault --bucket my-bucket --prefix sync --check
+  4. برای اتصال ایجنت‌ها، مسیر کامل secure-vault-mcp.cmd را به‌عنوان فرمان MCP در
      Hermes ثبت کنید (docs/MCP.md را ببینید).
 
 English:
@@ -378,7 +390,10 @@ This folder is the portable Windows build of Secure Vault. To run it:
   1. Double-click run.cmd (or secure-vault.cmd).
   2. On first run, choose the vault home folder and set the master password. The
      password is never stored and cannot be recovered — keep it safe.
-  3. To give agents access, register the full path of secure-vault-mcp.cmd as the
+  3. To bring back a vault that is already in an S3 bucket, use
+     secure-vault-import.cmd (docs/SYNC.md §8) — for example:
+       secure-vault-import.cmd --home D:\Vault --bucket my-bucket --prefix sync --check
+  4. To give agents access, register the full path of secure-vault-mcp.cmd as the
      MCP server command in Hermes (see docs/MCP.md).
 
 Notes:

@@ -91,6 +91,11 @@ manifest of the last successful sync (`$XDG_DATA_HOME/secure-vault/sync/<vault>.
 `meta.sqlite` grows one access-log row per call, so two syncs in a row may each upload a
 changed `meta.sqlite`; large content is only transferred once.
 
+A request carrying a large body gets a longer socket timeout (300 s instead of 15 s):
+secure.store grows with the search index (tens of megabytes is normal) and a slow link
+would otherwise abort the upload mid-way — which looks exactly like a sync that stopped
+halfway through with the store as the last file left behind.
+
 ## 5. Sync from the app or the web
 
 * **Desktop app**: Tools → *Sync now* (`menu.sync`), the tray *Sync now* action, or the
@@ -177,7 +182,84 @@ PY
 
 This only deletes files under `files/` that no metadata row references.
 
-## 8. Recommendation
+## 8. Restoring a vault that is already in the bucket
+
+**Never create an empty vault and sync it onto a bucket that already holds one.** The two
+vaults have different `vault_id` values and different KDF salts, so the new vault's empty
+index and fresh identity would replace the bucket's — every blob survives, but the index
+that names them is gone, and the old identity (the salt that decrypts those blobs) is
+overwritten too. Sync now refuses that case (§9), and the supported way to bring such a
+vault back is to **restore it**:
+
+* **Desktop app** — *Restore from S3…* on the unlock screen. Fill in the bucket, prefix,
+  endpoint/region and the keys (pre-filled from the machine-local credentials after the
+  first use), optionally the vault's master password, then press **Check the bucket** to see
+  exactly what is there before anything is written.
+* **Headless** — `secure-vault-import` (or `python -m vault.import_cli`):
+
+  ```bash
+  secure-vault-import --home /data/Cloud/SecureVault --bucket my-bucket --prefix sync \
+      --endpoint https://s3.ir-thr-at1.arvanstorage.ir --region ir-thr-at1 --check
+  secure-vault-import --home /data/Cloud/SecureVault --bucket my-bucket --prefix sync \
+      --endpoint https://s3.ir-thr-at1.arvanstorage.ir --region ir-thr-at1
+  ```
+
+The restore adopts the bucket's own files:
+
+```
+.vault-meta.json   identity: vault id, KDF salt, canary, settings  -> unlock with the ORIGINAL password
+meta.sqlite        the index (names, paths, levels, tags, history)
+secure.store       the encrypted content store (folder notes, FTS index)
+files/**           the blobs the index references
+```
+
+Rules it follows, all of them designed so a failure can never cost data:
+
+* **Blobs are reused, not re-downloaded.** A blob whose file is already present with the
+  same size is skipped, so restoring next to an existing `files/` folder (the usual
+  recovery case) transfers only the metadata.
+* **The index is verified before it is installed.** Every blob the index references must be
+  present after the download, otherwise the import stops with `import_incomplete` and does
+  **not** install anything — a vault that lists files it cannot decrypt is worse than no
+  vault at all.
+* **The identity is installed last.** Until `.vault-meta.json` exists the folder is not a
+  vault, so an interrupted restore can never be mistaken for a usable (or lockable) one.
+* **The password is checked first.** When you type it, it is verified against the canary in
+  the bucket *before* the first byte is downloaded.
+* **An existing vault is parked, never deleted.** Restoring into a folder that already
+  holds a *different* vault asks first; its metadata files move to
+  `<folder>.replaced-<stamp>/` (with a short `README.txt`) and its `files/` blobs stay where
+  they are so the restore can reuse them. Unreferenced leftovers can be pruned later with
+  `VaultSession.fs.gc_orphans` (§7).
+* **The sync base is seeded.** The restored folder is recorded as the last-synced manifest,
+  so the first sync after a restore transfers only what really changed.
+
+## 9. Safety rails on sync
+
+Three rules keep the mirror from destroying the other side. All three fire *before* anything
+is transferred.
+
+1. **Identity guard.** If the bucket already holds a `.vault-meta.json` with a different
+   `vault_id` than this vault, the sync stops with `vault_id_mismatch` and names both ids.
+   Two vaults are not a merge; use *Restore from S3* (§8) to adopt the bucket's vault, or
+   point this vault at its own prefix.
+2. **No clobbering a richer remote index.** An upload that would replace a remote
+   `meta.sqlite`/`secure.store`/`.vault-meta.json` with a file smaller than a quarter of it
+   (and the remote one is at least 1 MB) stops with
+   `refusing_to_overwrite_remote_metadata`. This is what an empty "just created" vault looks
+   like to a bucket that holds years of notes. Deliberate mass deletions can opt out with the
+   vault setting `sync.allow_metadata_overwrite: true`.
+3. **A copy before every overwrite.** Before a sync overwrites a metadata file whose remote
+   content differs, the current object is copied to
+   `<prefix>/.secure-vault-backups/<utc stamp>/<name>` (the newest
+   `META_BACKUP_KEEP` = 3 generations per file are kept; objects over 8 MB — the encrypted
+   store — are skipped). The folder is never mirrored into the vault, so it is a plain
+   rollback source: download the object and put it back if a sync ever goes wrong.
+
+Both guards report their reason in the notification/status line in the UI language
+(`sync.reason.<code>` in `i18n/*.json`).
+
+## 10. Recommendation
 
 Keep the lock discipline: one writer, the others read-only, sync before you switch
 machines. The built-in S3 sync plus the lock is the supported path; the cloud-drive

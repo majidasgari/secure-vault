@@ -22,6 +22,7 @@ import logging
 import os
 import socket
 import threading
+import time
 from pathlib import Path
 from typing import Any, Callable
 
@@ -35,6 +36,24 @@ LOG = logging.getLogger(__name__)
 LOCK_FILENAME = ".secure-vault.lock"
 STATE_VERSION = 1
 CHUNK = 1 << 20  # 1 MiB read chunks while hashing
+
+IDENTITY_FILENAME = ".vault-meta.json"
+INDEX_FILENAME = "meta.sqlite"
+STORE_FILENAME = "secure.store"
+METADATA_FILENAMES = (IDENTITY_FILENAME, INDEX_FILENAME, STORE_FILENAME)
+"""The three files a *vault identity* consists of; everything else is content."""
+
+BACKUP_DIRNAME = ".secure-vault-backups"
+"""Bucket folder holding pre-overwrite copies of the metadata files."""
+META_BACKUP_KEEP = 3
+"""How many backup generations to keep per metadata file."""
+META_BACKUP_MAX_BYTES = 8 * 1024 * 1024
+"""Never back up an object larger than this (the store can be huge and is rebuilt)."""
+
+SHRINK_GUARD_MIN_BYTES = 1 << 20
+"""A remote metadata file below this size is not worth guarding."""
+SHRINK_GUARD_RATIO = 0.25
+"""Refuse an upload that would shrink a remote metadata file below this fraction."""
 
 ProgressCallback = Callable[[str, int, int], None]
 
@@ -63,6 +82,8 @@ def _new_job() -> dict[str, Any]:
 
 def _is_excluded(relative: str) -> bool:
     """Return True for paths that must never be synced (derived/runtime files)."""
+    if relative == BACKUP_DIRNAME or relative.startswith(f"{BACKUP_DIRNAME}/"):
+        return True
     name = relative.rsplit("/", 1)[-1]
     if name in (".DS_Store", LOCK_FILENAME):
         return True
@@ -76,6 +97,23 @@ def _is_excluded(relative: str) -> bool:
     if "semantic" in parts or "cache" in parts:
         return True
     return False
+
+
+def identity_vault_id(data: bytes | None) -> str:
+    """Return the ``vault_id`` inside a ``.vault-meta.json`` payload.
+
+    Returns ``""`` for a missing, unreadable or foreign payload, so a caller can treat
+    "no identity" and "a different vault" separately.
+    """
+    if not data:
+        return ""
+    try:
+        parsed = json.loads(data.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError):
+        return ""
+    if not isinstance(parsed, dict):
+        return ""
+    return str(parsed.get("vault_id") or "")
 
 
 def _hash_file(path: Path) -> str:
@@ -547,6 +585,137 @@ class SyncManager:
             "conflict": conflicts,
         }
 
+    # --------------------------------------------------------------------- guards
+    def _sync_setting(self, name: str, default: Any) -> Any:
+        """Return a ``settings.sync.<name>`` override (used by the safety guards)."""
+        try:
+            settings = self.session.meta.settings.get("sync") or {}
+        except Exception:  # noqa: BLE001 - a locked or brand-new vault has no settings
+            return default
+        value = settings.get(name)
+        return default if value is None else value
+
+    def _guard_identity(self, client: Any, prefix: str) -> None:
+        """Refuse to mirror a vault into a bucket that holds a *different* vault.
+
+        Two vaults have unrelated ids and KDF salts, so mirroring one onto the other is
+        not a merge at all: the new vault's identity and (usually empty) index replace the
+        other vault's, and while every blob survives the index that names them is gone.
+        Adopting the bucket's vault is what ``vault.core.remote_import`` is for.
+        """
+        remote_id = identity_vault_id(client.get(f"{prefix}{IDENTITY_FILENAME}"))
+        try:
+            local_id = str(self.session.meta.vault_id or "")
+        except Exception:  # noqa: BLE001
+            local_id = ""
+        if remote_id and local_id and remote_id != local_id:
+            raise SyncError(
+                "vault_id_mismatch",
+                details={"local": local_id, "remote": remote_id, "prefix": prefix},
+            )
+
+    def _guard_metadata_overwrite(
+        self,
+        actions: dict[str, list[str]],
+        local: dict[str, dict[str, Any]],
+        remote: dict[str, dict[str, Any]],
+    ) -> None:
+        """Refuse an upload that would replace a much richer remote metadata file.
+
+        This is the second half of the same accident: even with matching vault ids, a
+        freshly created (empty) vault must not push its near-empty ``meta.sqlite`` /
+        ``secure.store`` over a populated remote one. Deliberate mass deletions can opt out
+        with the vault setting ``sync.allow_metadata_overwrite``.
+        """
+        if bool(self._sync_setting("allow_metadata_overwrite", False)):
+            return
+        for relative in actions["upload"]:
+            if relative not in METADATA_FILENAMES:
+                continue
+            local_size = int((local.get(relative) or {}).get("size") or 0)
+            remote_size = int((remote.get(relative) or {}).get("size") or 0)
+            if remote_size < SHRINK_GUARD_MIN_BYTES:
+                continue
+            if local_size >= remote_size * SHRINK_GUARD_RATIO:
+                continue
+            raise SyncError(
+                "refusing_to_overwrite_remote_metadata",
+                details={
+                    "path": relative,
+                    "local_bytes": local_size,
+                    "remote_bytes": remote_size,
+                },
+            )
+
+    def _backup_remote_metadata(
+        self,
+        client: Any,
+        prefix: str,
+        actions: dict[str, list[str]],
+        local: dict[str, dict[str, Any]],
+        remote: dict[str, dict[str, Any]],
+    ) -> list[str]:
+        """Copy the remote metadata aside before this sync overwrites it.
+
+        The copy lands in ``<prefix>/.secure-vault-backups/<utc stamp>/`` (never mirrored
+        back into the vault) and the newest :data:`META_BACKUP_KEEP` generations per file
+        are kept, so a bad upload can always be rolled back by hand.
+        """
+        saved: list[str] = []
+        stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+        for relative in actions["upload"]:
+            if relative not in METADATA_FILENAMES:
+                continue
+            there = remote.get(relative) or {}
+            if not there:
+                continue
+            if there.get("etag") is not None and there.get("etag") == (local.get(relative) or {}).get("md5"):
+                continue  # byte-identical: the upload is a no-op
+            size = int(there.get("size") or 0)
+            if size > META_BACKUP_MAX_BYTES:
+                LOG.info("not backing up %s (%d bytes): too large", relative, size)
+                continue
+            try:
+                data = client.get(f"{prefix}{relative}")
+            except Exception:  # noqa: BLE001 - keep syncing, lose the safety copy
+                LOG.warning("could not read %s for backup", relative, exc_info=True)
+                continue
+            if data is None:
+                continue
+            try:
+                client.put(f"{prefix}{BACKUP_DIRNAME}/{stamp}/{relative}", data)
+            except Exception:  # noqa: BLE001
+                LOG.warning("could not back up %s", relative, exc_info=True)
+                continue
+            saved.append(relative)
+        if saved:
+            self._prune_backups(client, prefix)
+        return saved
+
+    def _prune_backups(self, client: Any, prefix: str) -> None:
+        """Keep only the newest :data:`META_BACKUP_KEEP` generations per metadata file."""
+        root = f"{prefix}{BACKUP_DIRNAME}/"
+        try:
+            rows = client.list(root)
+        except Exception:  # noqa: BLE001 - pruning is best effort
+            return
+        generations: dict[str, list[tuple[str, str]]] = {}
+        for item in rows:
+            key = str(item.get("key") or "")
+            if not key.startswith(root):
+                continue
+            parts = key[len(root) :].split("/", 1)
+            if len(parts) != 2 or not parts[0] or not parts[1]:
+                continue
+            generations.setdefault(parts[1], []).append((parts[0], key))
+        for entries in generations.values():
+            entries.sort(reverse=True)
+            for _stamp, key in entries[META_BACKUP_KEEP:]:
+                try:
+                    client.delete(key)
+                except Exception:  # noqa: BLE001
+                    pass
+
     # --------------------------------------------------------------------- sync
     def sync(self, progress: ProgressCallback | None = None) -> dict[str, Any]:
         """Mirror the vault folder to/from S3 and persist the new base manifest.
@@ -618,16 +787,21 @@ class SyncManager:
         progress("scan", 0, 1)
         local = self._local_manifest()
         remote = self._remote_manifest()
+        prefix = self.config.normalized_prefix()
+        client = self._s3()
         actions = self.plan(local, remote, base)
+        # Safety rails: never mirror one vault onto another, never let a near-empty
+        # index replace a populated one, and keep a copy before any metadata overwrite.
+        self._guard_identity(client, prefix)
+        self._guard_metadata_overwrite(actions, local, remote)
+        if actions["upload"]:
+            self._backup_remote_metadata(client, prefix, actions, local, remote)
         progress("scan", 1, 1)
 
         uploaded = 0
         downloaded = 0
         deleted_remote = 0
         deleted_local = 0
-        prefix = self.config.normalized_prefix()
-        client = self._s3()
-
         total_upload = len(actions["upload"])
         total_download = len(actions["download"])
         total_delete = len(actions["delete_remote"]) + len(actions["delete_local"])
@@ -713,4 +887,14 @@ class SyncManager:
         return result
 
 
-__all__ = ["SyncManager", "LOCK_FILENAME", "STATE_VERSION"]
+__all__ = [
+    "BACKUP_DIRNAME",
+    "IDENTITY_FILENAME",
+    "INDEX_FILENAME",
+    "LOCK_FILENAME",
+    "METADATA_FILENAMES",
+    "STATE_VERSION",
+    "STORE_FILENAME",
+    "SyncManager",
+    "identity_vault_id",
+]

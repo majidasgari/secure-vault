@@ -33,6 +33,7 @@ from ..api.service import ActivityFeed, Service
 from ..api.socket_server import VaultSocketServer
 from ..errors import AlreadyExists
 from ..util import now_ms
+from .import_vault import megabytes
 from ..config import runtime_dir, user_config, user_state_dir
 from ..core.meta import DEFAULT_IMPORT_MIRROR
 from ..errors import Unauthorized, VaultError
@@ -232,6 +233,7 @@ class VaultApplication(QObject):
         self_test: bool = False,
         session_loader: Callable[[Path], Any] | None = None,
         vault_creator: Callable[[Path, str], Any] | None = None,
+        vault_importer: Callable[..., Any] | None = None,
         parent: Any = None,
     ) -> None:
         """Create the controller for ``home`` (no session yet)."""
@@ -242,6 +244,7 @@ class VaultApplication(QObject):
         self.self_test = self_test
         self._session_loader = session_loader
         self._vault_creator = vault_creator
+        self._vault_importer = vault_importer
         self.config = user_config()
         self.language = language
         self.start_minimized = bool(self.config.data.get("start_minimized", False))
@@ -330,6 +333,7 @@ class VaultApplication(QObject):
             self.unlock_screen.unlock_requested.connect(self.unlock)
             self.unlock_screen.open_vault_requested.connect(self.choose_vault)
             self.unlock_screen.create_vault_requested.connect(self.create_vault)
+            self.unlock_screen.import_vault_requested.connect(self.import_vault)
             self.unlock_screen.language_selected.connect(self.set_language)
             self.unlock_screen.fingerprint_requested.connect(self.unlock_with_fingerprint)
             self.unlock_screen.fingerprint_enable_requested.connect(
@@ -797,6 +801,137 @@ class VaultApplication(QObject):
         if self.unlock_screen is not None:
             self.unlock_screen.hide()
         self.attach_session(session)
+
+    def local_vault_id(self) -> str:
+        """Return the id of the vault already in :attr:`home` (``""`` when there is none)."""
+        from ..core.session import VaultSession
+
+        try:
+            if not VaultSession.is_initialised(self.home):
+                return ""
+            return str(VaultSession(self.home).meta.vault_id or "")
+        except Exception:  # noqa: BLE001 - an unreadable identity just means "no vault"
+            return ""
+
+    def import_vault(self) -> None:
+        """Restore the vault that already lives in the bucket (the pull path).
+
+        This is the counterpart of :meth:`create_vault`: instead of creating an empty vault
+        and syncing it (which would push that vault's identity and empty index over the
+        bucket's), it adopts the bucket's own ``.vault-meta.json``/``meta.sqlite``/
+        ``secure.store`` and reuses every blob the local folder already holds.
+        """
+        from ..config import load_sync_config
+        from ..core import remote_import
+        from ..core.s3 import S3Client
+        from ..core.session import VaultSession
+        from .import_vault import ImportJob, ImportVaultDialog, progress_text
+
+        dialog = ImportVaultDialog(
+            self.unlock_screen,
+            home=self.home,
+            credentials=load_sync_config(),
+            existing_vault_id=self.local_vault_id(),
+        )
+        if dialog.exec() != QDialog.Accepted:
+            return
+        home, config, password, replace = dialog.values()
+        client = S3Client(config)
+
+        progress = QProgressDialog(
+            i18n.tr("importvault.importing"),
+            i18n.tr("common.cancel"),
+            0,
+            100,
+            self.unlock_screen,
+        )
+        progress.setWindowTitle(i18n.tr("importvault.window_title"))
+        progress.setWindowModality(Qt.WindowModal)
+        progress.setMinimumDuration(0)
+        progress.setAutoClose(False)
+        progress.setAutoReset(False)
+        progress.setValue(0)
+
+        importer = self._vault_importer or remote_import.import_vault
+        holder: dict[str, Any] = {}
+
+        def work(state: dict[str, Any], cancel: Any) -> Any:
+            """Run the import in the worker thread."""
+            return importer(
+                client,
+                config,
+                home,
+                password=password,
+                progress=holder["job"].report,
+                cancel=cancel.is_set,
+                replace=replace,
+            )
+
+        job = ImportJob(work)
+        holder["job"] = job
+        job.start()
+
+        def tick() -> None:
+            """Mirror the worker's progress onto the dialog (GUI thread only)."""
+            state = job.state
+            if state["phase"] == "files" and state["total"]:
+                progress.setMaximum(int(state["total"]))
+                progress.setValue(int(state["done"]))
+            progress.setLabelText(
+                progress_text(str(state["phase"]), int(state["done"]), int(state["total"]))
+            )
+            if progress.wasCanceled():
+                job.cancel.set()
+
+        job.pump(self.qapp, tick=tick)
+        progress.close()
+
+        if job.state["error"] is not None:
+            exc = job.state["error"]
+            reason = str(getattr(exc, "message", "") or exc)
+            text = i18n.sync_reason(reason)
+            QMessageBox.warning(
+                self.unlock_screen,
+                i18n.tr("importvault.window_title"),
+                text if text != reason else error_message(exc),
+            )
+            return
+
+        report = job.state["result"]
+        try:
+            remote_import.persist_sync_credentials(config)
+        except Exception:  # noqa: BLE001 - the vault is already restored
+            logging.getLogger(__name__).warning("could not store the S3 credentials", exc_info=True)
+
+        self.home = Path(home)
+        if password:
+            session = VaultSession(self.home)
+            session.unlock(password)
+            self.session = session
+            if self.unlock_screen is not None:
+                self.unlock_screen.hide()
+            self.attach_session(session)
+            notifications.notify(
+                i18n.tr("importvault.done_title"),
+                i18n.tr("importvault.opened"),
+                tray=self.tray,
+            )
+            return
+
+        self.session = None
+        if self.unlock_screen is not None:
+            self.unlock_screen.set_vault_info(i18n.tr("app.title"), str(self.home))
+            self.unlock_screen.clear_error()
+        self.refresh_fingerprint_state()
+        notifications.notify(
+            i18n.tr("importvault.done_title"),
+            i18n.tr(
+                "importvault.done_body",
+                files=int(getattr(report, "files", 0)),
+                size=megabytes(int(getattr(report, "payload_bytes", 0))),
+            ),
+            tray=self.tray,
+        )
 
     def _create_structure(self, session: Any) -> None:
         """Create the recommended top-level folders in a new vault."""
@@ -1692,7 +1827,7 @@ class VaultApplication(QObject):
                 i18n.tr("notification.sync_title"),
                 i18n.tr(
                     "notification.sync_failed",
-                    reason=str(job.get("error") or ""),
+                    reason=i18n.sync_reason(str(job.get("error") or "")),
                 ),
                 tray=self.tray,
             )

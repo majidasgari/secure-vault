@@ -130,6 +130,21 @@ def reason_text(reason: str) -> str:
     return text
 
 
+def sync_reason(reason: str) -> str:
+    """Translate a sync/restore failure reason (``sync.reason.<value>``).
+
+    Falls back to the raw reason when no catalogue entry exists, so a new reason code can
+    never render as a ⟦missing⟧ marker.
+    """
+    if not reason:
+        return ""
+    key = f"sync.reason.{reason}"
+    text = tr(key)
+    if text == MISSING_TEMPLATE.format(key=key):
+        return reason
+    return text
+
+
 def set_language(lang: str) -> None:
     """Switch the current language and refresh registered widgets."""
     _translator.set_language(lang)
@@ -170,5 +185,6 @@ __all__ = [
     "bind",
     "reload_widgets",
     "translator",
+    "sync_reason",
     "MISSING_TEMPLATE",
 ]

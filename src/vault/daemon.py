@@ -89,8 +89,80 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser.add_argument(
         "--json-events", action="store_true", help="emit JSON events on stdout"
     )
+    parser.add_argument(
+        "--import-s3",
+        action="store_true",
+        help=(
+            "restore the vault stored in the S3 bucket into --home before serving "
+            "(coordinates come from the saved credentials; see secure-vault-import)"
+        ),
+    )
+    parser.add_argument(
+        "--import-replace",
+        action="store_true",
+        help="with --import-s3: park a different vault already in --home instead of refusing",
+    )
     parser.add_argument("--debug", action="store_true", help="verbose logging")
     return parser.parse_args(argv)
+
+
+def _restore_from_s3(
+    home: Path, *, password: str | None = None, replace: bool = False
+) -> int:
+    """Adopt the vault stored in the S3 bucket into ``home`` (0 on success).
+
+    Coordinates and credentials are the machine-local ones (the same file the app writes),
+    so a headless host is brought up with ``--import-s3`` after the bucket has been set up
+    once with ``secure-vault-import``.
+    """
+    from .config import load_sync_config
+    from .core import remote_import
+    from .core.s3 import S3Client, S3Config
+    from .errors import VaultError
+
+    saved = load_sync_config()
+    source = saved.get("last_source")
+    source = source if isinstance(source, dict) else {}
+    config = S3Config(
+        enabled=True,
+        bucket=str(source.get("bucket") or ""),
+        prefix=str(source.get("prefix") or ""),
+        endpoint=str(source.get("endpoint") or ""),
+        region=str(source.get("region") or ""),
+        access_key=str(saved.get("access_key") or ""),
+        secret_key=str(saved.get("secret_key") or ""),
+    )
+    if not config.configured:
+        LOG.error(
+            "--import-s3 needs saved S3 coordinates and credentials "
+            "(run secure-vault-import once, or set them in the app)"
+        )
+        return 2
+
+    def progress(phase: str, done: int, total: int) -> None:
+        """Log every phase change at INFO."""
+        if phase == "files" and total:
+            LOG.info("restoring: %d/%d files", done, total)
+        else:
+            LOG.info("restoring: %s", phase)
+
+    try:
+        report = remote_import.import_vault(
+            S3Client(config), config, home, password=password, progress=progress, replace=replace
+        )
+    except VaultError as exc:
+        LOG.error("restore from S3 failed: %s", getattr(exc, "message", str(exc)))
+        return 2
+    LOG.info(
+        "restored vault %s: %d files + %d folders into %s",
+        report.vault_id,
+        report.files,
+        report.folders,
+        report.home,
+    )
+    if report.replaced:
+        LOG.info("the previous vault was parked at %s", report.parked_at)
+    return 0
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -107,6 +179,11 @@ def main(argv: list[str] | None = None) -> int:
             LOG.error("refusing --unlock-file: %s", exc)
             return 2
 
+    if args.import_s3:
+        restored = _restore_from_s3(home, password=password, replace=args.import_replace)
+        if restored != 0:
+            return restored
+
     if VaultSession.is_initialised(home):
         session = VaultSession(home)
         if password is not None:
@@ -114,7 +191,9 @@ def main(argv: list[str] | None = None) -> int:
     else:
         if password is None:
             LOG.error(
-                "vault at %s is not initialised and no --unlock-file was given", home
+                "vault at %s is not initialised and no --unlock-file was given "
+                "(use --import-s3 to adopt a vault that is already in the bucket)",
+                home,
             )
             return 2
         session = VaultSession.create(home, password)

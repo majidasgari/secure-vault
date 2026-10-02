@@ -624,7 +624,9 @@ class SettingsDialog(QDialog):
                 "sync.held_by", host=held
             )
         elif sync.get("last_error"):
-            state = i18n.tr("status.sync_error") + " · " + str(sync.get("last_error"))
+            state = i18n.tr("status.sync_error") + " · " + i18n.sync_reason(
+                str(sync.get("last_error"))
+            )
         else:
             state = i18n.tr("status.sync_owned")
         backend = sync.get("backend")

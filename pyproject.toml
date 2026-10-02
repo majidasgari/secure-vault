@@ -32,6 +32,7 @@ s3 = ["boto3>=1.34"]
 
 [project.scripts]
 secure-vault = "vault.gui:main"
+secure-vault-import = "vault.import_cli:main"
 secure-vault-mcp = "vault.mcp:main"
 
 [tool.setuptools.packages.find]

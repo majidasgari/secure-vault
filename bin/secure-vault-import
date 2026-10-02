@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+#
+# secure-vault-import — restore a vault that already lives in an S3 bucket (docs/SYNC.md §8).
+#
+# Uses the project virtualenv created by tools/bootstrap.sh and runs the package straight
+# from src/ via PYTHONPATH, so nothing has to be pip-installed. All arguments are forwarded
+# to `python -m vault.import_cli` (see `--help`).
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+PY="$ROOT/.venv/bin/python"
+
+if [ ! -x "$PY" ]; then
+  echo "secure-vault-import: no virtualenv at $ROOT/.venv" >&2
+  echo "secure-vault-import: run $ROOT/tools/bootstrap.sh first" >&2
+  exit 1
+fi
+
+export PYTHONPATH="$ROOT/src${PYTHONPATH:+:$PYTHONPATH}"
+exec "$PY" -m vault.import_cli "$@"

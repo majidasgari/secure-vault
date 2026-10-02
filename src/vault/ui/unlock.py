@@ -30,6 +30,8 @@ class UnlockScreen(QMainWindow):
     unlock_requested = Signal(str)
     open_vault_requested = Signal()
     create_vault_requested = Signal()
+    #: ``بازیابی از S3``: adopt the vault that is already in the bucket.
+    import_vault_requested = Signal()
     language_selected = Signal(str)
     #: ``ورود سریع``: the user asked to be released by a fingerprint scan.
     fingerprint_requested = Signal()
@@ -100,8 +102,12 @@ class UnlockScreen(QMainWindow):
         self.open_button.clicked.connect(self.open_vault_requested.emit)
         self.create_button = QPushButton(self)
         self.create_button.clicked.connect(self.create_vault_requested.emit)
+        self.import_button = QPushButton(self)
+        self.import_button.setObjectName("unlock-import")
+        self.import_button.clicked.connect(self.import_vault_requested.emit)
         actions.addWidget(self.open_button)
         actions.addWidget(self.create_button)
+        actions.addWidget(self.import_button)
         layout.addLayout(actions)
 
         self.fingerprint_enable_button = QPushButton(self)
@@ -284,6 +290,7 @@ class UnlockScreen(QMainWindow):
         self.unlock_button.setText(i18n.tr("unlock.unlock"))
         self.open_button.setText(i18n.tr("unlock.open_another"))
         self.create_button.setText(i18n.tr("unlock.create_new"))
+        self.import_button.setText(i18n.tr("unlock.import"))
         self.fingerprint_button.setText(i18n.tr("unlock.fingerprint"))
         self.fingerprint_enable_button.setText(i18n.tr("unlock.fingerprint_enable"))
         if self._fingerprint_state:

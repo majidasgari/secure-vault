@@ -30,6 +30,11 @@ from ..errors import SyncError
 #: Connection/read timeouts (seconds): a dead endpoint must never hang the UI.
 _CONNECT_TIMEOUT = 5
 _READ_TIMEOUT = 15
+#: A single request carrying a large body (``secure.store`` grows with the search
+#: index and is routinely tens of megabytes) needs a much longer window: a slow link
+#: fills the socket buffer and a 15-second write timeout aborts the upload mid-way.
+_UPLOAD_TIMEOUT = 300
+_LARGE_BODY_BYTES = 1 << 20
 
 _SIGV4_ALGORITHM = "AWS4-HMAC-SHA256"
 _SERVICE = "s3"
@@ -78,6 +83,17 @@ class S3Config:
             access_key=str(credentials.get("access_key") or ""),
             secret_key=str(credentials.get("secret_key") or ""),
         )
+
+
+def request_timeout(body: bytes | bytearray | None) -> int:
+    """Return the socket timeout (seconds) for a request carrying ``body``.
+
+    Small metadata calls keep the short timeout so an unreachable endpoint fails fast;
+    a large body (the encrypted store) gets the upload timeout instead.
+    """
+    if body and len(body) > _LARGE_BODY_BYTES:
+        return _UPLOAD_TIMEOUT
+    return _READ_TIMEOUT
 
 
 def _md5_hex(data: bytes) -> str:
@@ -286,16 +302,17 @@ class _StdlibBackend:
         )
 
         parsed = urllib.parse.urlsplit(f"{self.scheme}://{self.host}")
+        timeout = request_timeout(body)
         if self.scheme == "https":
             conn: Any = http.client.HTTPSConnection(
                 parsed.hostname,
                 parsed.port,
-                timeout=_READ_TIMEOUT,
+                timeout=timeout,
                 context=ssl.create_default_context(),
             )
         else:
             conn = http.client.HTTPConnection(
-                parsed.hostname, parsed.port, timeout=_READ_TIMEOUT
+                parsed.hostname, parsed.port, timeout=timeout
             )
         try:
             conn.request(method, target, body=body or None, headers=headers)
@@ -493,4 +510,4 @@ def md5_hex(data: bytes) -> str:
     return _md5_hex(data)
 
 
-__all__ = ["S3Config", "S3Client", "backend_kind", "md5_hex"]
+__all__ = ["S3Config", "S3Client", "backend_kind", "md5_hex", "request_timeout"]
