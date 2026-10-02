@@ -289,10 +289,19 @@ class SemanticStoreTest(unittest.TestCase):
         self.assertEqual(self.store.count_files(), 1)
 
     def test_layout_change_wipes_vectors(self) -> None:
-        """A new model/dim/chunking resets the index and recreates the vec table."""
+        """A new model/dim/chunking resets the index and recreates the vec table.
+
+        Since P9 a layout mismatch is **never** wiped implicitly: without ``allow_reset`` the
+        call is refused and the live index is preserved. Only an explicit rebuild (the user's
+        "reindex" action) resets the vectors, which is what this test now checks in order.
+        """
         self.store.ensure_layout("m", 2, "paragraph")
         self.store.replace_file(1, ["x"], [_pack([1.0, 0.0])])
-        self.store.ensure_layout("m2", 3, "sentence")
+        refused = self.store.ensure_layout("m2", 3, "sentence")
+        self.assertFalse(refused["ok"], refused)
+        self.assertEqual(self.store.count_chunks(), 1)
+        reset = self.store.ensure_layout("m2", 3, "sentence", allow_reset=True)
+        self.assertTrue(reset["ok"], reset)
         self.assertEqual(self.store.count_chunks(), 0)
         self.store.replace_file(1, ["x"], [_pack([1.0, 0.0, 0.0])])
         self.assertEqual(self.store.search(_pack([1.0, 0.0, 0.0]), "m2", k=1)[0]["file_id"], 1)

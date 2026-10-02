@@ -96,6 +96,9 @@ class SemanticGuardTest(unittest.TestCase):
             def enqueue(self, path: str) -> None:
                 recorded.append(path)
 
+            def stop(self) -> None:
+                """The session stops the queue on lock/close (nothing to stop here)."""
+
             def stats(self) -> dict:
                 return {"pending": len(recorded), "debounce_ms": 0, "last_error": None}
 

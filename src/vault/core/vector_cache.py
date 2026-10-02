@@ -196,8 +196,17 @@ class VectorCache:
                 ).fetchall()
                 for row in rows:
                     key = bytes(row["key"])
+                    blob = bytes(row["vec"])
+                    # A truncated or foreign-width blob is corruption, not a hit: treating
+                    # it as one would hand the index a vector of the wrong shape (an empty
+                    # one, for a 1-byte row) and poison the nearest-neighbour result.
+                    if len(blob) != self.dim * 4:
+                        self._warn_once(
+                            f"ignoring a corrupt cache row ({len(blob)} bytes, dim {self.dim})"
+                        )
+                        continue
                     found.append(key)
-                    vector = _unpack(bytes(row["vec"]))
+                    vector = _unpack(blob)
                     for position in index_of.get(key, []):
                         hits[position] = vector
             if found:
@@ -249,11 +258,30 @@ class VectorCache:
 
     # --------------------------------------------------------------------- stats
     def _size_bytes(self) -> int:
-        """Return the on-disk size of the cache database."""
+        """Return the on-disk size of the cache database file."""
         try:
             return int(self.path.stat().st_size)
         except OSError:
             return 0
+
+    def _data_bytes(self) -> int:
+        """Return the size of the live data pages (free pages excluded).
+
+        The byte cap is about how much *cached data* is kept, but SQLite reports a
+        shrinking file only after a vacuum — and with ``journal_mode=WAL`` the pages can
+        sit in the ``-wal`` sidecar, so the file size says little about the logical size.
+        Deleting the LRU rows moves their pages onto the freelist, so the live page count
+        is what actually shrinks and what the cap must be measured against.
+        """
+        if self._conn is not None:
+            try:
+                page_count = int(self._conn.execute("PRAGMA page_count").fetchone()[0])
+                free = int(self._conn.execute("PRAGMA freelist_count").fetchone()[0])
+                page_size = int(self._conn.execute("PRAGMA page_size").fetchone()[0])
+                return max(0, page_count - free) * page_size
+            except sqlite3.Error:  # pragma: no cover - fall back to the file size
+                pass
+        return self._size_bytes()
 
     def stats(self) -> dict[str, Any]:
         """Return entry/byte/hit statistics for the settings line."""
@@ -294,7 +322,7 @@ class VectorCache:
                 removed += int(cur.rowcount or 0)
                 self._conn.commit()
             guard = 0
-            while self._size_bytes() > target and guard < 10_000:
+            while self._data_bytes() > target and guard < 10_000:
                 guard += 1
                 rows = self._conn.execute(
                     "SELECT key FROM vectors ORDER BY last_used_at ASC LIMIT 500"

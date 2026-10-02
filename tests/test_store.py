@@ -2,12 +2,11 @@
 
 from __future__ import annotations
 
-import stat
 import tempfile
 import unittest
 from pathlib import Path
 
-from support import tmp_vault
+from support import assert_private_mode, tmp_vault
 from vault.core import semantics
 from vault.core.store import STORE_FILENAME, SecureStore
 from vault.util import normalize_fa
@@ -26,7 +25,7 @@ class SecureStoreTest(unittest.TestCase):
         """Unlock creates store.dec (0600); lock removes it."""
         dec = self.session._store._dec_path
         self.assertTrue(dec.exists())
-        self.assertEqual(stat.S_IMODE(dec.stat().st_mode), 0o600)
+        assert_private_mode(dec)
         self.session.lock()
         self.assertFalse(dec.exists())
 

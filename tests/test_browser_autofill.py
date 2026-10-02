@@ -20,7 +20,7 @@ import re
 import unittest
 from pathlib import Path
 
-from support import tmp_vault
+from support import assert_private_mode, tmp_vault
 from vault.api.browser import BrowserBridge
 from vault.api.service import Service
 from vault.core import credentials as creds
@@ -276,10 +276,8 @@ class BridgeTest(unittest.TestCase):
 
     def test_token_file_written_and_removed(self) -> None:
         """The token file lives in the runtime dir with mode 0600 and goes away on stop."""
-        import os
-
         self.assertTrue(self.bridge.token_file.exists())
-        self.assertEqual(os.stat(self.bridge.token_file).st_mode & 0o777, 0o600)
+        assert_private_mode(self.bridge.token_file)
         document = json.loads(self.bridge.token_file.read_text(encoding="utf-8"))
         self.assertEqual(document["token"], self.bridge.token)
         self.bridge.stop()

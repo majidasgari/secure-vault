@@ -29,7 +29,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from ..config import load_sync_config
+from ..config import load_sync_config, user_state_dir
 from ..core.chunking import CHUNK_MODES, DEFAULT_CHUNK_MODE
 from ..core.semantics import folder_included, normalize_folder_key
 from ..util import is_within
@@ -640,7 +640,7 @@ class SettingsDialog(QDialog):
         """Build the Log tab."""
         page = QWidget(self)
         form = QFormLayout(page)
-        self.log_path = Path.home() / ".local" / "state" / "secure-vault" / "daemon.log"
+        self.log_path = user_state_dir() / "daemon.log"
         self.log_edit = QLineEdit(str(self.log_path), page)
         self.log_edit.setReadOnly(True)
         form.addRow(self._label("settings.log_path"), self.log_edit)

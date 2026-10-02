@@ -123,16 +123,16 @@ class ActivityFeedTest(unittest.TestCase):
         """The feed never keeps more than its limit."""
         feed = ActivityFeed(limit=ACTIVITY_LIMIT)
         for index in range(ACTIVITY_LIMIT + 50):
-            feed.add({"ts": index, "kind": "read", "path": f"n{index}"})
+            feed.add({"ts": index, "kind": "read", "source": "mcp", "path": f"n{index}"})
         self.assertEqual(len(feed), ACTIVITY_LIMIT)
         self.assertEqual(feed.events()[0]["ts"], ACTIVITY_LIMIT + 49)
 
     def test_last_read(self) -> None:
         """``last_read`` skips list/search events."""
         feed = ActivityFeed()
-        feed.add({"kind": "list", "path": "x"})
-        feed.add({"kind": "read", "path": "y"})
-        feed.add({"kind": "search", "path": None})
+        feed.add({"kind": "list", "source": "mcp", "path": "x"})
+        feed.add({"kind": "read", "source": "mcp", "path": "y"})
+        feed.add({"kind": "search", "source": "mcp", "path": None})
         self.assertEqual(feed.last_read()["path"], "y")
 
 

@@ -33,7 +33,7 @@ from ..api.service import ActivityFeed, Service
 from ..api.socket_server import VaultSocketServer
 from ..errors import AlreadyExists
 from ..util import now_ms
-from ..config import runtime_dir, user_config
+from ..config import runtime_dir, user_config, user_state_dir
 from ..core.meta import DEFAULT_IMPORT_MIRROR
 from ..errors import Unauthorized, VaultError
 from ..util import normalize_vault_path
@@ -1778,7 +1778,7 @@ class VaultApplication(QObject):
 
     def open_log_file(self) -> None:
         """Open the daemon log file with the desktop handler."""
-        path = Path.home() / ".local" / "state" / "secure-vault" / "daemon.log"
+        path = user_state_dir() / "daemon.log"
         QDesktopServices.openUrl(QUrl.fromLocalFile(str(path)))
 
     def about(self) -> None:

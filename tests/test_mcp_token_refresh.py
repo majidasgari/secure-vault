@@ -94,11 +94,10 @@ class MCPTokenRefreshTest(unittest.TestCase):
         """A client pinned with ``--token``/env keeps its token (no silent swap)."""
         _write_token(self.runtime, CURRENT)
         self._start_bridge(
-            {
-                "XDG_RUNTIME_DIR": str(self.base),
-                "SECURE_VAULT_SOCKET": str(self.daemon.socket_path),
-                "SECURE_VAULT_TOKEN": STALE,
-            }
+            self.daemon.env(
+                XDG_RUNTIME_DIR=str(self.base),
+                SECURE_VAULT_TOKEN=STALE,
+            )
         )
         _write_token(self.runtime, CURRENT)
         response = self.proc.tool("list_folder", {"path": "/"}, id=1)

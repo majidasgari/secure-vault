@@ -11,6 +11,14 @@ tools/bootstrap.sh
 ./bin/secure-vault          # on this machine: QT_QPA_PLATFORM=offscreen ./bin/secure-vault --self-test
 ```
 
+Windows (PowerShell/cmd; `docs/WINDOWS.md` has the full story):
+
+```bat
+uv venv --python 3.12 .venv
+uv pip install --python .venv\Scripts\python.exe -r requirements.txt
+bin\secure-vault.cmd
+```
+
 > **Important:** the master password is never stored and there is no way to recover it.
 
 ---
@@ -36,8 +44,13 @@ set: Python, PySide6, `cryptography`, `argon2-cffi`, `markdown-it-py` and Pygmen
   bidi-correct per block and can open the current note in the browser.
 * The GUI has **not** been verified on a real screen yet — only headless/offscreen.
   Fonts, RTL, tray, notifications and the KDE menu icon must be checked by hand.
-* The Windows portable build is **produced but not verified on Windows** (see
-  `docs/WINDOWS.md`).
+* **Windows is supported**: the same source tree runs on Windows 10+ (the daemon uses a
+  loopback TCP endpoint where CPython has no `AF_UNIX`, the log/config/runtime dirs move to
+  `%LOCALAPPDATA%`/`%APPDATA%`, and the GUI's single-instance guard is a named mutex). The
+  suite is green there and the portable folder produced by the builder was verified by
+  running `--self-test` **inside the built folder**. See `docs/WINDOWS.md`; the pieces that
+  still need a human on Windows are listed in its last section (real-screen GUI, signing,
+  fingerprint, a real S3 remote).
 * S3 folder sync is opt-in and needs no extra package (boto3 is an optional alternative
   backend in `requirements-s3.txt`): a two-way mirror with a cooperative
   lock file, read-only mode plus a manual *Take write access* button, and a **Sync now**
@@ -240,6 +253,19 @@ QT_QPA_PLATFORM=offscreen ./.venv/bin/python tests/test_ui_smoke.py
 ./.venv/bin/python tools/smoke_mcp.py
 ./.venv/bin/python tools/build_windows_portable.py --check         # prints CHECK OK
 ```
+
+On Windows the same commands run with `.venv\Scripts\python.exe`, and the portable build is
+verified from inside its own folder:
+
+```bat
+set PYTHONPATH=
+set QT_QPA_PLATFORM=offscreen
+cd portable\win && python.exe -m vault --self-test               :: SELFTEST OK
+```
+
+The semantic-search suites need the opt-in extra (`pip install -r requirements-semantic.txt`,
+or at least `sqlite-vec`, which is the small half of it); everything else runs with
+`requirements.txt` alone.
 
 The Joplin real-mirror run is opt-in and read-only (see `docs/TESTING.md`). See that
 file for the scratch-vault recipe and the list of things you must verify by hand.

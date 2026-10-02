@@ -14,6 +14,7 @@ import unittest
 from pathlib import Path
 
 from vault import errors
+from vault.config import runtime_dir
 from vault.core import crypto
 from vault.core import index as index_module
 from vault.core import semantics
@@ -106,16 +107,18 @@ class InvariantsTest(unittest.TestCase):
         store = home / "secure.store"
         assert store.exists(), "secure.store missing"
         assert store.read_bytes()[:4] not in (b"SQLi",), "store looks like a raw sqlite file"
-        rtdir = Path(os.environ.get("XDG_RUNTIME_DIR", "/tmp")) / "secure-vault"
+        rtdir = runtime_dir()
         # This session's own decrypted store (the file name is per instance; another vault
         # process — the user's running app or web UI — legitimately holds its own file, so the
         # assertions below are about OUR file, never about "no .dec exists anywhere").
         own = Path(getattr(s.store, "_dec_path"))
         assert own.exists(), f"this session's decrypted store is missing: {own}"
         assert own.parent == rtdir, f"{own} is not under {rtdir}"
-        assert rtdir.exists() and (rtdir.stat().st_mode & 0o777) == 0o700, "runtime dir must be 0700"
-        mode = own.stat().st_mode & 0o777
-        assert mode == 0o600, f"{own} mode {oct(mode)} != 0600"
+        assert rtdir.exists(), "runtime dir was not created"
+        if os.name != "nt":  # Windows has no POSIX mode bits (see docs/WINDOWS.md)
+            assert (rtdir.stat().st_mode & 0o777) == 0o700, "runtime dir must be 0700"
+            mode = own.stat().st_mode & 0o777
+            assert mode == 0o600, f"{own} mode {oct(mode)} != 0600"
         assert home not in own.parents, f"decrypted store inside the vault home: {own}"
         for cand in rtdir.glob("store.*.dec"):
             assert home not in cand.parents, f"a decrypted store sits inside a vault home: {cand}"
@@ -314,7 +317,17 @@ class InvariantsTest(unittest.TestCase):
             raise AssertionError(f"{bad!r}: accepted")
         s.write_file("/etc/passwd", b"not-the-real-one")
         assert s.read_text("etc/passwd") == "not-the-real-one", "absolute form not mapped into the vault"
-        assert Path("/etc/passwd").read_text().splitlines()[0] != "not-the-real-one", "wrote to the host /etc/passwd!"
+        # The API-absolute form must be mapped *into* the vault: prove the host file of the
+        # same name was not touched (Windows has no /etc/passwd, so the equivalent host file
+        # is used where it exists).
+        host_canary = (
+            Path(os.environ.get("SystemRoot", "C:/Windows")) / "win.ini"
+            if os.name == "nt"
+            else Path("/etc/passwd")
+        )
+        if host_canary.is_file():
+            first_line = host_canary.read_text(errors="replace").splitlines()[:1]
+            assert first_line != ["not-the-real-one"], f"wrote to the host file {host_canary}!"
         assert s.read_text("/etc/passwd") == s.read_text("etc/passwd"), "leading-slash identity broken"
         s.write_file("a/./b//c.md", b"norm")
         assert s.read_text("a/b/c.md") == "norm", "'.'/'//' normalization failed"

@@ -51,10 +51,9 @@ class MCPProtocolTest(unittest.TestCase):
         self.session.write_file("notes/vault.md", SECRETFILE_MARKER.encode())
         self.session.set_sensitivity("notes/vault.md", "secretfile")
         self.daemon = fake_daemon(self.session)
-        env = {
-            "SECURE_VAULT_SOCKET": str(self.daemon.socket_path),
-            "SECURE_VAULT_TOKEN": self.daemon.token,
-        }
+        # ``daemon.env()`` publishes the endpoint (socket path or loopback host:port) so
+        # the bridge subprocess reaches the daemon on either transport.
+        env = self.daemon.env()
         self.proc = mcp_stdio(env).__enter__()
         self._initialize()
 
@@ -290,10 +289,7 @@ class MCPProtocolTest(unittest.TestCase):
 
     def test_stdout_carries_only_json(self) -> None:
         """Every stdout line parses as JSON even with --debug diagnostics."""
-        env = {
-            "SECURE_VAULT_SOCKET": str(self.daemon.socket_path),
-            "SECURE_VAULT_TOKEN": self.daemon.token,
-        }
+        env = self.daemon.env()
         with mcp_stdio(env, args=["--debug"]) as proc:
             proc.send(
                 {

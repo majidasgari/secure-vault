@@ -530,13 +530,16 @@ def _spawn(
     (:data:`_DEATH_HOOK`), so no orphan can keep the sensor claimed.
     """
     try:
+        extra: dict[str, Any] = {}
+        if _DEATH_HOOK is not None:  # ``preexec_fn`` is POSIX-only and rejected on Windows
+            extra["preexec_fn"] = _DEATH_HOOK
         proc = subprocess.Popen(  # noqa: S603 - fixed argv, absolute binary from which()
             argv,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
             stdin=subprocess.DEVNULL,
-            preexec_fn=_DEATH_HOOK,
+            **extra,
         )
     except OSError as exc:
         return SpawnResult(None, "", f"{type(exc).__name__}: {exc}")

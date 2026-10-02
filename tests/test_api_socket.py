@@ -11,6 +11,7 @@ from pathlib import Path
 
 from support import fake_daemon, tmp_vault
 from vault.api.client import VaultClient
+from vault.api.transport import Endpoint, unix_sockets_available
 from vault.errors import (
     BadRequest,
     NotFound,
@@ -21,7 +22,7 @@ from vault.errors import (
 
 
 class SocketServerTest(unittest.TestCase):
-    """End-to-end behaviour of the Unix-socket JSON-RPC server."""
+    """End-to-end behaviour of the local JSON-RPC server (socket or loopback TCP)."""
 
     def setUp(self) -> None:
         self.session = tmp_vault()
@@ -34,10 +35,9 @@ class SocketServerTest(unittest.TestCase):
 
     # ------------------------------------------------------------------- helpers
     def _connect(self) -> socket.socket:
-        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        sock.settimeout(5.0)
-        sock.connect(str(self.daemon.socket_path))
-        return sock
+        # The raw connection goes through the daemon's live endpoint, so this suite runs
+        # unchanged on POSIX (Unix socket) and Windows (loopback TCP).
+        return self.daemon.connect(5.0)
 
     @staticmethod
     def _read_response(sock: socket.socket) -> dict:
@@ -69,7 +69,7 @@ class SocketServerTest(unittest.TestCase):
 
     def test_wrong_token_denied_and_logged(self) -> None:
         """A wrong token is rejected and recorded as a socket deny row."""
-        client = VaultClient(socket_path=self.daemon.socket_path, token="deadbeef")
+        client = VaultClient(endpoint=self.daemon.endpoint, token="deadbeef")
         with self.assertRaises(Unauthorized):
             client.call("vault.ping")
         rows = self.session.access_log(limit=10, source="socket")
@@ -164,11 +164,24 @@ class SocketServerTest(unittest.TestCase):
             daemon.stop()
 
     def test_connection_refused_maps_to_not_running(self) -> None:
-        """A missing socket raises VaultNotRunning."""
+        """A missing daemon endpoint raises VaultNotRunning."""
         base = Path(tempfile.mkdtemp(prefix="sv-nosock-"))
-        client = VaultClient(socket_path=base / "missing.sock", token="x")
+        if unix_sockets_available():
+            client = VaultClient(socket_path=base / "missing.sock", token="x")
+        else:
+            # No AF_UNIX on this platform: a closed loopback port is the equivalent case.
+            client = VaultClient(endpoint=Endpoint.tcp("127.0.0.1", 1), token="x")
         with self.assertRaises(VaultNotRunning):
             client.call("vault.ping")
+
+    def test_endpoint_is_published_for_external_clients(self) -> None:
+        """The daemon publishes endpoint.json so a bridge finds the transport."""
+        from vault.api.transport import read_endpoint
+
+        published = read_endpoint(self.daemon.runtime)
+        self.assertIsNotNone(published)
+        self.assertEqual(published.display(), self.daemon.endpoint.display())
+        self.assertFalse(published.display() == "")
 
 
 if __name__ == "__main__":

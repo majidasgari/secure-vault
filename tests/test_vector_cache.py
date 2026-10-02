@@ -88,13 +88,24 @@ class VectorCacheUnitTest(unittest.TestCase):
         self.assertEqual(self.cache.lookup(["alpha"]), {})
 
     def test_prune_evicts_lru(self) -> None:
-        """With a tiny cap the least-recently-used rows are evicted first."""
+        """With a tiny cap the least-recently-used rows are evicted first.
+
+        Rows used in the *current* run are deliberately protected by ``prune`` (so a live
+        index never evicts the vectors it is working with), which is why the cap is applied
+        from a freshly opened handle — the situation the cap actually exists for.
+        """
         for index in range(20):
             self.cache.store([f"text-{index}"], [[float(index), 0.0]])
         self.cache.lookup(["text-19"])
-        removed = self.cache.prune(max_bytes=4096)
-        self.assertGreaterEqual(removed, 1)
-        self.assertLessEqual(self.cache.stats()["bytes"], 65536)
+        self.cache.close()
+        reopened = VectorCache(self.base / "m__2.db", model="m", dim=2, prune_on_open=False)
+        try:
+            removed = reopened.prune(max_bytes=4096)
+            self.assertGreaterEqual(removed, 1)
+            self.assertLess(reopened.stats()["entries"], 20)
+            self.assertLessEqual(reopened.stats()["bytes"], 65536)
+        finally:
+            reopened.close()
 
     def test_clear(self) -> None:
         """clear() removes every row."""
@@ -139,8 +150,11 @@ class VectorCacheIntegrationTest(unittest.TestCase):
         first = self.provider.texts
         self.assertGreater(first, 0)
         before = {h["logical_path"] for h in self.session.search_semantic("alpha")}
+        # The semantic *search* above embeds the query through the same provider, so the
+        # baseline for "did the rebuild embed anything?" is taken after it.
+        baseline = self.provider.texts
         semantics.index_all(self.session, force=True)
-        self.assertEqual(self.provider.texts - first, 0)
+        self.assertEqual(self.provider.texts - baseline, 0)
         after = {h["logical_path"] for h in self.session.search_semantic("alpha")}
         self.assertEqual(before, after)
 

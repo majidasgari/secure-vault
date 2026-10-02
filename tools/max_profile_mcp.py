@@ -30,8 +30,6 @@ from __future__ import annotations
 
 import json
 import os
-import socket
-import urllib.error
 from pathlib import Path
 
 from mcp.server.fastmcp import FastMCP
@@ -59,9 +57,33 @@ class VaultUnavailable(RuntimeError):
 
 def _runtime_dir() -> Path:
     """Mirror ``vault.config.runtime_dir()`` — decrypted scratch lives outside the vault."""
+    import sys
+
     base = os.environ.get("XDG_RUNTIME_DIR")
-    path = Path(base) / "secure-vault" if base else Path("/tmp") / f"secure-vault-{os.getuid()}"
-    return path
+    if base:
+        return Path(base) / "secure-vault"
+    if sys.platform == "win32":
+        local = os.environ.get("LOCALAPPDATA") or str(Path.home() / "AppData" / "Local")
+        return Path(local) / "secure-vault" / "runtime"
+    return Path("/tmp") / f"secure-vault-{os.getuid()}"
+
+
+def _endpoint():
+    """Return the live daemon endpoint (Unix socket, or loopback TCP on Windows)."""
+    import sys
+
+    if sys.platform == "win32":
+        from vault.api.transport import read_endpoint
+
+        published = read_endpoint(_runtime_dir())
+        if published is None or not published.port:
+            raise VaultUnavailable(
+                "VAULT_NOT_RUNNING: برنامهٔ Secure Vault در حال اجرا نیست — آن را باز کن"
+            )
+        return published
+    from vault.api.transport import Endpoint
+
+    return Endpoint.unix(_runtime_dir() / SOCKET_FILENAME)
 
 
 def _token() -> str | None:
@@ -78,16 +100,14 @@ def _roundtrip(method: str, params: dict, token: str | None) -> dict:
     """Send one request line to the daemon socket and return the decoded response."""
     request = {"id": 1, "token": token, "method": method, "params": params}
     payload = json.dumps(request, ensure_ascii=False).encode("utf-8") + b"\n"
-    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    sock.settimeout(30.0)
     try:
-        try:
-            sock.connect(str(_runtime_dir() / SOCKET_FILENAME))
-        except OSError as exc:
-            raise VaultUnavailable(
-                "VAULT_NOT_RUNNING: برنامهٔ Secure Vault در حال اجرا نیست — آن را باز کن "
-                f"({exc})"
-            ) from exc
+        sock = _endpoint().connect(30.0)
+    except OSError as exc:
+        raise VaultUnavailable(
+            "VAULT_NOT_RUNNING: برنامهٔ Secure Vault در حال اجرا نیست — آن را باز کن "
+            f"({exc})"
+        ) from exc
+    try:
         sock.sendall(payload)
         chunks = bytearray()
         while b"\n" not in chunks:

@@ -54,7 +54,14 @@ class UiImportTest(unittest.TestCase):
         self.controller.set_settings({"import_joplin": {"mirror_root": str(self.mirror)}})
 
     def tearDown(self) -> None:
-        """Close the session and drop the scratch tree."""
+        """Stop the in-process servers, close the session and drop the scratch tree."""
+        # ``VaultApplication`` starts the daemon socket server and the web server as soon as a
+        # session is attached; without this the two keep running (and holding ports) for the
+        # rest of the interpreter's life.
+        try:
+            self.controller.shutdown()
+        except Exception:  # noqa: BLE001 - best effort: teardown must not fail a test
+            pass
         try:
             self.session.close()
         except Exception:  # noqa: BLE001 - best effort

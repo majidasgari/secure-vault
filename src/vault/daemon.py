@@ -11,6 +11,7 @@ import argparse
 import json
 import logging
 import logging.handlers
+import os
 import signal
 import sys
 import threading
@@ -18,7 +19,7 @@ from pathlib import Path
 
 from .api.service import Service
 from .api.socket_server import VaultSocketServer
-from .config import DEFAULT_VAULT_HOME, user_config
+from .config import DEFAULT_VAULT_HOME, user_config, user_state_dir
 from .core.session import VaultSession
 
 LOG = logging.getLogger("vault.daemon")
@@ -26,8 +27,6 @@ LOG = logging.getLogger("vault.daemon")
 
 def _resolve_home(explicit: str | None) -> Path:
     """Resolve the vault home from the CLI, the environment or the user config."""
-    import os
-
     if explicit:
         return Path(explicit)
     env_home = os.environ.get("SECURE_VAULT_HOME")
@@ -43,11 +42,15 @@ def _resolve_home(explicit: str | None) -> Path:
 
 
 def _read_unlock_file(path: str) -> str:
-    """Read the master password from a ``0600`` file (never from argv)."""
+    """Read the master password from a ``0600`` file (never from argv).
+
+    On Windows there are no POSIX mode bits (``st_mode`` always reports ``0o666``), so the
+    permission check is POSIX-only; keep the file inside your user profile there.
+    """
     unlock_path = Path(path)
     stat = unlock_path.stat()
     mode = stat.st_mode & 0o777
-    if mode != 0o600:
+    if os.name != "nt" and mode != 0o600:
         raise PermissionError(
             f"unlock file {unlock_path} has mode {oct(mode)}; expected 0o600"
         )
@@ -55,7 +58,7 @@ def _read_unlock_file(path: str) -> str:
 
 
 def _setup_logging(debug: bool) -> None:
-    """Log to stderr and to a rotating file under ``~/.local/state/secure-vault``."""
+    """Log to stderr and to a rotating file under the per-user state directory."""
     level = logging.DEBUG if debug else logging.INFO
     root = logging.getLogger()
     root.setLevel(level)
@@ -64,10 +67,8 @@ def _setup_logging(debug: bool) -> None:
     stream.setFormatter(formatter)
     root.addHandler(stream)
     try:
-        state_dir = Path.home() / ".local" / "state" / "secure-vault"
-        state_dir.mkdir(parents=True, exist_ok=True)
         file_handler = logging.handlers.RotatingFileHandler(
-            state_dir / "daemon.log", maxBytes=1_000_000, backupCount=3
+            user_state_dir() / "daemon.log", maxBytes=1_000_000, backupCount=3
         )
         file_handler.setFormatter(formatter)
         root.addHandler(file_handler)
@@ -129,11 +130,14 @@ def main(argv: list[str] | None = None) -> int:
         session.close()
         return 1
 
-    LOG.info("daemon ready on %s (home=%s, locked=%s)", server.socket_path, home, session.is_locked)
+    LOG.info(
+        "daemon ready on %s (home=%s, locked=%s)", server.address, home, session.is_locked
+    )
     if args.json_events:
         event = {
             "event": "ready",
             "socket": str(server.socket_path),
+            "endpoint": server.endpoint.to_json(),
             "home": str(home),
             "locked": bool(session.is_locked),
         }

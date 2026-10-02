@@ -11,12 +11,12 @@ from __future__ import annotations
 
 import json
 import os
-import select
 import shutil
 import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from pathlib import Path
 from typing import Any
@@ -65,20 +65,17 @@ class MCP:
         self.proc.stdin.flush()
 
     def read_line(self, timeout: float = 10.0) -> bytes:
-        """Read one stdout line."""
+        """Read one stdout line (pipes are read on a thread: Windows ``select`` is socket-only)."""
         deadline = time.time() + timeout
         while b"\n" not in self._buffer:
             remaining = deadline - time.time()
             if remaining <= 0:
                 raise TimeoutError("timed out waiting for the MCP bridge")
             assert self.proc.stdout is not None
-            ready, _, _ = select.select([self.proc.stdout], [], [], remaining)
-            if not ready:
-                raise TimeoutError("timed out waiting for the MCP bridge")
-            chunk = os.read(self.proc.stdout.fileno(), 65536)
+            chunk = _readline_with_deadline(self.proc.stdout, remaining)
             if not chunk:
                 raise EOFError("the MCP bridge exited")
-            self._buffer += chunk
+            self._buffer += chunk if isinstance(chunk, bytes) else chunk.encode("utf-8")
         line, _, self._buffer = self._buffer.partition(b"\n")
         return line
 
@@ -113,15 +110,37 @@ class MCP:
             self.proc.wait(timeout=5.0)
 
 
+def _readline_with_deadline(stream, timeout: float) -> str:
+    """Read one line from ``stream`` with a deadline.
+
+    The read happens on a helper thread: Windows' ``select`` only accepts sockets, so
+    ``select.select([proc.stdout], …)`` fails with ``OSError 10093`` on a pipe handle.
+    """
+    box: list[str] = []
+
+    def reader() -> None:
+        box.append(stream.readline())
+
+    thread = threading.Thread(target=reader, daemon=True)
+    thread.start()
+    thread.join(timeout)
+    if not box:
+        raise TimeoutError("timed out waiting for a line from the daemon")
+    return box[0]
+
+
 def read_daemon_ready(proc: subprocess.Popen, timeout: float = 15.0) -> dict:
     """Wait for the daemon's ``{"event":"ready"}`` JSON line."""
     assert proc.stdout is not None
     deadline = time.time() + timeout
-    while time.time() < deadline:
-        ready, _, _ = select.select([proc.stdout], [], [], deadline - time.time())
-        if not ready:
+    while True:
+        remaining = deadline - time.time()
+        if remaining <= 0:
             break
-        line = proc.stdout.readline()
+        try:
+            line = _readline_with_deadline(proc.stdout, remaining)
+        except TimeoutError:
+            break
         if not line:
             break
         text = line.decode("utf-8", "replace").strip()
@@ -134,6 +153,22 @@ def read_daemon_ready(proc: subprocess.Popen, timeout: float = 15.0) -> dict:
         if isinstance(event, dict) and event.get("event") == "ready":
             return event
     raise TimeoutError("the daemon never reported ready")
+
+
+def stop_daemon(proc: subprocess.Popen, timeout: float = 10.0) -> None:
+    """Ask the daemon to exit the way this platform can.
+
+    POSIX delivers ``SIGTERM`` (which the daemon handles and shuts down cleanly); Windows has
+    no deliverable termination signal, so ``terminate()`` (``TerminateProcess``) is used.
+    """
+    if os.name == "nt":
+        proc.terminate()
+    else:
+        proc.send_signal(signal.SIGTERM)
+    try:
+        proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        proc.kill()
 
 
 def main() -> int:
@@ -263,8 +298,7 @@ def main() -> int:
         step("tools/call request_open_secret", request_open_secret)
 
         def daemon_down() -> None:
-            daemon.send_signal(signal.SIGTERM)
-            daemon.wait(timeout=10.0)
+            stop_daemon(daemon)
             response = bridge.tool("list_folder", {"path": "/"})
             assert response.get("error", {}).get("code") == -32000, response
             assert response["error"]["data"]["code"] == "VAULT_NOT_RUNNING", response
@@ -274,11 +308,7 @@ def main() -> int:
         if bridge is not None:
             bridge.close()
         if daemon.poll() is None:
-            daemon.send_signal(signal.SIGTERM)
-            try:
-                daemon.wait(timeout=10.0)
-            except subprocess.TimeoutExpired:
-                daemon.kill()
+            stop_daemon(daemon)
         shutil.rmtree(scratch, ignore_errors=True)
 
     if _failures:

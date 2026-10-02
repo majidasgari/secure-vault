@@ -18,9 +18,14 @@ class NeedsRtlTest(unittest.TestCase):
         """English-only text is LTR."""
         self.assertFalse(bidi.needs_rtl("English only"))
 
-    def test_persian_starting_with_latin_is_ltr(self) -> None:
-        """A Persian paragraph that starts with a Latin word stays LTR."""
-        self.assertFalse(bidi.needs_rtl("Hello سلام دنیا"))
+    def test_persian_mixed_with_latin_is_rtl(self) -> None:
+        """A paragraph that starts with Latin but contains Persian is RTL.
+
+        The rule is "any Persian/Arabic character ⇒ RTL" (see ``needs_rtl``'s docstring and
+        the farsi-helper addon it mirrors): there is deliberately no first-strong test, so a
+        line that begins with a Latin word is still right-aligned.
+        """
+        self.assertTrue(bidi.needs_rtl("Hello سلام دنیا"))
 
     def test_persian_starting_with_persian_digit_is_rtl(self) -> None:
         """A Persian paragraph starting with a Persian digit is RTL."""

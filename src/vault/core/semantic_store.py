@@ -20,7 +20,7 @@ from typing import Any
 
 from ..config import runtime_dir as default_runtime_dir
 from ..errors import NotFound, ProviderUnavailable
-from ..util import atomic_write_bytes, now_ms
+from ..util import atomic_write_bytes, now_ms, process_alive
 from .crypto import decrypt_blob, encrypt_blob
 
 SEMANTIC_BLOB_ID = "semantic.db"
@@ -79,16 +79,9 @@ def cleanup_stale(runtime: Path, *, keep: Path | None = None) -> list[Path]:
             pid = int(parts[1]) if len(parts) > 2 else -1
         except (IndexError, ValueError):
             pid = -1
-        if pid > 0 and pid != os.getpid():
-            try:
-                os.kill(pid, 0)
-            except ProcessLookupError:
-                pass
-            except PermissionError:
-                continue
-            else:
-                continue
         if pid == os.getpid():
+            continue
+        if pid > 0 and process_alive(pid):
             continue
         try:
             candidate.unlink()

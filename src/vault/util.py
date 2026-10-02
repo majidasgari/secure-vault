@@ -63,6 +63,68 @@ def atomic_write_bytes(path: Path, data: bytes) -> None:
         os.close(dir_fd)
 
 
+def restrict(path: Path | str, mode: int = 0o700) -> None:
+    """Best-effort tightening of ``path``'s permissions.
+
+    POSIX: ``os.chmod``. Windows: a no-op — the runtime/config/data directories live
+    under ``%LOCALAPPDATA%``/``%APPDATA%``, which are already per-user ACL-protected and
+    where ``os.chmod`` only toggles the read-only bit anyway.
+    """
+    if os.name == "nt":
+        return
+    try:
+        os.chmod(path, mode)
+    except OSError:  # pragma: no cover - best effort on exotic filesystems
+        pass
+
+
+def process_alive(pid: int) -> bool:
+    """Return True when a process with ``pid`` is currently running.
+
+    POSIX probes with ``os.kill(pid, 0)``. Windows cannot do that: ``os.kill`` maps every
+    signal except the console events onto ``TerminateProcess`` — ``os.kill(pid, 0)`` there
+    would *kill* the process it is asked about (and raises ``WinError 87`` for a pid it
+    cannot open). The Windows path therefore asks the kernel properly, with
+    ``OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION)`` + ``GetExitCodeProcess``.
+    """
+    try:
+        pid = int(pid)
+    except (TypeError, ValueError):
+        return False
+    if pid <= 0:
+        return False
+    if os.name == "nt":
+        import ctypes
+        from ctypes import wintypes
+
+        ERROR_ACCESS_DENIED = 5
+        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+        STILL_ACTIVE = 259
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        open_process = kernel32.OpenProcess
+        open_process.restype = wintypes.HANDLE
+        open_process.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        handle = open_process(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+        if not handle:
+            # We cannot look at it: either it is gone, or it belongs to another account.
+            # Only the latter is a reason to keep its files.
+            return ctypes.get_last_error() == ERROR_ACCESS_DENIED
+        try:
+            code = wintypes.DWORD()
+            if kernel32.GetExitCodeProcess(handle, ctypes.byref(code)):
+                return code.value == STILL_ACTIVE
+            return True
+        finally:
+            kernel32.CloseHandle(handle)
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:  # pragma: no cover - another user's live process
+        return True
+    return True
+
+
 def normalize_logical_path(raw: str) -> str:
     """Return the canonical POSIX relative path for ``raw``.
 
@@ -214,6 +276,8 @@ def wipe(buf: bytearray) -> None:
 
 __all__ = [
     "atomic_write_bytes",
+    "restrict",
+    "process_alive",
     "normalize_logical_path",
     "normalize_fa",
     "is_within",

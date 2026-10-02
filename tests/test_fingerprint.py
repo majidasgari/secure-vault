@@ -10,11 +10,13 @@ import base64
 import json
 import os
 import sys
+import tempfile
 import threading
 import unittest
+from pathlib import Path
 from unittest import mock
 
-from support import DEFAULT_PASSWORD, scratch_home
+from support import DEFAULT_PASSWORD, assert_private_mode, scratch_home
 from vault.core import fingerprint
 from vault.core.session import VaultSession
 from vault.errors import Unauthorized
@@ -117,8 +119,8 @@ class RecordTest(FingerprintTestBase):
         self.assertEqual(state["fingers"], ["right-index-finger"])
 
         record = fingerprint.record_path(self.home)
-        self.assertEqual(record.stat().st_mode & 0o777, 0o600)
-        self.assertEqual(fingerprint.device_key_path().stat().st_mode & 0o777, 0o600)
+        assert_private_mode(record)
+        assert_private_mode(fingerprint.device_key_path())
         self.assertNotIn(base64.b64encode(master).decode(), record.read_text())
 
         self.session.close()
@@ -248,6 +250,21 @@ class SessionQuickUnlockTest(FingerprintTestBase):
 class VerifyTest(unittest.TestCase):
     """Parsing of the ``fprintd`` client output (no sensor involved)."""
 
+    def setUp(self) -> None:
+        """Pretend the ``fprintd`` CLI is installed.
+
+        ``verify()``/``device_info()`` refuse to spawn anything when the CLI tools are
+        missing, so without this the suite would depend on the developer's machine having
+        a fingerprint reader (and fail on any CI box that does not, Windows included).
+        ``_spawn`` is mocked in every test here, so nothing is ever executed.
+        """
+        self._available = mock.patch.object(fingerprint, "fprintd_available", return_value=True)
+        self._available.start()
+
+    def tearDown(self) -> None:
+        """Restore the real availability probe."""
+        self._available.stop()
+
     def test_match_output_is_a_match(self) -> None:
         with mock.patch.object(
             fingerprint, "_spawn", return_value=fingerprint.SpawnResult(0, MATCH_OUTPUT)
@@ -345,10 +362,12 @@ class VerifyTest(unittest.TestCase):
 
 
 class SpawnTest(unittest.TestCase):
-    """The real ``_spawn`` (short-lived ``true``/``false`` commands, no fprintd)."""
+    """The real ``_spawn`` (short-lived interpreter commands, no fprintd)."""
 
     def test_spawn_captures_output_and_code(self) -> None:
-        result = fingerprint._spawn(["/bin/echo", "verify-match"], timeout=5)
+        result = fingerprint._spawn(
+            [sys.executable, "-c", "print('verify-match')"], timeout=15
+        )
         self.assertEqual(result.returncode, 0)
         self.assertIn("verify-match", result.stdout)
 
@@ -366,7 +385,8 @@ class SpawnTest(unittest.TestCase):
         self.assertTrue(result.cancelled)
 
     def test_spawn_reports_a_missing_binary(self) -> None:
-        result = fingerprint._spawn(["/nonexistent/fprintd-verify"], timeout=5)
+        missing = str(Path(tempfile.gettempdir()) / "sv-no-such-dir" / "fprintd-verify")
+        result = fingerprint._spawn([missing], timeout=5)
         self.assertIsNone(result.returncode)
         self.assertIn("FileNotFoundError", result.stderr)
 

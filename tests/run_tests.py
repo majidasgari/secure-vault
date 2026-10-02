@@ -10,7 +10,9 @@ from __future__ import annotations
 
 import argparse
 import importlib
+import os
 import sys
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -90,7 +92,20 @@ def main(argv: list[str] | None = None) -> int:
         f"{'TOTAL':<36}{total_tests:>7}{total_failures:>10}{total_errors:>8}"
         f"{total_time:>9.2f}s"
     )
-    return 1 if (total_failures or total_errors) else 0
+    status = 1 if (total_failures or total_errors) else 0
+    # On Windows the interpreter *faults* (access violation) when it finalises while a server
+    # thread is still parked inside a socket select — every suite having stopped its server is
+    # not enough, because the thread can be mid-teardown. POSIX tolerates that, which is why
+    # this shows up only here. Name the stragglers (so a real leak is visible, not hidden)
+    # and exit with the runner's own status instead of a crash code.
+    lingering = sorted(
+        thread.name for thread in threading.enumerate() if thread is not threading.main_thread()
+    )
+    if lingering:
+        print(f"note: threads still alive at exit: {', '.join(lingering)}")
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(status)
 
 
 if __name__ == "__main__":

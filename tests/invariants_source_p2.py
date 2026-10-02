@@ -4,22 +4,57 @@
 #!/usr/bin/env python3
 """Independent adversarial verification of P2 (orchestrator-written, black-box).
 
-Drives the real headless daemon over its real Unix socket and the real MCP stdio bridge.
+Drives the real headless daemon over its real local endpoint (a Unix socket on POSIX, a
+loopback TCP port on Windows — see vault/api/transport.py) and the real MCP stdio bridge.
 """
 from __future__ import annotations
-import json, os, socket, subprocess, sys, tempfile, time, signal, traceback
+import json, os, subprocess, sys, tempfile, time, signal, traceback
 from pathlib import Path
 
-ROOT = Path("/data/Codes/secure-vault")
+# The checkout this script lives in (it used to be hard-coded to /data/Codes/secure-vault).
+ROOT = Path(os.environ.get("SECURE_VAULT_ROOT") or Path(__file__).resolve().parents[1])
 sys.path.insert(0, str(ROOT / "src"))
-PY = ROOT / ".venv" / "bin" / "python"
+PY = Path(sys.executable)
 PW = "verify-p2-passphrase"
+
+from vault.api.transport import (  # noqa: E402 - after sys.path setup
+    SOCKET_FILENAME,
+    Endpoint,
+    read_endpoint,
+)
+
+POSIX = os.name != "nt"
+
+
+def rundir_of(xdg: str) -> Path:
+    """Return the app's runtime dir under the ``XDG_RUNTIME_DIR`` the daemon is given."""
+    return Path(xdg) / "secure-vault"
+
+
+def endpoint_of(xdg: str) -> Endpoint:
+    """Return the live endpoint: the published one, else the conventional per-platform one."""
+    rundir = rundir_of(xdg)
+    published = read_endpoint(rundir)
+    if published is not None and (published.is_unix or published.port):
+        return published
+    return Endpoint.unix(rundir / SOCKET_FILENAME)
+
+
+def dial(target, timeout: float = 20.0):
+    """Return a connected socket to ``target`` (an endpoint, or a legacy socket path)."""
+    endpoint = target if isinstance(target, Endpoint) else None
+    if endpoint is None:
+        endpoint = Endpoint.parse(str(target))
+    return endpoint.connect(timeout)
+
 
 tmp = Path(tempfile.mkdtemp(prefix="sv-p2-"))
 rt = tmp / "runtime"; rt.mkdir(mode=0o700)
 rt_locked = tmp / "runtime-locked"; rt_locked.mkdir(mode=0o700)
 home = tmp / "home"
-pwfile = tmp / "pw"; pwfile.write_text(PW); os.chmod(pwfile, 0o600)
+pwfile = tmp / "pw"; pwfile.write_text(PW)
+if POSIX:
+    os.chmod(pwfile, 0o600)
 env = dict(os.environ, XDG_RUNTIME_DIR=str(rt), SECURE_VAULT_HOME=str(home), PYTHONPATH=str(ROOT / "src"))
 
 PASS, FAIL = [], []
@@ -30,9 +65,9 @@ def check(name, fn):
         FAIL.append((name, e)); print(f"FAIL  {name}: {type(e).__name__}: {e}")
         traceback.print_exc(limit=4)
 
-def raw_call(sock_path, obj, timeout=20):
-    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM); s.settimeout(timeout)
-    s.connect(str(sock_path))
+def raw_call(target, obj, timeout=20):
+    """Send one JSON line to the daemon and return the decoded response."""
+    s = dial(target, timeout)
     s.sendall((json.dumps(obj) + "\n").encode())
     buf = b""
     while b"\n" not in buf:
@@ -47,21 +82,70 @@ def start_daemon(env_over, unlock=True, extra=()):
     if unlock: cmd += ["--unlock-file", str(pwfile)]
     cmd += list(extra)
     p = subprocess.Popen(cmd, env=env_over, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, cwd=str(ROOT))
-    # wait for the ready event
+    # wait for the published endpoint to answer
     deadline = time.time() + 45
-    sock_path = Path(env_over["XDG_RUNTIME_DIR"]) / "secure-vault" / "daemon.sock"
+    xdg = env_over["XDG_RUNTIME_DIR"]
+    rundir = rundir_of(xdg)
     while time.time() < deadline:
         if p.poll() is not None:
             raise AssertionError(f"daemon exited early rc={p.returncode}: {p.stderr.read()[-800:]}")
-        if sock_path.exists():
+        endpoint = endpoint_of(xdg)
+        ready = (rundir / SOCKET_FILENAME).exists() if endpoint.is_unix else bool(endpoint.port)
+        if ready:
             try:
-                r = raw_call(sock_path, {"id": 1, "token": "x", "method": "vault.ping", "params": {}})
+                r = raw_call(endpoint, {"id": 1, "token": "x", "method": "vault.ping", "params": {}})
                 if r.get("error", {}).get("code") == "UNAUTHORIZED":
-                    return p, sock_path, Path(env_over["XDG_RUNTIME_DIR"]) / "secure-vault"
+                    return p, endpoint, rundir
             except Exception:
                 pass
         time.sleep(0.3)
     raise AssertionError("daemon did not become ready in time")
+
+def stop_daemon(proc, *, expect_clean_exit: bool = True) -> int:
+    """Stop the daemon the way the platform can (SIGTERM, or TerminateProcess on Windows)."""
+    if POSIX:
+        proc.send_signal(signal.SIGTERM)
+    else:
+        proc.terminate()
+    rc = proc.wait(timeout=30)
+    if expect_clean_exit and POSIX:
+        assert rc == 0, f"daemon exit code {rc}"
+    return rc
+
+def assert_endpoint_gone(endpoint: Endpoint, rundir: Path) -> None:
+    """The daemon must have stopped serving.
+
+    POSIX: the socket file is gone. Windows: there is no socket file, so the real question is
+    whether the daemon still *answers* — a socket that was just killed can leave the port in a
+    state where a connect neither completes nor refuses immediately, so the check sends a
+    request and requires that no live daemon replies.
+    """
+    if endpoint.is_unix:
+        assert not endpoint.path.exists(), "socket left behind"
+        return
+    time.sleep(0.3)  # let the killed process's listening socket finish tearing down
+    live = read_endpoint(rundir)
+    if live is None or not live.port:
+        return
+    try:
+        probe = dial(live, 2.0)
+    except OSError:
+        return  # nothing is listening any more
+    try:
+        probe.sendall(
+            (json.dumps({"id": 1, "token": "x", "method": "vault.ping", "params": {}}) + "\n").encode()
+        )
+        probe.settimeout(2.0)
+        try:
+            answer = probe.recv(65536)
+        except OSError:
+            return  # accepted, but nothing alive behind it
+    finally:
+        probe.close()
+    if answer.strip():
+        raise AssertionError(
+            f"daemon still answering on {live.display()} after shutdown: {answer[:120]!r}"
+        )
 
 def token_of(rundir: Path) -> str:
     return json.loads((rundir / "tokens.json").read_text())["mcp"]
@@ -79,8 +163,9 @@ def t01_start_and_perms():
     p, sock, rundir = start_daemon(env)
     state.update(p=p, sock=sock, rundir=rundir, token=token_of(rundir))
     assert (rundir / "tokens.json").exists()
-    assert (rundir / "tokens.json").stat().st_mode & 0o777 == 0o600, "tokens.json mode wrong"
-    assert sock.stat().st_mode & 0o777 == 0o600, f"socket mode {oct(sock.stat().st_mode & 0o777)}"
+    if POSIX:  # Windows has no POSIX mode bits (skills: docs/WINDOWS.md)
+        assert (rundir / "tokens.json").stat().st_mode & 0o777 == 0o600, "tokens.json mode wrong"
+        assert sock.path.stat().st_mode & 0o777 == 0o600, f"socket mode {oct(sock.path.stat().st_mode & 0o777)}"
 check("01 daemon starts, socket+tokens 0600", t01_start_and_perms)
 
 def t02_bad_token():
@@ -89,7 +174,7 @@ def t02_bad_token():
     r = raw_call(state["sock"], {"id": 2, "method": "vault.status", "params": {}})
     assert r["error"]["code"] == "UNAUTHORIZED", r
     # malformed line
-    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM); s.connect(str(state["sock"]))
+    s = dial(state["sock"], 20)
     s.sendall(b"not-json-at-all\n"); buf = s.recv(65536); s.close()
     got = json.loads(buf.decode().splitlines()[0])
     assert got["error"]["code"] == "BAD_REQUEST", got
@@ -262,16 +347,15 @@ def t06_locked_daemon():
     assert r["ok"] is True, f"filename search should work while locked: {r}"
     r = call("vault.search_text", query="body")
     assert r["ok"] is False and r["error"]["code"] == "VAULT_LOCKED", r
-    p.send_signal(signal.SIGTERM); rc = p.wait(timeout=30)
-    assert rc == 0, f"locked daemon exit code {rc}"
-    assert not sock.exists(), "socket left behind"
-check("06 locked daemon: metadata yes, content no, clean SIGTERM", t06_locked_daemon)
+    stop_daemon(p)
+    assert_endpoint_gone(sock, rundir)
+check("06 locked daemon: metadata yes, content no, clean shutdown", t06_locked_daemon)
 
 def t07_mcp_when_daemon_down():
     proc = state["mcp"]
     # stop the main daemon, then ask the bridge for content
-    state["p"].send_signal(signal.SIGTERM); assert state["p"].wait(timeout=30) == 0
-    assert not state["sock"].exists(), "socket left behind after SIGTERM"
+    stop_daemon(state["p"])
+    assert_endpoint_gone(state["sock"], state["rundir"])
     proc.stdin.write(json.dumps({"jsonrpc": "2.0", "id": 30, "method": "tools/call",
                                  "params": {"name": "list_folder", "arguments": {"path": "/"}}}) + "\n")
     proc.stdin.flush()
@@ -286,9 +370,13 @@ check("07 VAULT_NOT_RUNNING when the daemon is down; stdout stays pure JSON", t0
 
 def t08_client_errors():
     from vault.api.client import VaultClient
-    c = VaultClient(socket_path=Path("/tmp/definitely-not-there.sock"), token="x", timeout=3)
+    if POSIX:
+        client = VaultClient(socket_path=Path(tempfile.gettempdir()) / "definitely-not-there.sock", token="x", timeout=3)
+    else:
+        # No AF_UNIX here: a closed loopback port is the equivalent "nothing is listening".
+        client = VaultClient(endpoint=Endpoint.tcp("127.0.0.1", 1), token="x", timeout=3)
     try:
-        c.call("vault.status")
+        client.call("vault.status")
     except Exception as e:
         assert getattr(e, "code", None) == "VAULT_NOT_RUNNING", f"got {type(e).__name__}: {e}"
     else:

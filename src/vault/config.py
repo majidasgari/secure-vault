@@ -4,14 +4,36 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from .util import atomic_write_bytes
+from .util import atomic_write_bytes, restrict
 
-DEFAULT_VAULT_HOME = os.environ.get("SECURE_VAULT_HOME") or "/data/Cloud/SecureVault"
+WINDOWS = sys.platform == "win32"
+"""True on Windows, where the XDG directories do not exist."""
+
+
+def _windows_dir(variable: str, fallback: str) -> Path:
+    """Return ``%<variable>%`` on Windows, falling back to ``~/<fallback>``."""
+    value = os.environ.get(variable)
+    if value:
+        return Path(value)
+    return Path.home() / fallback
+
+
+def _default_vault_home() -> str:
+    """Return the platform default vault home (a synced, user-visible folder)."""
+    if WINDOWS:
+        documents = Path.home() / "Documents"
+        base = documents if documents.is_dir() else Path.home()
+        return str(base / "SecureVault")
+    return "/data/Cloud/SecureVault"
+
+
+DEFAULT_VAULT_HOME = os.environ.get("SECURE_VAULT_HOME") or _default_vault_home()
 """Default vault home; overridable at process start via ``SECURE_VAULT_HOME``."""
 
 DEFAULT_PLAIN_THRESHOLD = 10 * 1024 * 1024
@@ -30,19 +52,20 @@ SYNC_CONFIG_FILENAME = "s3.json"
 def runtime_dir() -> Path:
     """Return the per-user runtime directory, creating it with mode ``0700``.
 
-    Honours ``XDG_RUNTIME_DIR`` and falls back to ``/tmp/secure-vault-<uid>``.
-    Decrypted scratch data (store, socket, token, pid) lives here, never in the vault home.
+    Honours ``XDG_RUNTIME_DIR``, falls back to ``%LOCALAPPDATA%\\secure-vault\
+untime``
+    on Windows and to ``/tmp/secure-vault-<uid>`` elsewhere. Decrypted scratch data
+    (store, socket, token, pid) lives here, never in the vault home.
     """
     base = os.environ.get("XDG_RUNTIME_DIR")
     if base:
         path = Path(base) / "secure-vault"
+    elif WINDOWS:
+        path = _windows_dir("LOCALAPPDATA", "AppData/Local") / "secure-vault" / "runtime"
     else:
         path = Path("/tmp") / f"secure-vault-{os.getuid()}"
     path.mkdir(parents=True, exist_ok=True)
-    try:
-        os.chmod(path, 0o700)
-    except OSError:  # pragma: no cover - best effort on exotic filesystems
-        pass
+    restrict(path, 0o700)
     return path
 
 
@@ -51,23 +74,47 @@ def user_config_dir() -> Path:
     base = os.environ.get("XDG_CONFIG_HOME")
     if base:
         return Path(base) / "secure-vault"
+    if WINDOWS:
+        return _windows_dir("APPDATA", "AppData/Roaming") / "secure-vault"
     return Path.home() / ".config" / "secure-vault"
 
 
 def user_data_dir() -> Path:
     """Return the per-user data directory, creating it with mode ``0700``.
 
-    Honours ``XDG_DATA_HOME`` and falls back to ``~/.local/share/secure-vault``. The
-    semantic vector cache lives here by default: it is large, machine-local and
-    rebuildable, so it must not sit in the synced vault home.
+    Honours ``XDG_DATA_HOME``, falls back to ``%LOCALAPPDATA%\\secure-vault\\data`` on
+    Windows and to ``~/.local/share/secure-vault`` elsewhere. The semantic vector cache
+    lives here by default: it is large, machine-local and rebuildable, so it must not sit
+    in the synced vault home.
     """
     base = os.environ.get("XDG_DATA_HOME")
-    path = (Path(base) if base else Path.home() / ".local" / "share") / "secure-vault"
+    if base:
+        root = Path(base)
+    elif WINDOWS:
+        root = _windows_dir("LOCALAPPDATA", "AppData/Local")
+    else:
+        root = Path.home() / ".local" / "share"
+    path = root / "secure-vault"
     path.mkdir(parents=True, exist_ok=True)
-    try:
-        os.chmod(path, 0o700)
-    except OSError:  # pragma: no cover - best effort on exotic filesystems
-        pass
+    restrict(path, 0o700)
+    return path
+
+
+def user_state_dir() -> Path:
+    """Return the per-user state/log directory, creating it with mode ``0700``.
+
+    Honours ``XDG_STATE_HOME``, falls back to ``%LOCALAPPDATA%\\secure-vault\\state`` on
+    Windows and to ``~/.local/state/secure-vault`` elsewhere.
+    """
+    base = os.environ.get("XDG_STATE_HOME")
+    if base:
+        path = Path(base) / "secure-vault"
+    elif WINDOWS:
+        path = _windows_dir("LOCALAPPDATA", "AppData/Local") / "secure-vault" / "state"
+    else:
+        path = Path.home() / ".local" / "state" / "secure-vault"
+    path.mkdir(parents=True, exist_ok=True)
+    restrict(path, 0o700)
     return path
 
 
@@ -166,10 +213,7 @@ def save_sync_config(data: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8")
     atomic_write_bytes(path, payload)
-    try:
-        os.chmod(path, 0o600)
-    except OSError:  # pragma: no cover - best effort on exotic filesystems
-        pass
+    restrict(path, 0o600)
 
 
 def sync_client_id() -> str:
@@ -208,6 +252,7 @@ def app_paths() -> AppPaths:
 
 
 __all__ = [
+    "WINDOWS",
     "DEFAULT_VAULT_HOME",
     "DEFAULT_PLAIN_THRESHOLD",
     "DEFAULT_AUTO_LOCK_SECONDS",
@@ -216,6 +261,7 @@ __all__ = [
     "runtime_dir",
     "user_config_dir",
     "user_data_dir",
+    "user_state_dir",
     "UserConfig",
     "user_config",
     "sync_config_path",

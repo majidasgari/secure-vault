@@ -19,6 +19,7 @@ from typing import Iterator
 
 from .api.client import RefreshingClient, VaultClient
 from .api.mcp_server import MCPServer
+from .api.transport import Endpoint
 
 LOG = logging.getLogger(__name__)
 
@@ -55,7 +56,12 @@ def _parse_args(argv: list[str] | None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         prog="vault.mcp", description="Secure Vault MCP stdio bridge."
     )
-    parser.add_argument("--socket", default=None, help="daemon socket path")
+    parser.add_argument("--socket", default=None, help="daemon socket path (POSIX)")
+    parser.add_argument(
+        "--endpoint",
+        default=None,
+        help="daemon endpoint: 'host:port' or a path to endpoint.json",
+    )
     parser.add_argument("--token", default=None, help="mcp role token")
     parser.add_argument(
         "--selftest", action="store_true", help="run an in-process fake daemon"
@@ -75,14 +81,19 @@ def main(argv: list[str] | None = None) -> int:
     if args.selftest:
         with _selftest_daemon() as server:
             client = VaultClient(
-                socket_path=server.socket_path, token=server.mcp_token  # type: ignore[attr-defined]
+                endpoint=server.endpoint, token=server.mcp_token  # type: ignore[attr-defined]
             )
             return MCPServer(client, debug=args.debug).serve()
 
+    endpoint = args.endpoint or os.environ.get("SECURE_VAULT_ENDPOINT")
     socket_path = args.socket or os.environ.get("SECURE_VAULT_SOCKET")
     token = args.token or os.environ.get("SECURE_VAULT_TOKEN")
-    if socket_path and token:
-        client = VaultClient(socket_path=Path(socket_path), token=token)
+    if (endpoint or socket_path) and token:
+        client = VaultClient(
+            endpoint=Endpoint.parse(endpoint) if endpoint else None,
+            socket_path=Path(socket_path) if socket_path else None,
+            token=token,
+        )
     else:
         # No explicit credentials: read them from the runtime dir, and re-read them if
         # the app restarts mid-session (it rotates the token on every start).

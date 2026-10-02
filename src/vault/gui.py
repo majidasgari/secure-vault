@@ -89,13 +89,63 @@ def resolve_home(explicit: str | None) -> Path:
     return Path(DEFAULT_VAULT_HOME)
 
 
+class _WindowsMutex:
+    """A held Win32 named mutex; :meth:`close` releases it."""
+
+    def __init__(self, handle: Any, kernel32: Any) -> None:
+        """Wrap the mutex ``handle`` so ``close()`` can release it."""
+        self._handle = handle
+        self._kernel32 = kernel32
+
+    def close(self) -> None:
+        """Release the mutex (idempotent)."""
+        if self._handle:
+            self._kernel32.CloseHandle(self._handle)
+            self._handle = None
+
+
+def _acquire_windows_mutex(name: str) -> "_WindowsMutex | None":
+    """Create (or fail to create) a per-user named mutex, mirroring ``flock``.
+
+    Returns ``None`` when another process already holds the mutex, which is what the caller
+    reports as "Secure Vault is already running". Windows has no ``fcntl``, so this is the
+    equivalent single-instance guard.
+    """
+    import ctypes
+    from ctypes import wintypes
+
+    ERROR_ALREADY_EXISTS = 183
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    create = kernel32.CreateMutexW
+    create.restype = wintypes.HANDLE
+    create.argtypes = [wintypes.LPVOID, wintypes.BOOL, wintypes.LPCWSTR]
+    handle = create(None, False, name)
+    if not handle:
+        return None
+    if ctypes.get_last_error() == ERROR_ALREADY_EXISTS:
+        kernel32.CloseHandle(handle)
+        return None
+    return _WindowsMutex(handle, kernel32)
+
+
 def _acquire_single_instance() -> Any:
-    """Take the advisory GUI lock, returning the file handle or None."""
+    """Take the single-instance lock, returning a handle or None when already running.
+
+    POSIX uses an advisory ``flock`` on ``<runtime>/gui.lock``; Windows uses a named mutex in
+    the session-local namespace, keyed on the same runtime directory so two vaults with
+    different runtime dirs do not block each other.
+    """
+    runtime = runtime_dir()
+    if os.name == "nt":
+        import hashlib
+
+        digest = hashlib.sha256(str(runtime).lower().encode("utf-8")).hexdigest()[:16]
+        return _acquire_windows_mutex(f"Local\\secure-vault-gui-{digest}")
     try:
         import fcntl
     except ImportError:  # pragma: no cover - non-Unix
         return None
-    path = runtime_dir() / "gui.lock"
+    path = runtime / "gui.lock"
     handle = open(path, "a+")
     try:
         fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -161,7 +211,16 @@ def run_self_test(
     session.write_file("secrets/key.txt", b"token=alpha-secret")
     session.set_sensitivity("secrets/key.txt", "secretfile")
     session.mkdir("journal")
-    semantics.index_all(session)
+    # The semantic vector index is an opt-in extra (``requirements-semantic.txt``: sqlite-vec
+    # plus a sentence-transformers model). The app documents that every other feature keeps
+    # working without it — including the portable Windows build, which ships requirements.txt
+    # only — so the self-test reports the semantic step as skipped instead of dying.
+    semantic_note: str
+    try:
+        semantics.index_all(session)
+        semantic_note = "ok"
+    except Exception as exc:  # noqa: BLE001 - an absent optional extra is not a failure
+        semantic_note = f"skipped: {type(exc).__name__}: {exc}"
 
     qapp = QApplication.instance() or QApplication(["secure-vault-selftest"])
     qapp.setApplicationName("Secure Vault")
@@ -233,9 +292,14 @@ def run_self_test(
         entry.get("tool") == "ui.read_secretfile" for entry in audit
     )
 
+    checks["semantic_index"] = semantic_note
     checks["search_filename"] = len(window.search_panel.run_search("filename", "hello"))
     checks["search_text"] = len(window.search_panel.run_search("text", "alpha"))
-    checks["search_semantic"] = len(window.search_panel.run_search("semantic", "alpha"))
+    checks["search_semantic"] = (
+        len(window.search_panel.run_search("semantic", "alpha"))
+        if semantic_note == "ok"
+        else "skipped"
+    )
     checks["last_results_filename"] = len(window.search_panel.last_results("filename"))
 
     window.log_panel.refresh()

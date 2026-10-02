@@ -3,13 +3,13 @@
 from __future__ import annotations
 
 import os
-import stat
 import tempfile
 import unicodedata
 import unittest
 from pathlib import Path
 from unittest import mock
 
+from support import assert_private_mode
 from vault import config
 from vault.core.meta import default_settings
 from vault.errors import InvalidPath
@@ -88,15 +88,20 @@ class RuntimeDirTest(unittest.TestCase):
             path = config.runtime_dir()
         self.assertEqual(path, base / "secure-vault")
         self.assertTrue(path.is_dir())
-        self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o700)
+        assert_private_mode(path, 0o700)
 
     def test_fallback_when_unset(self) -> None:
-        """Without XDG_RUNTIME_DIR the fallback path is used."""
+        """Without XDG_RUNTIME_DIR the platform fallback path is used."""
         env = dict(os.environ)
         env.pop("XDG_RUNTIME_DIR", None)
         with mock.patch.dict(os.environ, env, clear=True):
             path = config.runtime_dir()
-        self.assertEqual(path, Path("/tmp") / f"secure-vault-{os.getuid()}")
+        if os.name == "nt":
+            # Windows has no /tmp and no uid: the per-user local app data dir is used.
+            self.assertEqual(path, config._windows_dir("LOCALAPPDATA", "AppData/Local")
+                             / "secure-vault" / "runtime")
+        else:
+            self.assertEqual(path, Path("/tmp") / f"secure-vault-{os.getuid()}")
 
 
 class UserConfigTest(unittest.TestCase):
@@ -142,7 +147,15 @@ class DefaultsAgreeTest(unittest.TestCase):
 
     def test_defaults(self) -> None:
         """DEFAULT_VAULT_HOME and the settings defaults match the SPEC."""
-        self.assertEqual(config.DEFAULT_VAULT_HOME, "/data/Cloud/SecureVault")
+        if os.name == "nt":
+            # The POSIX path does not exist on Windows; the default is a user-visible
+            # folder in the user's Documents (the first-run wizard can change it).
+            self.assertEqual(
+                config.DEFAULT_VAULT_HOME,
+                str(Path.home() / "Documents" / "SecureVault"),
+            )
+        else:
+            self.assertEqual(config.DEFAULT_VAULT_HOME, "/data/Cloud/SecureVault")
         self.assertEqual(config.DEFAULT_PLAIN_THRESHOLD, 10 * 1024 * 1024)
         self.assertEqual(config.DEFAULT_AUTO_LOCK_SECONDS, 900)
         self.assertEqual(config.DEFAULT_LANGUAGE, "fa")

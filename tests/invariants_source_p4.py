@@ -11,9 +11,9 @@ from __future__ import annotations
 import json, os, re, subprocess, sys, tempfile, traceback
 from pathlib import Path
 
-ROOT = Path("/data/Codes/secure-vault")
+ROOT = Path(os.environ.get("SECURE_VAULT_ROOT") or Path(__file__).resolve().parents[1])
 MIRROR = Path("/data/Cloud/Documents/Notes/joplin-mirror")
-PY = ROOT / ".venv" / "bin" / "python"
+PY = Path(sys.executable)
 sys.path.insert(0, str(ROOT / "src"))
 
 PASS, FAIL = [], []

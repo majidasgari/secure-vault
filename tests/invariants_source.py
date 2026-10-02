@@ -10,7 +10,7 @@ from __future__ import annotations
 import os, sys, tempfile, time, traceback
 from pathlib import Path
 
-ROOT = Path("/data/Codes/secure-vault")
+ROOT = Path(os.environ.get("SECURE_VAULT_ROOT") or Path(__file__).resolve().parents[1])
 sys.path.insert(0, str(ROOT / "src"))
 
 from vault.core import crypto, session as session_mod
@@ -77,13 +77,16 @@ def t04_store_encrypted_and_runtime_outside():
     store = home / "secure.store"
     assert store.exists(), "secure.store missing"
     assert store.read_bytes()[:4] not in (b"SQLi",), "store looks like a raw sqlite file"
-    # decrypted store must live outside the vault home, mode 0600
-    rtdir = Path(os.environ.get("XDG_RUNTIME_DIR", "/tmp")) / "secure-vault"
+    # decrypted store must live outside the vault home (mode 0600 where the platform has
+    # POSIX modes; Windows has none — see docs/WINDOWS.md)
+    from vault.config import runtime_dir as _runtime_dir
+    rtdir = _runtime_dir()
     cands = list(rtdir.glob("**/*.dec")) if rtdir.exists() else []
     assert cands, f"no decrypted store under {rtdir}"
     for c in cands:
-        mode = c.stat().st_mode & 0o777
-        assert mode == 0o600, f"{c} mode {oct(mode)} != 0600"
+        if os.name != "nt":
+            mode = c.stat().st_mode & 0o777
+            assert mode == 0o600, f"{c} mode {oct(mode)} != 0600"
         assert home not in c.parents, f"decrypted store inside the vault home: {c}"
     s.lock()
     left = list(rtdir.glob("**/*.dec")) if rtdir.exists() else []

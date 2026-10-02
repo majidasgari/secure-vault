@@ -18,7 +18,7 @@ from typing import Any, Iterable
 
 from ..config import runtime_dir as default_runtime_dir
 from ..errors import NotFound
-from ..util import atomic_write_bytes, normalize_fa, now_ms, sha256_hex
+from ..util import atomic_write_bytes, normalize_fa, now_ms, process_alive, sha256_hex
 from .crypto import decrypt_blob, encrypt_blob
 
 STORE_FILENAME = "secure.store"
@@ -72,17 +72,10 @@ def cleanup_stale(runtime: Path, *, keep: Path | None = None) -> list[Path]:
             pid = int(parts[1]) if len(parts) > 2 else -1
         except (IndexError, ValueError):
             pid = -1
-        if pid > 0 and pid != os.getpid():
-            try:
-                os.kill(pid, 0)
-            except ProcessLookupError:
-                pass
-            except PermissionError:
-                continue
-            else:
-                continue  # the owning process is alive — leave it alone
         if pid == os.getpid():
             continue  # a live store of ours (another instance in this process)
+        if pid > 0 and process_alive(pid):
+            continue  # the owning process is alive — leave it alone
         try:
             candidate.unlink()
             removed.append(candidate)

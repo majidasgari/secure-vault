@@ -19,7 +19,7 @@ import os, sys, tempfile, traceback
 from pathlib import Path
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
-ROOT = Path("/data/Codes/secure-vault")
+ROOT = Path(os.environ.get("SECURE_VAULT_ROOT") or Path(__file__).resolve().parents[1])
 sys.path.insert(0, str(ROOT / "src"))
 
 from PySide6.QtWidgets import QApplication
@@ -159,6 +159,14 @@ def t09_lock_returns_to_unlock():
     assert app.current_screen == "unlock", f"screen after lock: {app.current_screen}"
     assert app.window is None or not app.window.isVisible(), "main window still visible after lock"
 check("09 lock() returns to the unlock screen", t09_lock_returns_to_unlock)
+
+# Stop the in-process socket/web servers before leaving: an interpreter that finalises while a
+# server thread sits in a socket select faults on Windows (access violation) even though every
+# check above passed.
+try:
+    app.shutdown()
+except Exception as e:  # noqa: BLE001 - teardown must not hide a check result
+    print("note: shutdown raised", type(e).__name__, e)
 
 print(f"\n==== SUMMARY: {len(PASS)} passed, {len(FAIL)} failed ====")
 for n, e in FAIL: print("FAILED:", n, "->", e)

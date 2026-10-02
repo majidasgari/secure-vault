@@ -9,10 +9,10 @@ from __future__ import annotations
 
 import json
 import os
-import select
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -94,6 +94,34 @@ def assert_under(path: Path | str, root: Path | str) -> None:
         raise AssertionError(f"{resolved} is not under {root_resolved}")
 
 
+POSIX_MODES = os.name != "nt"
+"""True where ``st_mode`` carries real permission bits (Windows has none)."""
+
+
+def file_mode(path: Path | str) -> int | None:
+    """Return ``stat.S_IMODE`` of ``path``, or ``None`` on a platform without mode bits."""
+    if not POSIX_MODES:
+        return None
+    import stat as _stat
+
+    return _stat.S_IMODE(Path(path).stat().st_mode)
+
+
+def assert_private_mode(path: Path | str, mode: int = 0o600) -> None:
+    """Assert a private POSIX mode where the platform has one.
+
+    On Windows there are no POSIX mode bits at all — ``os.chmod`` only toggles the
+    read-only flag and ``st_mode`` always reports ``0o666``/``0o444`` — so the assertion is
+    skipped there. The equivalent protection on Windows is the per-user ACL of
+    ``%LOCALAPPDATA%``/``%APPDATA%``, where those files live (see ``docs/WINDOWS.md``).
+    """
+    actual = file_mode(path)
+    if actual is None:
+        return
+    if actual != mode:
+        raise AssertionError(f"{path} mode {oct(actual)} != {oct(mode)}")
+
+
 # --------------------------------------------------------------------------- socket
 class FakeDaemon:
     """An in-process socket server with a known ``mcp`` token (SPEC/06 §1)."""
@@ -120,20 +148,42 @@ class FakeDaemon:
 
     @property
     def socket_path(self) -> Path:
-        """The daemon socket path."""
+        """The daemon socket path (POSIX; unused on Windows, where TCP is the transport)."""
         return self.server.socket_path
+
+    @property
+    def endpoint(self) -> Any:
+        """The live endpoint (a Unix socket path or a loopback ``host:port``)."""
+        return self.server.endpoint
 
     @property
     def token(self) -> str:
         """The ``mcp`` role token."""
         return self.server.mcp_token
 
+    def connect(self, timeout: float = 5.0) -> Any:
+        """Return a raw connected socket to the daemon, whatever the transport is."""
+        return self.server.endpoint.connect(timeout)
+
+    def env(self, **extra: str) -> dict[str, str]:
+        """Return env overrides that point a subprocess bridge at this daemon.
+
+        Uses ``SECURE_VAULT_ENDPOINT`` (transport-agnostic: ``host:port`` on Windows, a
+        socket path on POSIX) plus the token, so the MCP protocol tests work on both.
+        """
+        values = {
+            "SECURE_VAULT_ENDPOINT": str(self.endpoint.display()),
+            "SECURE_VAULT_TOKEN": self.token,
+        }
+        values.update({str(key): str(value) for key, value in extra.items()})
+        return values
+
     def client(self, *, role: str = "mcp") -> Any:
         """Return a :class:`VaultClient` bound to this fake daemon."""
         from vault.api.client import VaultClient
 
         token = self.token if role == "mcp" else None
-        return VaultClient(socket_path=self.socket_path, token=token)
+        return VaultClient(endpoint=self.endpoint, token=token)
 
     def stop(self) -> None:
         """Stop the server."""
@@ -179,6 +229,37 @@ class MCPProcess:
             cwd=str(REPO_ROOT),
         )
         self._buffer = b""
+        self._stderr = b""
+        self._lock = threading.Lock()
+        self._data = threading.Event()
+        # Pipes are read by pump threads, not by ``select``: Windows' ``select`` only accepts
+        # sockets and answers OSError 10093 for a pipe handle, which is not a real difference
+        # in the bridge's behaviour.
+        self._pumps = [
+            threading.Thread(target=self._pump, args=("stdout",), daemon=True),
+            threading.Thread(target=self._pump, args=("stderr",), daemon=True),
+        ]
+        for thread in self._pumps:
+            thread.start()
+
+    def _pump(self, which: str) -> None:
+        """Copy one of the child's pipes into memory until it closes."""
+        stream = self.proc.stdout if which == "stdout" else self.proc.stderr
+        assert stream is not None
+        while True:
+            try:
+                chunk = os.read(stream.fileno(), 65536)
+            except OSError:  # pragma: no cover - the pipe died with the child
+                break
+            if not chunk:
+                break
+            with self._lock:
+                if which == "stdout":
+                    self._buffer += chunk
+                else:
+                    self._stderr += chunk
+            self._data.set()
+            self._data.clear()
 
     # ------------------------------------------------------------------ lifecycle
     def __enter__(self) -> "MCPProcess":
@@ -214,20 +295,25 @@ class MCPProcess:
     def read_line(self, timeout: float = 10.0) -> bytes:
         """Read one stdout line from the bridge, or raise on timeout/EOF."""
         deadline = time.time() + timeout
-        while b"\n" not in self._buffer:
+        while True:
+            with self._lock:
+                if b"\n" in self._buffer:
+                    line, _, self._buffer = self._buffer.partition(b"\n")
+                    return line
+            if self.proc.poll() is not None:
+                # The child exited: let the pump threads drain the pipe, then report EOF
+                # (a partial trailing line without a newline is not a response).
+                for thread in self._pumps:
+                    thread.join(timeout=0.5)
+                with self._lock:
+                    if b"\n" in self._buffer:
+                        line, _, self._buffer = self._buffer.partition(b"\n")
+                        return line
+                raise EOFError("the MCP bridge exited unexpectedly")
             remaining = deadline - time.time()
             if remaining <= 0:
                 raise TimeoutError("timed out waiting for an MCP response")
-            assert self.proc.stdout is not None
-            ready, _, _ = select.select([self.proc.stdout], [], [], remaining)
-            if not ready:
-                raise TimeoutError("timed out waiting for an MCP response")
-            chunk = os.read(self.proc.stdout.fileno(), 65536)
-            if not chunk:
-                raise EOFError("the MCP bridge exited unexpectedly")
-            self._buffer += chunk
-        line, _, self._buffer = self._buffer.partition(b"\n")
-        return line
+            self._data.wait(min(0.05, remaining))
 
     def read_response(self, timeout: float = 10.0) -> dict:
         """Read one stdout line and decode it as JSON."""
@@ -250,14 +336,8 @@ class MCPProcess:
 
     def stderr_text(self) -> str:
         """Return whatever the bridge has written to stderr so far."""
-        assert self.proc.stderr is not None
-        try:
-            ready, _, _ = select.select([self.proc.stderr], [], [], 0)
-        except (ValueError, OSError):
-            return ""
-        if not ready:
-            return ""
-        return os.read(self.proc.stderr.fileno(), 65536).decode("utf-8", "replace")
+        with self._lock:
+            return self._stderr.decode("utf-8", "replace")
 
 
 def mcp_stdio(
@@ -280,10 +360,13 @@ __all__ = [
     "DEFAULT_PASSWORD",
     "REPO_ROOT",
     "SRC_ROOT",
+    "POSIX_MODES",
     "scratch_home",
     "tmp_vault",
     "assert_no_plaintext",
     "assert_under",
+    "assert_private_mode",
+    "file_mode",
     "FakeDaemon",
     "fake_daemon",
     "MCPProcess",

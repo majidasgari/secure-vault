@@ -1,7 +1,11 @@
-"""Client for the local Unix-socket JSON-RPC server (SPEC/02 §3).
+"""Client for the local daemon JSON-RPC server (SPEC/02 §3).
 
 Used by the MCP bridge and by any external agent. One short-lived connection per call
 keeps the client stateless; responses are newline-delimited JSON.
+
+The transport is a Unix socket on POSIX and a loopback TCP port on Windows (CPython has no
+``AF_UNIX`` there); :mod:`vault.api.transport` publishes which one is live, so this module
+does not care which platform it runs on.
 """
 
 from __future__ import annotations
@@ -15,6 +19,7 @@ from .. import errors
 from ..config import runtime_dir
 from ..errors import VaultError, VaultNotRunning
 from .socket_server import SOCKET_FILENAME, TOKENS_FILENAME
+from .transport import Endpoint, resolve_endpoint
 
 _DEFAULT_TIMEOUT = 30.0
 
@@ -29,7 +34,7 @@ def _error_class(code: str) -> type[VaultError]:
 
 
 class VaultClient:
-    """Thin JSON-RPC client for ``runtime_dir()/daemon.sock``."""
+    """Thin JSON-RPC client for the daemon endpoint published in the runtime dir."""
 
     def __init__(
         self,
@@ -37,10 +42,25 @@ class VaultClient:
         socket_path: Path | str | None = None,
         token: str | None = None,
         timeout: float = _DEFAULT_TIMEOUT,
+        endpoint: Endpoint | dict[str, Any] | str | None = None,
     ) -> None:
-        """Create a client for ``socket_path`` presenting ``token``."""
+        """Create a client for the daemon endpoint presenting ``token``.
+
+        ``socket_path`` keeps the original POSIX meaning (a Unix socket path); ``endpoint``
+        may be an :class:`~vault.api.transport.Endpoint`, its JSON mapping or ``host:port``.
+        When neither is given the endpoint is resolved from the runtime dir.
+        """
+        if endpoint is not None:
+            self.endpoint = Endpoint.parse(endpoint)
+        elif socket_path is not None:
+            self.endpoint = Endpoint.unix(socket_path)
+        else:
+            self.endpoint = resolve_endpoint(runtime_dir())
+        #: The Unix socket path, kept for callers that only ever run on POSIX.
         self.socket_path = (
-            Path(socket_path) if socket_path is not None else runtime_dir() / SOCKET_FILENAME
+            Path(socket_path)
+            if socket_path is not None
+            else runtime_dir() / SOCKET_FILENAME
         )
         self.token = token
         self.timeout = float(timeout)
@@ -59,10 +79,10 @@ class VaultClient:
         except (OSError, ValueError) as exc:
             raise VaultNotRunning(
                 "daemon is not running — start `secure-vault`",
-                details={"socket": str(runtime / SOCKET_FILENAME)},
+                details={"socket": str(resolve_endpoint(runtime).display())},
             ) from exc
         token = data.get(role) if isinstance(data, dict) else None
-        return cls(socket_path=runtime / SOCKET_FILENAME, token=token)
+        return cls(token=token, endpoint=resolve_endpoint(runtime))
 
     # ---------------------------------------------------------------------- calls
     def call(self, method: str, params: dict | None = None) -> dict:
@@ -103,31 +123,32 @@ class VaultClient:
     def _roundtrip(self, request: dict) -> dict:
         """Open a connection, send one request line and read one response line."""
         payload = json.dumps(request, ensure_ascii=False).encode("utf-8") + b"\n"
-        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        sock.settimeout(self.timeout)
         try:
-            sock.connect(str(self.socket_path))
-        except (FileNotFoundError, ConnectionRefusedError, NotADirectoryError) as exc:
-            sock.close()
-            raise VaultNotRunning(
-                "daemon is not running — start `secure-vault`",
-                details={"socket": str(self.socket_path)},
-            ) from exc
+            sock = self.endpoint.connect(self.timeout)
         except OSError as exc:
-            sock.close()
             raise VaultNotRunning(
                 "daemon is not running — start `secure-vault`",
-                details={"socket": str(self.socket_path), "reason": str(exc)},
+                details={"socket": self.endpoint.display(), "reason": str(exc)},
             ) from exc
         try:
-            sock.sendall(payload)
-            line = self._read_line(sock)
+            try:
+                sock.sendall(payload)
+                line = self._read_line(sock)
+            except OSError as exc:
+                # The connection died mid-request — the daemon was killed, crashed, or the
+                # socket was reset while we were talking to it (both seen after a hard
+                # ``terminate()`` on Windows). That is "the app is not running", not an
+                # Internal error: agents must be able to tell the two apart.
+                raise VaultNotRunning(
+                    "daemon is not running — start `secure-vault`",
+                    details={"socket": self.endpoint.display(), "reason": str(exc)},
+                ) from exc
         finally:
             sock.close()
         if not line:
             raise VaultNotRunning(
                 "daemon closed the connection",
-                details={"socket": str(self.socket_path)},
+                details={"socket": self.endpoint.display()},
             )
         try:
             return json.loads(line.decode("utf-8"))
@@ -170,9 +191,10 @@ class RefreshingClient(VaultClient):
         self._resolved = False
 
     def _resolve(self) -> None:
-        """Copy socket path and token out of ``runtime_dir()`` (raises VaultNotRunning)."""
+        """Copy endpoint and token out of ``runtime_dir()`` (raises VaultNotRunning)."""
         fresh = VaultClient.from_runtime(role="mcp")
         self.socket_path = fresh.socket_path
+        self.endpoint = fresh.endpoint
         self.token = fresh.token
         self._resolved = True
 

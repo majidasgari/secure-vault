@@ -25,6 +25,7 @@ from __future__ import annotations
 import argparse
 import ast
 import configparser
+import importlib.util
 import os
 import re
 import shutil
@@ -267,6 +268,13 @@ def enable_site(dest: Path) -> None:
 
 def pip_install(dest: Path, version: str, index_url: str, trusted_host: str) -> None:
     """Cross-install the Windows wheels (and pip) into ``Lib/site-packages``."""
+    if importlib.util.find_spec("pip") is None:
+        # uv-created venvs ship without pip; the builder needs it for the cross-install.
+        raise SystemExit(
+            "the build interpreter has no pip: install it first, e.g.\n"
+            "  uv pip install --python <venv>/Scripts/python.exe pip\n"
+            "  (or) python -m ensurepip"
+        )
     site_packages = dest / "Lib" / "site-packages"
     site_packages.mkdir(parents=True, exist_ok=True)
     common = [
