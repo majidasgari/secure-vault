@@ -60,10 +60,20 @@ uv pip install --python .venv/Scripts/python.exe -r requirements.txt
 
 Then either:
 
-```bash
-bin\secure-vault.cmd                        # GUI (double-clickable)
-bin\secure-vault-mcp.cmd                    # MCP stdio bridge (for agents)
+```bat
+bin\secure-vault.cmd                        :: GUI (double-clickable)
+bin\secure-vault-mcp.cmd                    :: MCP stdio bridge (for agents)
 bin\secure-vault-web.cmd --home D:\Vault --port 8788
+```
+
+The three launchers detect their layout: a sibling `python.exe` (the portable build), else
+`..\.venv\Scripts\python.exe` (a checkout), else `python` on `PATH`. The same files are
+therefore correct inside `portable\win\bin\` too, and either of these starts the portable
+app:
+
+```bat
+portable\win\secure-vault.cmd
+portable\win\bin\secure-vault.cmd
 ```
 
 or the module form, which is what the launchers call:

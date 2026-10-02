@@ -1,11 +1,15 @@
 @echo off
-rem Secure Vault launcher for a Windows checkout (see docs/WINDOWS.md).
-rem Uses the checkout's own .venv; run tools\bootstrap.sh (git-bash) or
-rem "uv venv && uv pip install -r requirements.txt" once before the first run.
+rem Secure Vault launcher — works from a checkout AND from the portable build.
+rem
+rem Layout detection (docs/WINDOWS.md §2/§3):
+rem   * portable\win\bin\secure-vault.cmd  -> uses ..\python.exe (the embedded interpreter)
+rem   * <repo>\bin\secure-vault.cmd        -> uses ..\.venv\Scripts\python.exe, else python
 setlocal
 set "HERE=%~dp0.."
 set "PYTHONPATH=%HERE%\src"
-if exist "%HERE%\.venv\Scripts\python.exe" (
+if exist "%HERE%\python.exe" (
+  set "PY=%HERE%\python.exe"
+) else if exist "%HERE%\.venv\Scripts\python.exe" (
   set "PY=%HERE%\.venv\Scripts\python.exe"
 ) else (
   set "PY=python"
