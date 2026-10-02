@@ -17,6 +17,8 @@ EXPECTED_TOOLS = {
     "mkdir",
     "file_ops",
     "set_sensitivity",
+    "set_emoji",
+    "emoji_palette",
     "search_filenames",
     "search_text",
     "search_semantic",

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import unittest
 
 from support import DEFAULT_PASSWORD, tmp_vault
@@ -391,3 +392,66 @@ class ServiceLockedModeTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class BinaryReadTest(unittest.TestCase):
+    """``vault.read_file`` with ``binary`` returns the exact bytes, base64-encoded.
+
+    Pictures have no text form: decoding them as UTF-8 raises, so a caller that needs the
+    bytes (the desktop image viewer) asks for them explicitly instead of guessing an encoding.
+    """
+
+    PNG = bytes.fromhex(
+        "89504e470d0a1a0a0000000d4948445200000002000000030806000000"
+        "6e1f0f0a0000000d49444154789c6360606060000000050001069c9e9c"
+        "8c0000000049454e44ae426082"
+    )
+
+    def setUp(self) -> None:
+        self.session = tmp_vault()
+        self.session.write_file("notes/picture.png", self.PNG)
+        self.session.write_file("secrets/scan.png", self.PNG)
+        self.session.set_sensitivity("secrets/scan.png", "secret")
+        self.service = Service(self.session)
+
+    def tearDown(self) -> None:
+        self.session.close()
+
+    def test_binary_read_returns_the_bytes(self) -> None:
+        """The payload carries base64 the caller can decode back to the original file."""
+        result = self.service.dispatch(
+            "vault.read_file", {"path": "/notes/picture.png", "binary": True}, role="ui",
+            session_id="ui",
+        )
+        self.assertEqual(result["encoding"], "base64")
+        self.assertEqual(base64.b64decode(result["content_base64"]), self.PNG)
+        self.assertEqual(result["size"], len(self.PNG))
+        self.assertEqual(result["name"], "picture.png")
+
+    def test_encoding_base64_implies_binary(self) -> None:
+        """Asking for the ``base64`` encoding is the same thing as ``binary``."""
+        result = self.service.dispatch(
+            "vault.read_file", {"path": "/notes/picture.png", "encoding": "base64"},
+            role="ui", session_id="ui",
+        )
+        self.assertEqual(base64.b64decode(result["content_base64"]), self.PNG)
+
+    def test_plain_read_of_a_picture_still_reports_the_error(self) -> None:
+        """Without the flag the caller gets the honest decode error, not mojibake."""
+        with self.assertRaises(BadRequest):
+            self.service.dispatch(
+                "vault.read_file", {"path": "/notes/picture.png"}, role="ui", session_id="ui"
+            )
+
+    def test_binary_read_keeps_the_sensitivity_gate(self) -> None:
+        """A ``secret`` picture still needs the role that may read it."""
+        with self.assertRaises(PermissionDenied):
+            self.service.dispatch(
+                "vault.read_file", {"path": "/secrets/scan.png", "binary": True}, role="mcp",
+                session_id="mcp",
+            )
+        allowed = self.service.dispatch(
+            "vault.read_file", {"path": "/secrets/scan.png", "binary": True}, role="ui",
+            session_id="ui",
+        )
+        self.assertEqual(base64.b64decode(allowed["content_base64"]), self.PNG)

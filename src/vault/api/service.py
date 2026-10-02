@@ -18,12 +18,14 @@ from pathlib import Path
 from typing import Any, Callable, Iterable
 
 from ..core.chunking import CHUNK_MODES
+from ..core import emoji as emoji_mod
 from ..core.semantics import normalize_folder_key
-from ..core.security import LEVELS, SOURCE_MCP, SOURCE_UI
+from ..core.security import LEVELS, SOURCE_BROWSER, SOURCE_MCP, SOURCE_UI
 from ..errors import (
     BadRequest,
     DowngradeForbidden,
     PermissionDenied,
+    ProviderUnavailable,
     VaultError,
     VaultLocked,
 )
@@ -31,14 +33,19 @@ from ..util import is_within, normalize_vault_path, now_ms
 
 ROLE_UI = SOURCE_UI
 ROLE_MCP = SOURCE_MCP
-ROLES = (ROLE_UI, ROLE_MCP)
+#: The browser-autofill bridge. Its method table below is deliberately three entries long: a
+#: hostile browser holding the browser token must not be able to reach a generic read/write.
+ROLE_BROWSER = SOURCE_BROWSER
+ROLES = (ROLE_UI, ROLE_MCP, ROLE_BROWSER)
 
 #: Read-only telemetry that must never write an access-log row.
 #:
 #: The status bar and the log panel poll these while the UI is open. Logging a poll writes a row
 #: per poll (measured: ~1000 rows in 18 minutes — 40 % of the whole log, i.e. the log filled
 #: itself), and the DB grows for as long as anything watches the vault. Refusals and errors are
-#: still logged: only the "allow" row of a pure telemetry read is dropped.
+#: still logged: only the "allow" row of a pure telemetry read is dropped. ``vault.browser_status``
+#: is here because the add-on refreshes its badge from it; ``browser_match`` and
+#: ``browser_reveal`` — the calls that look something up or hand out a password — are never quiet.
 QUIET_METHODS = frozenset(
     {
         "vault.status",
@@ -47,7 +54,9 @@ QUIET_METHODS = frozenset(
         "vault.ping",
         "vault.recent",
         "vault.i18n",
+        "vault.emoji_palette",
         "vault.sync_status",
+        "vault.browser_status",
     }
 )
 
@@ -154,6 +163,15 @@ def _iso(ts: int) -> str:
     return datetime.fromtimestamp(int(ts) / 1000.0, tz=timezone.utc).isoformat()
 
 
+def _default_source(role: str) -> str:
+    """Return the activity ``source`` for a role when the transport passes none."""
+    if role == ROLE_MCP:
+        return SOURCE_MCP
+    if role == ROLE_BROWSER:
+        return SOURCE_BROWSER
+    return "gui"
+
+
 class Service:
     """Wraps :class:`VaultSession` and exposes exactly the commands the transports need."""
 
@@ -166,8 +184,21 @@ class Service:
         """Bind the service to ``session`` and register the secret-request callback."""
         self.session = session
         self._lock = threading.RLock()
+        #: The browser-autofill bridge, attached by the transport that serves it (the web
+        #: server). ``None`` leaves the three ``vault.browser_*`` methods unavailable.
+        self.browser: Any | None = None
         if on_secret_request is not None:
             session.on_secret_request = on_secret_request
+
+    def attach_browser(self, bridge: Any) -> None:
+        """Attach the browser-autofill bridge that serves the ``browser`` role."""
+        self.browser = bridge
+
+    def _require_browser(self) -> Any:
+        """Return the attached browser bridge or raise when none is attached."""
+        if self.browser is None:
+            raise ProviderUnavailable("browser_bridge_unavailable")
+        return self.browser
 
     # ------------------------------------------------------------------ dispatch
     def dispatch(
@@ -212,9 +243,7 @@ class Service:
                     "method_not_allowed", details={"method": method, "role": role}
                 )
             previous_source = getattr(self.session, "_activity_source", None)
-            self.session._activity_source = source or (
-                SOURCE_MCP if role == ROLE_MCP else "gui"
-            )
+            self.session._activity_source = source or _default_source(role)
             previous_suppress = getattr(self.session, "_suppress_log", False)
             self.session._suppress_log = True      # this layer writes the one row for the call
             try:
@@ -312,6 +341,7 @@ class Service:
             "mtime": int(row["mtime"]),
             "sensitivity": row["sensitivity"],
             "tags": tags,
+            "emoji": row.get("emoji"),
             "secret": row["sensitivity"] != "normal",
         }
 
@@ -332,6 +362,8 @@ class Service:
         )
         return {
             "path": _api_path(logical),
+            "name": logical.rsplit("/", 1)[-1],
+            "emoji": row.get("emoji"),
             "content": content,
             "sensitivity": row["sensitivity"],
             "size": int(row["size"]),
@@ -395,12 +427,42 @@ class Service:
         logical = normalize_vault_path(self._text(self._require(params, "path"), param="path"))
         encoding = self._text(params.get("encoding", "utf-8"), param="encoding")
         data = self.session.read_file(logical, source=role, session=session_id)
-        payload = self._read_payload(logical, data, encoding)
+        if bool(params.get("binary")) or encoding.lower() in ("base64", "b64"):
+            # Pictures and other binaries have no text form: hand them over as base64 so the
+            # caller (a Qt image viewer, an importer) gets the exact bytes back.
+            payload = self._binary_read_payload(logical, data)
+        else:
+            payload = self._read_payload(logical, data, encoding)
         try:
             payload["note"] = self.session.file_note(logical, source=role)
         except VaultError:  # noqa: BLE001 - the note is optional
             payload["note"] = None
         return payload
+
+    def _binary_read_payload(self, logical: str, data: bytes) -> dict[str, Any]:
+        """Build a read result carrying base64 bytes instead of decoded text."""
+        row = self.session.index.require_file(logical)
+        try:
+            tags = self.session.index.get_tags(logical)
+        except Exception:  # noqa: BLE001 - tags are best-effort metadata
+            tags = []
+        source_url = next(
+            (tag[len("source:") :] for tag in tags if tag.startswith("source:")),
+            None,
+        )
+        return {
+            "path": _api_path(logical),
+            "name": logical.rsplit("/", 1)[-1],
+            "emoji": row.get("emoji"),
+            "encoding": "base64",
+            "content_base64": base64.b64encode(data).decode("ascii"),
+            "sensitivity": row["sensitivity"],
+            "size": len(data),
+            "mtime": int(row["mtime"]),
+            "created": int(row.get("created", row["mtime"])),
+            "tags": tags,
+            "source_url": source_url,
+        }
 
     def _h_read_lines(self, params: dict, role: str, session_id: str) -> dict:
         logical = normalize_vault_path(self._text(self._require(params, "path"), param="path"))
@@ -510,6 +572,23 @@ class Service:
         self.session.set_tags(logical, [str(tag) for tag in tags], source=role)
         return {"path": _api_path(logical), "tags": [str(tag) for tag in tags]}
 
+    def _h_set_emoji(self, params: dict, role: str, session_id: str) -> dict:
+        """Set or clear the emoji label of a folder/file (``emoji: null`` clears it).
+
+        Returns the whole entry (name, level, size, mtime, tags, emoji) because the caller
+        usually re-renders exactly one row from the answer instead of re-listing the folder.
+        """
+        logical = normalize_vault_path(self._text(self._require(params, "path"), param="path"))
+        label = emoji_mod.normalize(params.get("emoji"))
+        row = self.session.set_emoji(logical, label, source=role)
+        entry = self._entry(row)
+        entry["emoji"] = label
+        return entry
+
+    def _h_emoji_palette(self, params: dict, role: str, session_id: str) -> dict:
+        """Return the built-in emoji palette (grouped; ``group`` is an i18n key)."""
+        return {"groups": emoji_mod.palette()}
+
     def _h_folder_note(self, params: dict, role: str, session_id: str) -> dict:
         logical = normalize_vault_path(self._text(self._require(params, "path"), param="path"))
         note = self.session.folder_note(logical, source=role)
@@ -567,6 +646,29 @@ class Service:
         )
         result["path"] = _api_path(logical)
         return result
+
+    # ------------------------------------------------------------ handlers: browser
+    def _h_browser_status(self, params: dict, role: str, session_id: str) -> dict:
+        """Return the autofill bridge state (metadata only; works while locked)."""
+        return self._require_browser().status()
+
+    def _h_browser_match(self, params: dict, role: str, session_id: str) -> dict:
+        """Return the credential candidates for one page host (never a password)."""
+        host = params.get("host")
+        url = params.get("url")
+        return self._require_browser().match(
+            host if isinstance(host, str) else "",
+            url=url if isinstance(url, str) else None,
+            limit=params.get("limit"),
+        )
+
+    def _h_browser_reveal(self, params: dict, role: str, session_id: str) -> dict:
+        """Return the fields of one matched credential entry (the audited reveal)."""
+        path = self._text(self._require(params, "path"), param="path")
+        host = params.get("host")
+        return self._require_browser().reveal(
+            path, host=host if isinstance(host, str) else None, session_id=session_id
+        )
 
     # ------------------------------------------------------------ handlers: search
     @staticmethod
@@ -728,6 +830,12 @@ class Service:
                 current["allow_lan"] = bool(web["allow_lan"])
             if "open_browser_on_start" in web:
                 current["open_browser_on_start"] = bool(web["open_browser_on_start"])
+        browser = params.get("browser")
+        if isinstance(browser, dict):
+            # The browser-autofill bridge switch (the add-on reads this in its status call).
+            current = settings.setdefault("browser", {})
+            if "enabled" in browser:
+                current["enabled"] = bool(browser["enabled"])
         sync = params.get("sync")
         if isinstance(sync, dict):
             current = settings.setdefault("sync", {})
@@ -861,6 +969,7 @@ class Service:
                 "sensitivity": row["sensitivity"],
                 "size": int(row["size"]),
                 "mtime": int(row["mtime"]),
+                "emoji": row.get("emoji"),
                 "note": None,
                 "_id": int(row["id"]),
                 "note_count": 0,
@@ -951,6 +1060,8 @@ class Service:
         "vault.file_ops": (_h_file_ops, _BOTH),
         "vault.set_sensitivity": (_h_set_sensitivity, _BOTH),
         "vault.set_tags": (_h_set_tags, _BOTH),
+        "vault.set_emoji": (_h_set_emoji, _BOTH),
+        "vault.emoji_palette": (_h_emoji_palette, _BOTH),
         "vault.folder_note": (_h_folder_note, _BOTH),
         "vault.set_folder_note": (_h_set_folder_note, _BOTH),
         "vault.file_note": (_h_file_note, _BOTH),
@@ -984,6 +1095,11 @@ class Service:
         "vault.tree": (_h_tree, _UI_ONLY),
         "vault.all_tags": (_h_all_tags, _BOTH),
         "vault.files_by_tag": (_h_files_by_tag, _BOTH),
+        # Browser autofill: reachable only with the browser token (role ``browser``), never by
+        # the web UI or an agent — see ``api/browser.py`` for what each one may return.
+        "vault.browser_status": (_h_browser_status, ROLE_BROWSER),
+        "vault.browser_match": (_h_browser_match, ROLE_BROWSER),
+        "vault.browser_reveal": (_h_browser_reveal, ROLE_BROWSER),
     }
 
 
@@ -991,6 +1107,7 @@ __all__ = [
     "Service",
     "ROLE_UI",
     "ROLE_MCP",
+    "ROLE_BROWSER",
     "ROLES",
     "ActivityFeed",
     "ACTIVITY_LIMIT",

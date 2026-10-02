@@ -31,14 +31,21 @@ class UnlockScreen(QMainWindow):
     open_vault_requested = Signal()
     create_vault_requested = Signal()
     language_selected = Signal(str)
+    #: ``ورود سریع``: the user asked to be released by a fingerprint scan.
+    fingerprint_requested = Signal()
+    #: ``فعالسازی``: the typed password plus a scan should enable quick unlock.
+    fingerprint_enable_requested = Signal()
+    #: The user typed in the password field (so waiting for a finger is pointless).
+    password_edited = Signal()
 
     def __init__(self, parent: Any = None) -> None:
         """Create the unlock screen."""
         super().__init__(parent)
         self.failed_attempts = 0
         self._locked_until = 0
+        self._scanning = False
+        self._fingerprint_state: dict[str, Any] = {}
         self.setObjectName("unlock-screen")
-
         central = QWidget(self)
         layout = QVBoxLayout(central)
         layout.setContentsMargins(32, 32, 32, 32)
@@ -60,6 +67,7 @@ class UnlockScreen(QMainWindow):
         self.password = QLineEdit(self)
         self.password.setEchoMode(QLineEdit.Password)
         self.password.returnPressed.connect(self._submit)
+        self.password.textEdited.connect(self._emit_password_edited)
         self.password_label = QLabel(self)
         form.addRow(self.password_label, self.password)
         layout.addLayout(form)
@@ -75,6 +83,18 @@ class UnlockScreen(QMainWindow):
         self.unlock_button.clicked.connect(self._submit)
         layout.addWidget(self.unlock_button)
 
+        self.fingerprint_button = QPushButton(self)
+        self.fingerprint_button.setObjectName("unlock-fingerprint")
+        self.fingerprint_button.clicked.connect(self._request_fingerprint)
+        self.fingerprint_button.hide()
+        layout.addWidget(self.fingerprint_button)
+
+        self.fingerprint_status = QLabel(self)
+        self.fingerprint_status.setObjectName("unlock-fingerprint-status")
+        self.fingerprint_status.setWordWrap(True)
+        self.fingerprint_status.hide()
+        layout.addWidget(self.fingerprint_status)
+
         actions = QHBoxLayout()
         self.open_button = QPushButton(self)
         self.open_button.clicked.connect(self.open_vault_requested.emit)
@@ -83,6 +103,18 @@ class UnlockScreen(QMainWindow):
         actions.addWidget(self.open_button)
         actions.addWidget(self.create_button)
         layout.addLayout(actions)
+
+        self.fingerprint_enable_button = QPushButton(self)
+        self.fingerprint_enable_button.setObjectName("unlock-fingerprint-enable")
+        self.fingerprint_enable_button.clicked.connect(self._request_fingerprint_enable)
+        self.fingerprint_enable_button.hide()
+        layout.addWidget(self.fingerprint_enable_button)
+
+        self.fingerprint_hint = QLabel(self)
+        self.fingerprint_hint.setObjectName("unlock-fingerprint-hint")
+        self.fingerprint_hint.setWordWrap(True)
+        self.fingerprint_hint.hide()
+        layout.addWidget(self.fingerprint_hint)
 
         layout.addStretch(1)
         self.language_combo = QComboBox(self)
@@ -141,6 +173,8 @@ class UnlockScreen(QMainWindow):
 
     def _end_backoff(self) -> None:
         """Re-enable input after the backoff window."""
+        if getattr(self, "_scanning", False):
+            return
         self.unlock_button.setEnabled(True)
         self.password.setEnabled(True)
         self.password.setFocus()
@@ -157,6 +191,72 @@ class UnlockScreen(QMainWindow):
         if not self.unlock_button.isEnabled():
             return
         self.unlock_requested.emit(self.password.text())
+
+    def _request_fingerprint(self) -> None:
+        """Emit a quick-unlock request (fingerprint) when idle."""
+        if not self.fingerprint_button.isEnabled():
+            return
+        self.fingerprint_requested.emit()
+
+    def _emit_password_edited(self, _text: str = "") -> None:
+        """Forward a user edit to :attr:`password_edited` (no payload needed)."""
+        self.password_edited.emit()
+
+    def _request_fingerprint_enable(self) -> None:
+        """Emit a request to enable quick unlock with the typed password."""
+        if not self.fingerprint_enable_button.isEnabled():
+            return
+        self.fingerprint_enable_requested.emit()
+
+    # ----------------------------------------------------------- quick unlock
+    def set_fingerprint_state(self, state: dict[str, Any]) -> None:
+        """Reflect the quick-unlock state: sensor availability and a stored record.
+
+        ``state`` comes from :func:`vault.core.fingerprint.quick_unlock_state`: an enabled
+        record shows the «ورود با اثر انگشت» button, a usable sensor without a record
+        shows the enable button, and an unusable sensor explains itself in the hint.
+        """
+        self._fingerprint_state = dict(state or {})
+        available = bool(self._fingerprint_state.get("available"))
+        enabled = bool(self._fingerprint_state.get("enabled"))
+        self.fingerprint_button.setVisible(enabled)
+        self.fingerprint_button.setEnabled(enabled)
+        self.fingerprint_enable_button.setVisible(available and not enabled)
+        self.fingerprint_enable_button.setEnabled(available and not enabled)
+        reason = str(self._fingerprint_state.get("reason") or "")
+        hint = ""
+        if enabled:
+            fingers = ", ".join(self._fingerprint_state.get("fingers") or [])
+            if fingers:
+                hint = i18n.tr("unlock.fingerprint_enabled", fingers=fingers)
+        elif available:
+            hint = i18n.tr("unlock.fingerprint_enable_hint")
+        elif reason in ("no_enrolled_finger",):
+            hint = i18n.tr("unlock.fingerprint_no_enrolment")
+        elif reason in ("fprintd_missing", "no_device"):
+            hint = i18n.tr("unlock.fingerprint_no_sensor")
+        self.fingerprint_hint.setText(hint)
+        self.fingerprint_hint.setVisible(bool(hint))
+        if not enabled:
+            self.set_fingerprint_busy(False)
+
+    def set_fingerprint_busy(self, busy: bool, message: str | None = None) -> None:
+        """Show a scan in progress (buttons disabled) or the outcome ``message``."""
+        self._scanning = bool(busy)
+        self.fingerprint_button.setEnabled(not busy and self.fingerprint_button.isVisible())
+        self.fingerprint_enable_button.setEnabled(
+            not busy and self.fingerprint_enable_button.isVisible()
+        )
+        idle = not busy and self.failed_attempts < _BACKOFF_AFTER
+        self.unlock_button.setEnabled(idle)
+        self.password.setEnabled(idle)
+        text = message or (i18n.tr("unlock.fingerprint_scanning") if busy else "")
+        self.fingerprint_status.setText(text)
+        self.fingerprint_status.setVisible(bool(text))
+
+    def fingerprint_state(self) -> dict[str, Any]:
+        """Return the last state handed to :meth:`set_fingerprint_state`."""
+        return dict(getattr(self, "_fingerprint_state", {}) or {})
 
     def _on_language(self, index: int) -> None:
         """Switch the UI language live and notify listeners."""
@@ -184,6 +284,11 @@ class UnlockScreen(QMainWindow):
         self.unlock_button.setText(i18n.tr("unlock.unlock"))
         self.open_button.setText(i18n.tr("unlock.open_another"))
         self.create_button.setText(i18n.tr("unlock.create_new"))
+        self.fingerprint_button.setText(i18n.tr("unlock.fingerprint"))
+        self.fingerprint_enable_button.setText(i18n.tr("unlock.fingerprint_enable"))
+        if self._fingerprint_state:
+            # Refresh the hint/status wording for the new language.
+            self.set_fingerprint_state(self._fingerprint_state)
         self.language_combo.setItemText(0, i18n.tr("language.fa"))
         self.language_combo.setItemText(1, i18n.tr("language.en"))
 

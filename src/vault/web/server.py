@@ -8,6 +8,7 @@ API.
 
 from __future__ import annotations
 
+import hmac
 import json
 import logging
 import queue
@@ -17,6 +18,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, urlsplit
 
+from ..api.browser import BrowserBridge
 from ..config import app_paths
 from ..util import now_ms
 from .api import Response, WebAPI, json_response
@@ -100,12 +102,22 @@ class _Handler(BaseHTTPRequestHandler):
                 return
             if method == "POST" and path == "/api/session/claim":
                 # Loopback-only convenience: a browser on this machine gets the token instead of
-                # asking the user to copy it out of runtime_dir()/web.token.
+                # asking the user to copy it out of runtime_dir()/web.token. A body of
+                # {"scope": "browser"} asks for the narrow browser-autofill token instead.
                 self._send(
                     self.server.web.api.claim(
-                        self.headers, self.client_address[0], self.server.web.port
+                        self.headers,
+                        self.client_address[0],
+                        self.server.web.port,
+                        self._read_json(),
                     )
                 )
+                return
+            if path.startswith("/api/autofill/"):
+                # Authenticated with the browser token, never the web token.
+                if not self._authorized_browser():
+                    return
+                self._route_autofill(method, path)
                 return
             if path.startswith("/api/"):
                 if not self._authorized():
@@ -169,6 +181,18 @@ class _Handler(BaseHTTPRequestHandler):
         if method == "POST" and path == "/api/session/lock":
             self._send(web.api.lock())
             return
+        if method in ("GET", "HEAD") and path == "/api/session/quick-unlock":
+            self._send(web.api.quick_unlock_info())
+            return
+        if method == "POST" and path == "/api/session/unlock-fingerprint":
+            self._send(web.api.quick_unlock_unlock(self.client_address[0]))
+            return
+        if method == "POST" and path == "/api/session/quick-unlock/enable":
+            self._send(web.api.quick_unlock_enable(self.client_address[0]))
+            return
+        if method == "POST" and path == "/api/session/quick-unlock/disable":
+            self._send(web.api.quick_unlock_disable(self.client_address[0]))
+            return
         self._send_json(404, {"error": {"code": "NOT_FOUND", "message": "unknown_endpoint"}})
 
     # --------------------------------------------------------------------- auth
@@ -190,6 +214,50 @@ class _Handler(BaseHTTPRequestHandler):
             },
         )
         return False
+
+    def _authorized_browser(self) -> bool:
+        """Require the browser-autofill token for ``/api/autofill/*``.
+
+        The web token is deliberately *not* accepted here and the browser token is not accepted
+        anywhere else: the two secrets stay separate, so a compromised browser profile can only
+        reach the three credential methods behind the token it holds.
+        """
+        bridge = getattr(self.server.web, "browser", None)
+        token = self.headers.get("X-Vault-Token")
+        if (
+            bridge is not None
+            and isinstance(token, str)
+            and token
+            and hmac.compare_digest(token, bridge.token)
+        ):
+            return True
+        self.server.web.api.log_bad_browser_token(self.path.split("?", 1)[0])
+        self._send_json(
+            401,
+            {
+                "ok": False,
+                "error": {
+                    "code": "UNAUTHORIZED",
+                    "message": "invalid_token",
+                    "details": {"scope": "browser"},
+                },
+            },
+        )
+        return False
+
+    def _route_autofill(self, method: str, path: str) -> None:
+        """Route one authenticated ``/api/autofill/*`` request."""
+        api = self.server.web.api
+        if method in ("GET", "HEAD") and path == "/api/autofill/status":
+            self._send(api.autofill_status())
+            return
+        if method == "POST" and path == "/api/autofill/match":
+            self._send(api.autofill_match(self._read_json()))
+            return
+        if method == "POST" and path == "/api/autofill/reveal":
+            self._send(api.autofill_reveal(self._read_json()))
+            return
+        self._send_json(404, {"error": {"code": "NOT_FOUND", "message": "not_found"}})
 
     def _token_link(self, token: str) -> None:
         """``GET /?token=…``: set the cookie and redirect to ``/``."""
@@ -363,12 +431,19 @@ class WebServer:
         self.auth = TokenAuth(runtime_dir=runtime_dir, token=token)
         self.events = EventBus()
         self.throttle = throttle if throttle is not None else LoginThrottle()
+        #: The browser-autofill bridge: its own token and exactly three narrow methods
+        #: (``api/browser.py``). The add-on reaches it over this same loopback listener.
+        self.browser = BrowserBridge(service, runtime_dir=runtime_dir)
+        attach = getattr(service, "attach_browser", None)
+        if callable(attach):
+            attach(self.browser)
         self.api = WebAPI(
             service,
             self.auth,
             self.events,
             throttle=self.throttle,
             i18n_dir=i18n_dir,
+            browser=self.browser,
         )
         self.webui_dir = Path(webui_dir) if webui_dir is not None else WEBUI_DIR
         self.assets_dir = (
@@ -415,12 +490,13 @@ class WebServer:
         target.on_activity = _relay
 
     def start(self) -> None:
-        """Write the token file, bind ``host:port`` and serve in a background thread."""
+        """Write the token files, bind ``host:port`` and serve in a background thread."""
         self.attach_activity()
         self._httpd = _ThreadingHTTPServer((self.host, self.port), _Handler)
         self._httpd.web = self
         self.port = int(self._httpd.server_address[1])
         self.auth.write_token_file(extra={"port": self.port})
+        self.browser.start()
         self._thread = threading.Thread(
             target=self._httpd.serve_forever, name="vault-web", daemon=True
         )
@@ -445,6 +521,7 @@ class WebServer:
             self._thread.join(timeout=5.0)
             self._thread = None
         self.auth.remove_token_file()
+        self.browser.stop()
 
     def _autolock_loop(self) -> None:
         """Lock the vault once the UI idle time passes ``auto_lock_seconds``."""

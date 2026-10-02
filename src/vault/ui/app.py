@@ -8,6 +8,7 @@ only for locking, the auto-lock clock and the agent secret-request flow.
 
 from __future__ import annotations
 
+import base64
 import json
 import logging
 import threading
@@ -38,7 +39,7 @@ from ..errors import Unauthorized, VaultError
 from ..util import normalize_vault_path
 from ..web.auth import TOKEN_FILENAME
 from ..web.server import WebServer
-from . import i18n, notifications, theme, viewer
+from . import i18n, image_view, notifications, theme, viewer
 
 LOG = logging.getLogger("vault.ui.app")
 
@@ -58,6 +59,14 @@ from .unlock import UnlockScreen
 from .versions import VersionsDialog
 
 AUTO_LOCK_TICK_MS = 1000
+#: How long the automatic fingerprint scan waits after the unlock screen appears, so the
+#: window is painted and focused before ``fprintd`` starts waiting for a finger.
+AUTO_SCAN_DELAY_MS = 400
+#: How long to wait before offering the sensor again after a scan nobody answered.
+AUTO_SCAN_RETRY_MS = 2500
+#: Scan outcomes that mean "the finger was not there / not recognised" rather than a real
+#: error, so an automatic scan may simply wait again.
+AUTO_SCAN_RETRY_REASONS = frozenset({"timeout", "no_match"})
 #: How often the external-editor helper looks for changes to save back into the vault.
 EXTERNAL_POLL_MS = 1500
 #: How often the import dialog refreshes its percentage from the importer's progress state.
@@ -210,6 +219,8 @@ class VaultApplication(QObject):
     reindex_finished = Signal(object)
     # Emitted from the semantic-index worker thread with the ``indexed``/``skipped`` result.
     semantic_finished = Signal(object)
+    # Emitted from the fingerprint worker thread with the scan outcome / payload.
+    fingerprint_finished = Signal(object)
 
     def __init__(
         self,
@@ -234,6 +245,9 @@ class VaultApplication(QObject):
         self.config = user_config()
         self.language = language
         self.start_minimized = bool(self.config.data.get("start_minimized", False))
+        # Appearance is a client preference: "system" follows the desktop, "dark"/"light"
+        # force it (the desktop's scheme is not always reported to the process).
+        theme.set_preference(self.config.data.get("theme", "system"))
 
         self.session: Any = None
         self.service: Service | None = None
@@ -248,6 +262,11 @@ class VaultApplication(QObject):
         self.hub = DataHub()
         self.window: MainWindow | None = None
         self.unlock_screen: UnlockScreen | None = None
+        #: Last quick-unlock state read for the unlock screen (sensor + record).
+        self.quick_unlock_state: dict[str, Any] = {}
+        #: The running fingerprint scan worker, if any (one scan at a time).
+        self._fingerprint_worker: threading.Thread | None = None
+        self.fingerprint_finished.connect(self._on_fingerprint_finished)
         self.tray: TrayIcon | None = None
         self.current_screen = "none"
         self.confirm_hook: Callable[[str, str], bool] | None = None
@@ -282,6 +301,15 @@ class VaultApplication(QObject):
         self._auto_lock_timer.setInterval(AUTO_LOCK_TICK_MS)
         self._auto_lock_timer.timeout.connect(self._auto_lock_tick)
 
+        #: Single-shot timer that starts an automatic fingerprint scan (see `_arm_auto_scan`).
+        self._auto_scan_timer = QTimer(self)
+        self._auto_scan_timer.setSingleShot(True)
+        self._auto_scan_timer.timeout.connect(self._auto_scan_fire)
+        #: True while a scan is scheduled but has not started yet.
+        self._auto_scan_armed = False
+        #: Cancellation event of the running scan, if any (``fingerprint.verify``).
+        self._fingerprint_cancel: threading.Event | None = None
+
     # ------------------------------------------------------------------ screen
     @property
     def vault_home(self) -> Path:
@@ -290,23 +318,98 @@ class VaultApplication(QObject):
             return Path(self.session.home)
         return self.home
 
-    def show_unlock(self) -> UnlockScreen:
-        """Create (once) and show the unlock screen."""
+    def show_unlock(self, *, auto_scan: bool = True) -> UnlockScreen:
+        """Create (once) and show the unlock screen.
+
+        With ``auto_scan`` (the default) and quick unlock enabled, a fingerprint scan
+        starts on its own shortly after the screen appears, so launching the app goes
+        straight to "put your finger on the sensor".
+        """
         if self.unlock_screen is None:
             self.unlock_screen = UnlockScreen()
             self.unlock_screen.unlock_requested.connect(self.unlock)
             self.unlock_screen.open_vault_requested.connect(self.choose_vault)
             self.unlock_screen.create_vault_requested.connect(self.create_vault)
             self.unlock_screen.language_selected.connect(self.set_language)
+            self.unlock_screen.fingerprint_requested.connect(self.unlock_with_fingerprint)
+            self.unlock_screen.fingerprint_enable_requested.connect(
+                self.enable_fingerprint_unlock
+            )
+            self.unlock_screen.password_edited.connect(self.cancel_fingerprint_scan)
         self.unlock_screen.set_vault_info(i18n.tr("app.title"), str(self.home))
         self.unlock_screen.set_language(self.language)
+        self.refresh_fingerprint_state()
         if self.window is not None:
             self.window.hide()
         self.unlock_screen.show()
         self.current_screen = "unlock"
         if self.tray is not None:
             self.tray.set_locked(True)
+        if auto_scan:
+            self._arm_auto_scan(AUTO_SCAN_DELAY_MS)
         return self.unlock_screen
+
+    def auto_scan_armed(self) -> bool:
+        """True while an automatic fingerprint scan is scheduled (unlock screen waiting)."""
+        return bool(self._auto_scan_armed)
+
+    def _arm_auto_scan(self, delay_ms: int) -> bool:
+        """Schedule an automatic scan when quick unlock is enabled and the screen shows."""
+        state = self.quick_unlock_state or {}
+        if not (state.get("available") and state.get("enabled")):
+            return False
+        if self.unlock_screen is None or not self.unlock_screen.isVisible():
+            return False
+        self._auto_scan_armed = True
+        self._auto_scan_timer.start(max(0, int(delay_ms)))
+        return True
+
+    def cancel_auto_scan(self) -> None:
+        """Stop waiting for a finger (the user is typing the password instead)."""
+        self._auto_scan_timer.stop()
+        self._auto_scan_armed = False
+
+    def cancel_fingerprint_scan(self) -> None:
+        """Stop waiting for a finger *and* end a running scan (its client is killed).
+
+        Used when the user types the password instead, when the vault opens, and on
+        shutdown — a scan that outlives the app would keep the sensor claimed.
+        """
+        self.cancel_auto_scan()
+        cancel = self._fingerprint_cancel
+        self._fingerprint_cancel = None
+        if cancel is not None:
+            cancel.set()
+
+    def _auto_scan_fire(self) -> None:
+        """Start the scheduled scan unless the user took over in the meantime."""
+        self._auto_scan_armed = False
+        if self.current_screen != "unlock" or self.unlock_screen is None:
+            return
+        if self.unlock_screen.password.text():
+            return
+        self.unlock_with_fingerprint(auto=True)
+
+    def refresh_fingerprint_state(self) -> dict[str, Any]:
+        """Read the quick-unlock state and push it into the unlock screen.
+
+        Never raises: an uninitialised vault or a broken sensor simply reports an
+        unavailable state, because the unlock screen must always be able to show up.
+        """
+        from ..core import fingerprint
+
+        state: dict[str, Any] = {"available": False, "enabled": False, "reason": "error"}
+        try:
+            if self.session is not None and not self.session.is_locked:
+                state = self.session.quick_unlock_status()
+            else:
+                state = fingerprint.quick_unlock_state(self.home)
+        except Exception as exc:  # noqa: BLE001 - the screen must never fail to appear
+            LOG.debug("quick unlock state unavailable: %s", exc)
+        self.quick_unlock_state = dict(state)
+        if self.unlock_screen is not None:
+            self.unlock_screen.set_fingerprint_state(state)
+        return state
 
     def attach_session(self, session: Any) -> MainWindow:
         """Bind ``session``, start the socket server and build the main window."""
@@ -418,11 +521,243 @@ class VaultApplication(QObject):
             if self.unlock_screen is not None:
                 self.unlock_screen.show_error(error_message(exc))
             return False
+        self._finish_unlock()
+        return True
+
+    def _finish_unlock(self) -> None:
+        """Hide the unlock screen and attach the (now open) session."""
+        self.cancel_fingerprint_scan()
         if self.unlock_screen is not None:
             self.unlock_screen.reset_failures()
+            self.unlock_screen.set_fingerprint_busy(False)
             self.unlock_screen.hide()
         self.attach_session(self.session)
+
+    # ------------------------------------------------------------- quick unlock
+    def unlock_with_fingerprint(self, *, auto: bool = False) -> bool:
+        """Run a fingerprint scan off the GUI thread; unlock the vault on a match.
+
+        The password is never needed here: the wrapped master key is released by
+        ``vault.core.fingerprint`` only after ``fprintd`` reports a match. ``auto`` marks a
+        scan that started by itself when the unlock screen appeared (see
+        :meth:`_arm_auto_scan`), so its result can quietly keep waiting instead of
+        reporting a failure.
+        """
+        from ..core import fingerprint
+
+        if self._fingerprint_worker is not None:
+            return False
+        if not (self.quick_unlock_state or {}).get("enabled"):
+            if self.unlock_screen is not None:
+                self.unlock_screen.show_error(i18n.tr("unlock.fingerprint_not_enabled"))
+            return False
+        self.cancel_auto_scan()          # a scan the user asked for replaces the wait
+        self._start_fingerprint_worker(
+            self._fingerprint_unlock_worker,
+            {"action": "unlock", "fingerprint": fingerprint, "auto": auto},
+        )
         return True
+
+    def enable_fingerprint_unlock(self) -> bool:
+        """Enable quick unlock from the unlock screen: typed password + one scan."""
+        if self._fingerprint_worker is not None:
+            return False
+        password = self.unlock_screen.password.text() if self.unlock_screen is not None else ""
+        if not password:
+            if self.unlock_screen is not None:
+                self.unlock_screen.show_error(i18n.tr("unlock.fingerprint_password_required"))
+            return False
+        from ..core import fingerprint
+
+        self._start_fingerprint_worker(
+            self._fingerprint_enable_worker,
+            {"action": "enable", "fingerprint": fingerprint, "password": password},
+        )
+        return True
+
+    def _start_fingerprint_worker(
+        self, target: Callable[..., None], args: dict[str, Any]
+    ) -> None:
+        """Show the scanning state and run ``target`` in a daemon thread."""
+        if self.unlock_screen is not None:
+            self.unlock_screen.clear_error()
+            self.unlock_screen.set_fingerprint_busy(True)
+        cancel = threading.Event()
+        args = dict(args)
+        args["cancel"] = cancel
+        self._fingerprint_cancel = cancel
+        worker = threading.Thread(
+            target=target, args=(args,), name="vault-fingerprint", daemon=True
+        )
+        self._fingerprint_worker = worker
+        worker.start()
+
+    def _fingerprint_unlock_worker(self, args: dict[str, Any]) -> None:
+        """Scan a finger and unwrap the master key (worker thread)."""
+        fingerprint = args["fingerprint"]
+        payload: dict[str, Any] = {
+            "action": "unlock",
+            "ok": False,
+            "reason": "error",
+            "key": None,
+            "auto": bool(args.get("auto")),
+        }
+        try:
+            verification = fingerprint.verify(cancel=args.get("cancel"))
+            payload["reason"] = verification.reason
+            payload["message"] = verification.message
+            payload["fingers"] = list(verification.fingers)
+            if verification.matched:
+                payload["key"] = fingerprint.release_master_key(self.home, verification)
+                payload["ok"] = True
+        except VaultError as exc:
+            payload["reason"] = str(exc.details.get("reason") or exc.code)
+            payload["message"] = error_message(exc)
+        except Exception as exc:  # noqa: BLE001 - a scan must never crash the app
+            payload["message"] = error_message(exc)
+        self.fingerprint_finished.emit(payload)
+
+    def _fingerprint_enable_worker(self, args: dict[str, Any]) -> None:
+        """Verify the password, scan a finger and store the wrapped key (worker thread)."""
+        fingerprint = args["fingerprint"]
+        payload: dict[str, Any] = {
+            "action": "enable",
+            "ok": False,
+            "unlocked": False,
+            "reason": "error",
+            "key": None,
+        }
+        session = self.session
+        try:
+            if session is None:
+                session = self._session_loader(self.home) if self._session_loader else None
+            if session is None:
+                payload["reason"] = "no_session"
+                self.fingerprint_finished.emit(payload)
+                return
+            if session.is_locked:
+                session.unlock(args["password"])
+            self.session = session
+            payload["unlocked"] = True
+            verification = fingerprint.verify(cancel=args.get("cancel"))
+            payload["reason"] = verification.reason
+            payload["message"] = verification.message
+            payload["fingers"] = list(verification.fingers)
+            if verification.matched:
+                payload["state"] = session.quick_unlock_enable(verification)
+                payload["ok"] = True
+        except Unauthorized:
+            payload["reason"] = "bad_password"
+        except VaultError as exc:
+            payload["reason"] = str(exc.details.get("reason") or exc.code)
+            payload["message"] = error_message(exc)
+        except Exception as exc:  # noqa: BLE001 - a scan must never crash the app
+            payload["message"] = error_message(exc)
+        self.fingerprint_finished.emit(payload)
+
+    def _on_fingerprint_finished(self, payload: dict[str, Any]) -> None:
+        """Handle a finished scan on the GUI thread (unlock, enable or explain)."""
+        self._fingerprint_worker = None
+        self._fingerprint_cancel = None
+        action = str(payload.get("action") or "unlock")
+        if action == "enable":
+            self._on_fingerprint_enable_finished(payload)
+            return
+        if payload.get("ok") and payload.get("key") is not None:
+            self._adopt_master_key(payload["key"])
+            return
+        reason = str(payload.get("reason") or "error")
+        # This result belongs to the scan that just finished, so any pending automatic
+        # scan is superseded (the retry branch below decides whether to arm a new one).
+        self._auto_scan_armed = False
+        if payload.get("auto") and reason in AUTO_SCAN_RETRY_REASONS:
+            # An automatic scan nobody answered: keep the sensor offered instead of
+            # reporting a failure the user never caused.
+            if self.unlock_screen is not None:
+                self.unlock_screen.set_fingerprint_busy(
+                    False, i18n.tr("unlock.fingerprint_scanning")
+                )
+            self._arm_auto_scan(AUTO_SCAN_RETRY_MS)
+            return
+        message = i18n.tr(
+            "unlock.fingerprint_not_verified", reason=self._fingerprint_reason_text(reason)
+        )
+        if self.unlock_screen is not None:
+            self.unlock_screen.set_fingerprint_busy(False, message)
+        else:  # pragma: no cover - the screen exists whenever a scan can start
+            LOG.warning("fingerprint scan failed (%s)", reason)
+
+    def _on_fingerprint_enable_finished(self, payload: dict[str, Any]) -> None:
+        """Finish the enable flow: open the vault, then report the scan outcome."""
+        if payload.get("unlocked"):
+            # The password was right, so the vault opens either way; only the stored
+            # record depends on the scan.
+            self._finish_unlock()
+            self._log_unlock("vault.unlock", "allow")
+        if payload.get("ok"):
+            self.refresh_fingerprint_state()
+            self._notify(i18n.tr("notification.fingerprint_enabled"))
+            return
+        reason = str(payload.get("reason") or "error")
+        if reason == "bad_password":
+            if self.unlock_screen is not None:
+                self.unlock_screen.notify_failure()
+                self.unlock_screen.set_fingerprint_busy(False)
+                self.unlock_screen.show_error(i18n.tr("unlock.wrong_password"))
+            return
+        message = i18n.tr(
+            "unlock.fingerprint_enable_failed", reason=self._fingerprint_reason_text(reason)
+        )
+        if self.unlock_screen is not None:
+            self.unlock_screen.set_fingerprint_busy(False, message)
+        self.refresh_fingerprint_state()
+        if payload.get("unlocked"):
+            self._notify(message)
+
+    def _adopt_master_key(self, key: Any) -> bool:
+        """Unlock the vault with a released master key (fingerprint quick unlock)."""
+        from ..util import wipe
+
+        if self.session is None:
+            if self._session_loader is None:
+                return False
+            self.session = self._session_loader(self.home)
+        try:
+            self.session.unlock_with_master_key(key)
+        except VaultError as exc:
+            if self.unlock_screen is not None:
+                self.unlock_screen.set_fingerprint_busy(False, error_message(exc))
+            LOG.warning("quick unlock refused: %s", exc.code)
+            return False
+        finally:
+            if isinstance(key, bytearray):
+                wipe(key)
+        self._finish_unlock()
+        self._log_unlock("vault.quick_unlock", "allow", source="fingerprint")
+        return True
+
+    def _log_unlock(
+        self, tool: str, outcome: str, *, source: str | None = None
+    ) -> None:
+        """Write one access-log row for an unlock that happened outside the service."""
+        if self.service is None:
+            return
+        self.service._log(  # noqa: SLF001 - the service owns the access log
+            role="ui",
+            tool=tool,
+            target=None,
+            outcome=outcome,
+            source=source or "ui",
+        )
+
+    def _notify(self, message: str) -> None:
+        """Notify through the tray when there is one (no modal dialogs here)."""
+        notifications.notify(i18n.tr("app.title"), message, tray=self.tray)
+
+    @staticmethod
+    def _fingerprint_reason_text(reason: str) -> str:
+        """Translate a machine-readable scan reason for the user."""
+        return i18n.reason_text(reason)
 
     def choose_vault(self) -> None:
         """Ask for another vault folder and switch to its unlock screen."""
@@ -438,6 +773,7 @@ class VaultApplication(QObject):
         if self.unlock_screen is not None:
             self.unlock_screen.set_vault_info(i18n.tr("app.title"), str(self.home))
             self.unlock_screen.clear_error()
+        self.refresh_fingerprint_state()
 
     def create_vault(self) -> None:
         """Open the new-vault wizard and create the vault on success."""
@@ -474,7 +810,15 @@ class VaultApplication(QObject):
                 pass
 
     def lock(self) -> None:
-        """Lock the vault and return to the unlock screen."""
+        """Lock the vault and return to the unlock screen.
+
+        The unlock screen arms an automatic fingerprint scan again, because the click that
+        locked the vault means the user is sitting in front of it.
+        """
+        self._lock_and_show(auto_scan=True)
+
+    def _lock_and_show(self, *, auto_scan: bool) -> None:
+        """Lock the vault and show the unlock screen (``auto_scan`` arms the sensor)."""
         if self.session is None:
             return
         try:
@@ -486,7 +830,7 @@ class VaultApplication(QObject):
             self.window.set_current_path(None)
         if self._external is not None:
             self._external.close_all()          # never leave a decrypted copy behind
-        self.show_unlock()
+        self.show_unlock(auto_scan=auto_scan)
         self._sync_editor_web()
 
     def _auto_lock_tick(self) -> None:
@@ -495,7 +839,10 @@ class VaultApplication(QObject):
             return
         try:
             if self.session.auto_lock_due():
-                self.lock()
+                # The idle timeout means nobody is at the keyboard, so the sensor is not
+                # offered here: a scan would sit waiting and steal the next touch meant
+                # for the screen lock. The fingerprint button stays available.
+                self._lock_and_show(auto_scan=False)
         except Exception:  # noqa: BLE001 - never let the timer crash the app
             pass
         if self.window is not None:
@@ -562,6 +909,13 @@ class VaultApplication(QObject):
         result = self.dispatch_ui("vault.read_file", {"path": self._api(path)})
         return str(result.get("content", ""))
 
+    def read_bytes(self, path: str) -> bytes:
+        """Read a file's exact bytes (pictures and other binaries) as the UI role."""
+        result = self.dispatch_ui(
+            "vault.read_file", {"path": self._api(path), "binary": True}
+        )
+        return base64.b64decode(str(result.get("content_base64") or ""))
+
     def folder_note(self, path: str) -> str | None:
         """Return the note attached to ``path``."""
         result = self.dispatch_ui("vault.folder_note", {"path": self._api(path)})
@@ -627,6 +981,26 @@ class VaultApplication(QObject):
             note = self.file_note(api)
         except VaultError:
             note = None
+        if image_view.looks_like_image(api):
+            # A picture is shown natively (never through the text editor or a web engine),
+            # which keeps `secret`/`secretfile` pictures inside the same rule as their text.
+            if level != "normal" and not self._confirm(level, api):
+                return False
+            data = self.read_bytes(api)
+            if image_view.decode(data) is None:
+                if self.window is not None:
+                    QMessageBox.warning(
+                        self.window, i18n.tr("image.title"), i18n.tr("image.unsupported")
+                    )
+                return False
+            self.window.open_image(api, data, sensitivity=level, note=note or "")
+            if level == "secret":
+                notifications.notify(
+                    i18n.tr("notification.secret_opened"), api, tray=self.tray
+                )
+            elif level != "normal":
+                self._log_secretfile(api)
+            return True
         if level == "normal":
             content = self.read(api)
             self.window.editor.set_content(api, content, preview_enabled=True)
@@ -1013,6 +1387,35 @@ class VaultApplication(QObject):
         tags = [part.strip() for part in text.split(",") if part.strip()]
         try:
             self.dispatch_ui("vault.set_tags", {"path": self._api(path), "tags": tags})
+        except VaultError as exc:
+            QMessageBox.warning(self.window, i18n.tr("app.title"), error_message(exc))
+            return
+        self.hub.notify()
+
+    def edit_emoji(self, path: str) -> None:
+        """Pick an emoji label for one folder or file (empty clears it)."""
+        from .emoji_dialog import EmojiDialog
+
+        try:
+            entry = self.stat(path)
+        except VaultError:
+            return
+        try:
+            groups = self.dispatch_ui("vault.emoji_palette", {}).get("groups", [])
+        except Exception:  # noqa: BLE001 - an empty palette still allows the text field
+            groups = []
+        dialog = EmojiDialog(
+            groups,
+            current=entry.get("emoji"),
+            name=str(entry.get("name") or path.rsplit("/", 1)[-1]),
+            parent=self.window,
+        )
+        if dialog.exec() != QDialog.Accepted:
+            return
+        try:
+            self.dispatch_ui(
+                "vault.set_emoji", {"path": self._api(path), "emoji": dialog.value()}
+            )
         except VaultError as exc:
             QMessageBox.warning(self.window, i18n.tr("app.title"), error_message(exc))
             return
@@ -1803,6 +2206,32 @@ class VaultApplication(QObject):
         except Exception:  # noqa: BLE001 - persistence is best effort
             pass
 
+    def set_theme(self, preference: str) -> str:
+        """Switch the appearance live and persist it in ``ui.json`` (SPEC/03 §2.1).
+
+        A picture or note already on screen is brought along: the palette changes for every
+        window, and the image viewer repaints its canvas so no white slab is left behind.
+        """
+        choice = theme.set_preference(preference)
+        theme.refresh(self.qapp)
+        for widget in (self.window, self.unlock_screen):
+            if widget is not None and hasattr(widget, "apply_theme"):
+                try:
+                    widget.apply_theme()
+                except Exception:  # noqa: BLE001 - cosmetic
+                    pass
+        if self.window is not None and hasattr(self.window, "refresh_theme"):
+            try:
+                self.window.refresh_theme()
+            except Exception:  # noqa: BLE001 - cosmetic
+                pass
+        self.config.data["theme"] = choice
+        try:
+            self.config.save()
+        except Exception:  # noqa: BLE001 - persistence is best effort
+            pass
+        return choice
+
     def tray_available(self) -> bool:
         """Return True when a system tray icon is active."""
         return bool(self.tray is not None and self.tray.available)
@@ -1815,6 +2244,7 @@ class VaultApplication(QObject):
     def shutdown(self) -> None:
         """Stop timers, the server and the session."""
         self._auto_lock_timer.stop()
+        self.cancel_fingerprint_scan()   # no scan may outlive the app: it would claim the sensor
         if self.server is not None:
             try:
                 self.server.stop()
@@ -1838,4 +2268,12 @@ class VaultApplication(QObject):
                 pass
 
 
-__all__ = ["VaultApplication", "SecretRequestDialog", "error_message", "AUTO_LOCK_TICK_MS"]
+__all__ = [
+    "VaultApplication",
+    "SecretRequestDialog",
+    "error_message",
+    "AUTO_LOCK_TICK_MS",
+    "AUTO_SCAN_DELAY_MS",
+    "AUTO_SCAN_RETRY_MS",
+    "AUTO_SCAN_RETRY_REASONS",
+]

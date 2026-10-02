@@ -209,6 +209,69 @@
     $("#login-error").textContent = message || "";
     $("#password-input").value = "";
     $("#token-input").value = state.token || "";
+    loadQuickUnlock();
+  }
+
+  function loadQuickUnlock() {
+    // Fingerprint quick unlock is offered only when a record exists for this vault *and*
+    // the request would come from this machine (a phone on the LAN can never scan).
+    var button = $("#fingerprint-button");
+    if (!button || !state.token) { return; }
+    request("GET", "/api/session/quick-unlock").then(function (r) {
+      var info = (r.ok && r.data) ? r.data : {};
+      state.quickUnlock = info;
+      var offered = info.ok === true && info.enabled === true && info.loopback === true;
+      button.hidden = !offered;
+      button.disabled = false;
+      var hint = $("#fingerprint-hint");
+      if (!hint) { return; }
+      if (offered) {
+        hint.hidden = false;
+        hint.setAttribute("data-i18n", "web.fingerprint_hint");
+      } else if (info.ok === true && info.loopback === true && info.available === true) {
+        // A sensor is here but no record for this vault: enabling belongs to the desktop app.
+        hint.hidden = false;
+        hint.setAttribute("data-i18n", "web.fingerprint_setup");
+      } else {
+        hint.hidden = true;
+        return;
+      }
+      hint.textContent = t(hint.getAttribute("data-i18n"));
+      if (offered && info.fingers && info.fingers.length) {
+        button.title = info.fingers.join(", ");
+      }
+    }).catch(function () { button.hidden = true; });
+  }
+
+  function handleFingerprint() {
+    var button = $("#fingerprint-button");
+    if (!button || button.disabled) { return; }
+    $("#login-error").hidden = true;
+    $("#login-lockout").hidden = true;
+    button.disabled = true;
+    var label = button.textContent;
+    button.textContent = t("web.fingerprint_scanning");
+    request("POST", "/api/session/unlock-fingerprint", {}).then(function (r) {
+      if (r.ok && r.data && r.data.ok === true) { return enterAfterQuickUnlock(); }
+      var err = (r.data && r.data.error) || {};
+      var reason = (err.details && err.details.reason) || err.code || "";
+      setLoginError(reason ? t("fingerprint.reason." + reason) : t("error.UNAUTHORIZED"));
+    }).catch(function () {
+      setLoginError(t("error.ERROR"));
+    }).then(function () {
+      button.textContent = label;
+      button.disabled = false;
+      loadQuickUnlock();
+    });
+  }
+
+  function enterAfterQuickUnlock() {
+    // The server unlocked the vault during the scan request: refresh the catalogue (the
+    // language may differ) and go straight into the app.
+    return loadCatalogue().then(function () {
+      applyI18n();
+      return enterApp();
+    });
   }
 
   function setTokenVisibility(hasToken) {
@@ -362,8 +425,13 @@
     count.className = "tree-count";
     count.textContent = String(node.note_count || 0);
     li.appendChild(caret);
+    var emoji = emojiSpan(node);
+    if (emoji) { li.appendChild(emoji); }
     li.appendChild(label);
     li.appendChild(count);
+    //: The tree is the only place a top-level folder (a child of `/`) is listed without the
+    //: centre pane, so it needs the same row action the notebook list has.
+    li.appendChild(rowDeleteButton(node));
     li.addEventListener("click", function (ev) {
       if (ev.target === caret) {
         caret.textContent = caret.textContent === "▸" ? "▾" : "▸";
@@ -372,6 +440,7 @@
       }
       navigateFolder(node.path);
     });
+    bindRowMenu(li, node);
     var childList = null;
     var dirs = (node.children || []).filter(function (child) { return child.is_dir; });
     if (dirs.length) {
@@ -501,6 +570,8 @@
         var name = document.createElement("span");
         name.dir = "auto";
         name.textContent = entry.name || String(entry.logical_path).split("/").pop();
+        var emoji = emojiSpan(entry);
+        if (emoji) { li.appendChild(emoji); }
         li.appendChild(name);
         var path = document.createElement("span");
         path.className = "meta";
@@ -656,18 +727,29 @@
   }
 
   function rowDeleteButton(entry) {
+    var label = entry.is_dir ? t("menu.delete_folder") : t("menu.delete");
     var button = document.createElement("button");
     button.type = "button";
     button.className = "row-action";
     button.textContent = "🗑";
-    button.title = t("menu.delete");
-    button.setAttribute("aria-label", t("menu.delete") + ": " + (entry.name || entry.path));
+    button.title = label;
+    button.setAttribute("aria-label", label + ": " + (entry.name || entry.path));
     button.addEventListener("click", function (ev) {
       ev.stopPropagation();
       ev.preventDefault();
       deleteEntry(entry);
     });
     return button;
+  }
+
+  //: Same action row for every listing a row can appear in (folder tree, notebook list). The click
+  //: row navigates; the menu is where the row's own actions live, so a row needs no visible chrome.
+  function bindRowMenu(li, entry) {
+    li.addEventListener("contextmenu", function (ev) {
+      ev.preventDefault();
+      ev.stopPropagation();
+      showContextMenu(ev.clientX, ev.clientY, entry);
+    });
   }
 
   function renderFolderView(entries) {
@@ -680,7 +762,8 @@
       var li = document.createElement("li");
       li.className = "notebook";
       var icon = document.createElement("span");
-      icon.textContent = "📁";
+      icon.className = "row-emoji";
+      icon.textContent = entry.emoji || "📁";
       var name = document.createElement("span");
       name.dir = "auto";
       name.textContent = entry.name;
@@ -692,6 +775,7 @@
       li.appendChild(count);
       li.appendChild(rowDeleteButton(entry));
       li.addEventListener("click", function () { navigateFolder(entry.path); });
+      bindRowMenu(li, entry);
       notebooks.appendChild(li);
     });
     $("#notes-heading").textContent = t("web.notes") + " (" + files.length + ")";
@@ -700,6 +784,8 @@
     files.forEach(function (entry) {
       var li = document.createElement("li");
       li.className = "note-row";
+      var emoji = emojiSpan(entry);
+      if (emoji) { li.appendChild(emoji); }
       var badge = document.createElement("span");
       badge.className = "badge";
       badge.textContent = levelIcon(entry.sensitivity);
@@ -735,6 +821,130 @@
     if (level === "secretfile") { return "🔑"; }
     if (level === "secret") { return "🔒"; }
     return "🔓";
+  }
+
+  /* --------------------------------------------------------------- emoji labels */
+  //: A label is metadata on the path (SPEC/07 §9). It is always rendered in its own span beside
+  //: the name — never glued into the name text — so `dir="auto"` on the name keeps working and a
+  //: neutral glyph cannot flip a Persian row.
+  function emojiSpan(entry) {
+    if (!entry || !entry.emoji) { return null; }
+    var span = document.createElement("span");
+    span.className = "row-emoji";
+    span.textContent = entry.emoji;
+    return span;
+  }
+
+  function loadEmojiPalette() {
+    //: The palette is a convenience, never a requirement: the dialog also takes free text, so a
+    //: failed fetch degrades to "type it yourself" instead of blocking the action.
+    if (state.emojiPalette) { return Promise.resolve(state.emojiPalette); }
+    return call("vault.emoji_palette", {}).then(function (result) {
+      state.emojiPalette = (result && result.groups) || [];
+      return state.emojiPalette;
+    }).catch(function () {
+      state.emojiPalette = [];
+      return [];
+    });
+  }
+
+  function editEmoji(entry) {
+    loadEmojiPalette().then(function (groups) {
+      var modal = buildModal(t("dialog.emoji"));
+      var hint = document.createElement("p");
+      hint.className = "modal-hint";
+      hint.textContent = t("emoji.hint", { name: entry.name });
+      modal.body.appendChild(hint);
+
+      var current = document.createElement("div");
+      current.className = "emoji-current";
+      current.textContent = entry.emoji || "—";
+      modal.body.appendChild(current);
+
+      var input = document.createElement("input");
+      input.type = "text";
+      input.className = "emoji-input";
+      input.value = entry.emoji || "";
+      input.placeholder = t("emoji.custom");
+      input.dir = "auto";
+      modal.body.appendChild(input);
+
+      var scroll = document.createElement("div");
+      scroll.className = "emoji-scroll";
+      groups.forEach(function (group) {
+        var title = document.createElement("div");
+        title.className = "emoji-group-title";
+        title.textContent = t(group.group);
+        scroll.appendChild(title);
+        var grid = document.createElement("div");
+        grid.className = "emoji-grid";
+        (group.items || []).forEach(function (glyph) {
+          var button = document.createElement("button");
+          button.type = "button";
+          button.className = "emoji-choice" + (glyph === entry.emoji ? " selected" : "");
+          button.textContent = glyph;
+          button.addEventListener("click", function () {
+            input.value = glyph;
+            current.textContent = glyph;
+            $$(".emoji-choice", grid).forEach(function (el) { el.classList.remove("selected"); });
+            button.classList.add("selected");
+          });
+          grid.appendChild(button);
+        });
+        scroll.appendChild(grid);
+      });
+      modal.body.appendChild(scroll);
+
+      var clear = document.createElement("button");
+      clear.type = "button";
+      clear.className = "ghost";
+      clear.textContent = t("emoji.clear");
+      clear.addEventListener("click", function () {
+        input.value = "";
+        current.textContent = "—";
+        $$(".emoji-choice").forEach(function (el) { el.classList.remove("selected"); });
+      });
+      modal.actions.appendChild(clear);
+
+      var cancel = document.createElement("button");
+      cancel.type = "button";
+      cancel.className = "ghost";
+      cancel.textContent = t("web.cancel");
+      cancel.addEventListener("click", function () { closeModal(modal.root); });
+      modal.actions.appendChild(cancel);
+
+      var save = document.createElement("button");
+      save.type = "button";
+      save.textContent = t("web.save");
+      save.addEventListener("click", function () {
+        var value = input.value.trim();
+        if (value.length > EMOJI_MAX) {
+          showToast(t("emoji.too_long", { max: EMOJI_MAX }), "error");
+          return;
+        }
+        call("vault.set_emoji", { path: entry.path, emoji: value }).then(function () {
+          closeModal(modal.root);
+          showToast(t("emoji.saved"), "ok");
+          entry.emoji = value || null;
+          refreshAfterEmoji();
+        }).catch(function (err) { showToast(errorText(err), "error"); });
+      });
+      modal.actions.appendChild(save);
+      openModal(modal.root);
+      input.focus();
+    }).catch(function (err) { showToast(errorText(err), "error"); });
+  }
+
+  //: Keep in step with ``core/emoji.py`` (a longer label is refused by the API anyway).
+  var EMOJI_MAX = 16;
+
+  function refreshAfterEmoji() {
+    // The tree, the notebook list and the note head all render labels, so re-render the
+    // surfaces we are on rather than patching one row and leaving the others stale.
+    loadIndex();
+    var hash = String(location.hash || "");
+    if (hash.indexOf("#/note/") === 0 && state.file) { renderNoteView(); }
+    else { applyRoute(); }
   }
 
   function humanSize(n) {
@@ -1028,7 +1238,8 @@
   function renderNoteView() {
     if (!state.file) { return; }
     renderBreadcrumbs($("#note-crumbs"), state.file.path, navigateFolder, { file: true });
-    $("#note-title").textContent = state.file.name;
+    $("#note-title").textContent =
+      (state.file.emoji ? state.file.emoji + " " : "") + state.file.name;
     $("#note-title").setAttribute("dir", "auto");
     var updated = formatDate(state.file.mtime);
     var created = formatDate(state.file.created || state.file.mtime);
@@ -1076,6 +1287,11 @@
       hydrateImages(body);
     } else if (state.file.sensitivity === "normal") {
       body.innerHTML = renderMarkdown(state.file.content, state.file.path);
+      //: The container direction (not per line — the blocks carry their own `dir`): with `auto` the
+      //: browser answered LTR whenever every child had a dir attribute of its own, which silently
+      //: left lists and tables mirrored.
+      body.dir = hasRtlChars(state.file.content) ? "rtl" : "ltr";
+      hydrateCodeBlocks(body);
       hydrateImages(body);
     } else {
       body.textContent = t("web.preview_disabled");
@@ -1174,7 +1390,10 @@
       return;
     }
     preview.hidden = false;
-    preview.innerHTML = renderMarkdown($("#editor").value, state.file.path);
+    var source = $("#editor").value;
+    preview.innerHTML = renderMarkdown(source, state.file.path);
+    preview.dir = hasRtlChars(source) ? "rtl" : "ltr";
+    hydrateCodeBlocks(preview);
     hydrateImages(preview);
   }
 
@@ -1389,6 +1608,15 @@
     return text;
   }
 
+  //: Any Persian/Arabic/Hebrew letter makes a line RTL. Used for the *container* direction (list
+  //: markers, table column order): `dir="auto"` cannot do it, because it ignores the text of
+  //: descendants that carry their own dir attribute — and every item now does.
+  var RTL_TEXT = /[\u0591-\u07FF\uFB1D-\uFDFD\uFE70-\uFEFC]/;
+
+  function hasRtlChars(text) {
+    return RTL_TEXT.test(String(text || ""));
+  }
+
   function renderMarkdown(source, notePath) {
     // Bodies exported from Joplin contain raw <img src="data:..."> HTML; escaping it showed the
     // markup as text. Turn those tags into markdown images first, then escape everything else.
@@ -1399,22 +1627,86 @@
     var lines = escapeHtml(source).split(/\r?\n/);
     var html = [];
     var inCode = false;
+    var fenceIndent = 0;
+    var codeOpen = "";
+    var codeLines = [];
     var inList = null;
     var inQuote = false;
     var inTable = false;
-    function closeList() { if (inList) { html.push("</" + inList + ">"); inList = null; } }
-    function closeQuote() { if (inQuote) { html.push("</blockquote>"); inQuote = false; } }
-    function closeTable() { if (inTable) { html.push("</tbody></table>"); inTable = false; } }
+    //: Index in html[] of the open container tag + whether its content is RTL: a container tag is
+    //: written as a placeholder and finished once its content is known.
+    var listIndex = -1;
+    var listRtl = false;
+    var quoteIndex = -1;
+    var quoteRtl = false;
+    var tableIndex = -1;
+    var tableRtl = false;
+    function closeList() {
+      if (!inList) { return; }
+      html[listIndex] = "<" + inList + ' dir="' + (listRtl ? "rtl" : "ltr") + '">';
+      html.push("</" + inList + ">");
+      inList = null;
+      listIndex = -1;
+      listRtl = false;
+    }
+    //: The whole block goes into the array in one piece: joining line by line left a newline right
+    //: after <code>, which <pre> renders as a blank first line.
+    function closeCodeBlock() {
+      var block = codeOpen + codeLines.join("\n") + "</code></pre></div>";
+      codeOpen = "";
+      codeLines = [];
+      return block;
+    }
+    function closeQuote() {
+      if (!inQuote) { return; }
+      html[quoteIndex] = '<blockquote dir="' + (quoteRtl ? "rtl" : "ltr") + '">';
+      html.push("</blockquote>");
+      inQuote = false;
+      quoteIndex = -1;
+      quoteRtl = false;
+    }
+    function closeTable() {
+      if (!inTable) { return; }
+      html[tableIndex] = '<table dir="' + (tableRtl ? "rtl" : "ltr") + '"><tbody>';
+      html.push("</tbody></table>");
+      inTable = false;
+      tableIndex = -1;
+      tableRtl = false;
+    }
     function openList(kind) {
-      if (inList !== kind) { closeList(); html.push("<" + kind + ">"); inList = kind; }
+      if (inList !== kind) {
+        closeList();
+        listIndex = html.length;
+        html.push("");
+        listRtl = false;
+        inList = kind;
+      }
     }
     lines.forEach(function (line) {
-      if (/^```/.test(line)) {
-        if (inCode) { html.push("</code></pre>"); inCode = false; }
-        else { closeList(); closeQuote(); closeTable(); html.push('<pre><code dir="ltr">'); inCode = true; }
+      //: A fence may be indented (four spaces under a list item is the normal way to write a code
+      //: block inside a step) — matching it only at column 0 left the ``` lines and the language
+      //: label in the note as literal text.
+      var fence = /^\s*(?:`{3,}|~{3,})\s*([A-Za-z0-9_+#.-]*)/.exec(line);
+      if (fence) {
+        if (inCode) { html.push(closeCodeBlock()); inCode = false; fenceIndent = 0; }
+        else {
+          closeList(); closeQuote(); closeTable();
+          fenceIndent = line.length - line.replace(/^\s*/, "").length;
+          var lang = fence[1] || "";
+          codeOpen = '<div class="code-block"' + (lang ? ' data-lang="' + lang + '"' : "") +
+            '><pre><code dir="ltr"' + (lang ? ' class="language-' + lang + '"' : "") + ">";
+          codeLines = [];
+          inCode = true;
+        }
         return;
       }
-      if (inCode) { html.push(line); return; }
+      if (inCode) {
+        // CommonMark strips the fence's own indentation from its content; without this the block
+        // keeps the list item's eight spaces.
+        var spaces = /^ */.exec(line)[0].length;
+        codeLines.push(line.slice(Math.min(fenceIndent, spaces)));
+        return;
+      }
       if (/^\s*(-{3,}|\*{3,}|_{3,})\s*$/.test(line)) {
         closeList(); closeQuote(); closeTable(); html.push("<hr>"); return;
       }
@@ -1429,32 +1721,55 @@
       if (task) {
         closeQuote(); closeTable(); openList("ul");
         var done = task[1].toLowerCase() === "x";
-        html.push('<li class="task' + (done ? " done" : "") + '"><input type="checkbox" disabled' +
+        listRtl = listRtl || hasRtlChars(task[2]);
+        html.push('<li dir="auto" class="task' + (done ? " done" : "") +
+          '"><input type="checkbox" disabled' +
           (done ? " checked" : "") + "> " + inlineMarkdown(task[2], notePath) + "</li>");
         return;
       }
       if (/^\s*[-*+]\s+/.test(line)) {
         closeQuote(); closeTable(); openList("ul");
-        html.push("<li>" + inlineMarkdown(line.replace(/^\s*[-*+]\s+/, ""), notePath) + "</li>");
+        var bullet = line.replace(/^\s*[-*+]\s+/, "");
+        listRtl = listRtl || hasRtlChars(bullet);
+        html.push('<li dir="auto">' + inlineMarkdown(bullet, notePath) + "</li>");
         return;
       }
       if (/^\s*\d+\.\s+/.test(line)) {
         closeQuote(); closeTable(); openList("ol");
-        html.push("<li>" + inlineMarkdown(line.replace(/^\s*\d+\.\s+/, ""), notePath) + "</li>");
+        var numbered = line.replace(/^\s*\d+\.\s+/, "");
+        listRtl = listRtl || hasRtlChars(numbered);
+        html.push('<li dir="auto">' + inlineMarkdown(numbered, notePath) + "</li>");
         return;
       }
-      if (/^\s*>\s?/.test(line)) {
+      //: escapeHtml ran over the whole source first, so a quote marker arrives as `&gt;` —
+      //: matching a bare `>` left every blockquote rendered as a plain paragraph.
+      if (/^\s*(?:&gt;|>)\s?/.test(line)) {
         closeList(); closeTable();
-        if (!inQuote) { html.push("<blockquote>"); inQuote = true; }
-        html.push("<p>" + inlineMarkdown(line.replace(/^\s*>\s?/, ""), notePath) + "</p>");
+        var quoted = line.replace(/^\s*(?:&gt;|>)\s?/, "");
+        if (!inQuote) {
+          quoteIndex = html.length;
+          html.push("");
+          quoteRtl = false;
+          inQuote = true;
+        }
+        quoteRtl = quoteRtl || hasRtlChars(quoted);
+        html.push('<p dir="auto">' + inlineMarkdown(quoted, notePath) + "</p>");
         return;
       }
       if (/\|/.test(line) && /^\s*\|?.*\|/.test(line)) {
         closeList(); closeQuote();
         var cells = line.split("|").map(function (c) { return c.trim(); }).filter(function (c) { return c !== ""; });
         if (cells.length && /^:?-+:?$/.test(cells[0].replace(/\s/g, ""))) { return; }
-        if (!inTable) { html.push("<table><tbody>"); inTable = true; }
-        html.push("<tr>" + cells.map(function (c) { return "<td>" + inlineMarkdown(c, notePath) + "</td>"; }).join("") + "</tr>");
+        if (!inTable) {
+          tableIndex = html.length;
+          html.push("");
+          tableRtl = false;
+          inTable = true;
+        }
+        tableRtl = tableRtl || cells.some(hasRtlChars);
+        html.push("<tr>" + cells.map(function (c) {
+          return '<td dir="auto">' + inlineMarkdown(c, notePath) + "</td>";
+        }).join("") + "</tr>");
         return;
       }
       closeList(); closeQuote(); closeTable();
@@ -1462,7 +1777,7 @@
       html.push('<p dir="auto">' + inlineMarkdown(line, notePath) + "</p>");
     });
     closeList(); closeQuote(); closeTable();
-    if (inCode) { html.push("</code></pre>"); }
+    if (inCode) { html.push(closeCodeBlock()); }
     return html.join("\n");
   }
 
@@ -1504,6 +1819,36 @@
       bytes = new TextEncoder().encode(decodeURIComponent(payload));
     }
     return new Blob([bytes], { type: mime });
+  }
+
+  //: A code block gets a header bar: the fence's language on one side and a copy button on the
+  //: other. The markup comes from renderMarkdown as a string, so the buttons are attached here.
+  function hydrateCodeBlocks(root) {
+    $$(".code-block", root).forEach(function (box) {
+      if (box.querySelector(".code-head")) { return; }
+      var code = box.querySelector("code");
+      var head = document.createElement("div");
+      head.className = "code-head";
+      //: The header strip holds a Latin language label and a Persian button, so its side layout
+      //: follows the *document* direction — inheriting from the note body flipped it whenever a
+      //: note resolved to LTR.
+      head.dir = document.documentElement.dir === "ltr" ? "ltr" : "rtl";
+      var label = document.createElement("span");
+      label.className = "code-lang";
+      label.dir = "ltr";
+      label.textContent = box.getAttribute("data-lang") || "";
+      var copy = document.createElement("button");
+      copy.type = "button";
+      copy.className = "code-copy";
+      copy.textContent = t("web.copy_code");
+      copy.addEventListener("click", function () {
+        if (navigator.clipboard) { navigator.clipboard.writeText(code ? code.textContent : ""); }
+        showToast(t("notification.copied"), "ok");
+      });
+      head.appendChild(label);
+      head.appendChild(copy);
+      box.insertBefore(head, box.firstChild);
+    });
   }
 
   function hydrateImages(root) {
@@ -1636,7 +1981,11 @@
 
   function deleteEntry(entry) {
     if (!entry || !entry.path) { return Promise.resolve(); }
-    return confirmDialog(t("dialog.delete_confirm", { path: entry.path }), t("menu.delete"))
+    //: A folder delete is recursive, so say so instead of the neutral file wording.
+    var message = entry.is_dir
+      ? t("dialog.delete_folder_confirm", { path: entry.path })
+      : t("dialog.delete_confirm", { path: entry.path });
+    return confirmDialog(message, t("menu.delete"))
       .then(function (ok) { if (ok) { return performDelete(entry); } });
   }
 
@@ -1663,12 +2012,24 @@
       button.addEventListener("click", function () { closeContextMenu(); handler(); });
       menu.appendChild(button);
     }
+    if (entry.is_dir) {
+      //: A folder offers only the actions it supports — the note-only items (open native, level,
+      //: tags) would answer BAD_REQUEST, or open a prompt, for a path that is not a file.
+      item(t("menu.open"), function () { navigateFolder(entry.path); });
+      item(t("menu.emoji"), function () { editEmoji(entry); });
+      item(t("menu.rename"), function () { renameEntry(entry); });
+      item(t("menu.delete_folder"), function () { deleteEntry(entry); });
+      item(t("menu.copy_path"), function () { copyPath(entry.path); });
+      document.body.appendChild(menu);
+      return;
+    }
     item(t("menu.open"), function () { navigateNote(entry.path); });
     if (entry.sensitivity === "secretfile") {
       item(t("menu.open_native"), function () { requestNative(entry.path); });
     } else if (entry.sensitivity === "secret") {
       item(t("menu.open_native"), function () { openPlainViewer(entry.path); });
     }
+    item(t("menu.emoji"), function () { editEmoji(entry); });
     item(t("menu.rename"), function () { renameEntry(entry); });
     item(t("menu.delete"), function () { deleteEntry(entry); });
     item(t("menu.copy_path"), function () { copyPath(entry.path); });
@@ -1725,6 +2086,8 @@
       var path = hit.logical_path || hit.path || "";
       title.dir = "auto";
       title.textContent = path;
+      var emoji = emojiSpan(hit);
+      if (emoji) { li.appendChild(emoji); }
       li.appendChild(title);
       if (hit.snippet) {
         var snippet = document.createElement("span");
@@ -2175,6 +2538,10 @@
   function bind() {
     buildFormatToolbar();
     $("#login-form").addEventListener("submit", handleLogin);
+    var fingerprintButton = $("#fingerprint-button");
+    if (fingerprintButton) {
+      fingerprintButton.addEventListener("click", handleFingerprint);
+    }
     var tokenToggle = $("#token-toggle");
     if (tokenToggle) {
       tokenToggle.addEventListener("click", function () {

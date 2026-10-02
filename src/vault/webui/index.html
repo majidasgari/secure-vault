@@ -24,6 +24,8 @@
       <input id="password-input" name="password" type="password"
              autocomplete="current-password" data-i18n-placeholder="unlock.password_placeholder">
       <button id="unlock-button" type="submit" class="primary" data-i18n="web.unlock_button"></button>
+      <button id="fingerprint-button" type="button" data-i18n="web.fingerprint" hidden></button>
+      <p id="fingerprint-hint" class="hint" data-i18n="web.fingerprint_hint" hidden></p>
       <p id="login-error" class="error" hidden></p>
       <p id="login-lockout" class="warn" hidden></p>
       <select id="lang-select-login" class="lang-select" data-i18n-title="web.language"
@@ -42,7 +44,7 @@
           <option value="text" data-i18n="web.text"></option>
           <option value="semantic" data-i18n="web.semantic"></option>
         </select>
-        <input id="global-search" type="search" autocomplete="off"
+        <input id="global-search" type="search" autocomplete="off" dir="auto"
                data-i18n-placeholder="web.global_search_placeholder">
         <button id="btn-global-search" type="submit" data-i18n="search.button"></button>
       </form>
@@ -69,7 +71,7 @@
     <main class="layout">
       <aside id="panel-left" class="panel panel-left">
         <div class="panel-head">
-          <input id="filter-input" type="search" data-i18n-placeholder="web.filter_placeholder">
+          <input id="filter-input" type="search" dir="auto" data-i18n-placeholder="web.filter_placeholder">
           <button id="btn-refresh" type="button" class="icon-btn" data-i18n-title="web.refresh">⟳</button>
         </div>
         <div class="sidebar-actions">
@@ -141,7 +143,7 @@
           <div id="dirty-indicator" class="dirty" hidden data-i18n="editor.unsaved_title"></div>
           <div class="edit-split">
             <textarea id="editor" spellcheck="false" dir="auto" data-i18n-placeholder="editor.placeholder"></textarea>
-            <div id="preview" class="preview" hidden></div>
+            <div id="preview" class="preview" dir="auto" hidden></div>
           </div>
         </div>
 

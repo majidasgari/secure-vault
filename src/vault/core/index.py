@@ -17,7 +17,7 @@ from ..errors import AlreadyExists, BadRequest, NotFound
 from ..util import atomic_write_bytes, normalize_logical_path, now_ms
 from .security import LEVELS
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS schema_meta(key TEXT PRIMARY KEY, value TEXT);
@@ -32,7 +32,8 @@ CREATE TABLE IF NOT EXISTS files(
       CHECK(sensitivity IN ('normal','secret','secretfile')),
   mtime INTEGER NOT NULL,
   created INTEGER NOT NULL,
-  source TEXT NOT NULL DEFAULT 'ui'
+  source TEXT NOT NULL DEFAULT 'ui',
+  emoji TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_files_parent ON files(logical_path);
 CREATE TABLE IF NOT EXISTS file_versions(
@@ -87,11 +88,26 @@ class Index:
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA foreign_keys=ON")
         self._conn.executescript(_SCHEMA)
+        self._migrate()
+        self._conn.commit()
+
+    def _migrate(self) -> None:
+        """Bring an older ``meta.sqlite`` up to the current schema (idempotent).
+
+        ``CREATE TABLE IF NOT EXISTS`` cannot add a column to a table that already exists, so
+        every column added after the first release needs its own ``ALTER`` on each open — and
+        the stored ``schema_meta.schema_version`` is rewritten to the code's version, because
+        the old value would otherwise lie about what the file contains.
+        """
+        columns = {str(row["name"]) for row in self._conn.execute("PRAGMA table_info(files)")}
+        if "emoji" not in columns:
+            # An emoji label on a path (SPEC/01 §6). NULL = no label.
+            self._conn.execute("ALTER TABLE files ADD COLUMN emoji TEXT")
         self._conn.execute(
-            "INSERT OR IGNORE INTO schema_meta(key, value) VALUES('schema_version', ?)",
+            "INSERT INTO schema_meta(key, value) VALUES('schema_version', ?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
             (str(SCHEMA_VERSION),),
         )
-        self._conn.commit()
 
     # ------------------------------------------------------------------ plumbing
     @property
@@ -421,6 +437,28 @@ class Index:
                 (level,),
             )
         return [str(r["logical_path"]) for r in cur.fetchall()]
+
+    # --------------------------------------------------------------------- emoji
+    def set_emoji(self, logical_path: str, emoji: str | None) -> None:
+        """Set (or clear, with ``None``) the emoji label of an existing row.
+
+        The label is plaintext metadata on the path, so it survives a rename, an upsert or a
+        level change of the file itself; only deleting the row drops it.
+        """
+        path = self._norm(logical_path)
+        self.require_file(path)
+        self._conn.execute(
+            "UPDATE files SET emoji=? WHERE logical_path=? COLLATE NOCASE",
+            (emoji, path),
+        )
+        self._conn.commit()
+
+    def emoji_map(self) -> dict[str, str]:
+        """Return ``{logical_path: emoji}`` for every labelled row (used by exports/tests)."""
+        cur = self._conn.execute(
+            "SELECT logical_path, emoji FROM files WHERE emoji IS NOT NULL AND emoji != ''"
+        )
+        return {str(r["logical_path"]): str(r["emoji"]) for r in cur.fetchall()}
 
     # ---------------------------------------------------------------------- tags
     def set_tags(self, logical_path: str, tags: list[str]) -> None:

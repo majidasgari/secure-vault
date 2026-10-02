@@ -175,3 +175,68 @@ class IndexTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class EmojiColumnTest(unittest.TestCase):
+    """The emoji label of a path (SPEC/01 §6)."""
+
+    def setUp(self) -> None:
+        self.tmp = Path(tempfile.mkdtemp(prefix="sv-emoji-"))
+        self.index = Index(self.tmp / "meta.sqlite")
+
+    def tearDown(self) -> None:
+        self.index.close()
+
+    def test_set_and_clear_round_trip(self) -> None:
+        """A label is stored, listed by ``emoji_map`` and cleared with ``None``."""
+        self.index.upsert_file("notes", is_dir=True)
+        self.index.upsert_file("notes/a.md", blob_id="abc", size=3)
+        self.index.set_emoji("notes", "🗂️")
+        self.index.set_emoji("notes/a.md", "📝")
+        self.assertEqual(self.index.emoji_map(), {"notes": "🗂️", "notes/a.md": "📝"})
+        self.index.set_emoji("notes/a.md", None)
+        self.assertEqual(self.index.emoji_map(), {"notes": "🗂️"})
+        self.assertIsNone(self.index.require_file("notes/a.md")["emoji"])
+
+    def test_upsert_keeps_the_label(self) -> None:
+        """Rewriting the file (same path, new blob) must not drop the label."""
+        self.index.upsert_file("a.md", blob_id="one", size=1)
+        self.index.set_emoji("a.md", "⭐")
+        self.index.upsert_file("a.md", blob_id="two", size=2)
+        self.assertEqual(self.index.require_file("a.md")["emoji"], "⭐")
+
+    def test_delete_drops_the_label(self) -> None:
+        """Removing the row removes the label with it — nothing is kept orphaned."""
+        self.index.upsert_file("a.md", blob_id="one", size=1)
+        self.index.set_emoji("a.md", "⭐")
+        self.index.delete_file("a.md")
+        self.assertEqual(self.index.emoji_map(), {})
+        self.index.upsert_file("a.md", blob_id="two", size=1)
+        self.assertIsNone(self.index.require_file("a.md")["emoji"])
+
+    def test_unknown_path_is_not_found(self) -> None:
+        """Labelling something that does not exist is a NotFound, not a silent insert."""
+        with self.assertRaises(NotFound):
+            self.index.set_emoji("ghost.md", "⭐")
+
+    def test_old_schema_gains_the_column(self) -> None:
+        """An older meta.sqlite (no column, version 2) is migrated on open."""
+        self.index.upsert_file("a.md", blob_id="one", size=1)
+        self.index.conn.execute("ALTER TABLE files DROP COLUMN emoji")
+        self.index.conn.execute("UPDATE schema_meta SET value='2' WHERE key='schema_version'")
+        self.index.conn.commit()
+        self.index.close()
+
+        reopened = Index(self.tmp / "meta.sqlite")
+        try:
+            columns = {str(row["name"]) for row in reopened.conn.execute("PRAGMA table_info(files)")}
+            self.assertIn("emoji", columns)
+            row = reopened.require_file("a.md")
+            self.assertEqual(row["blob_id"], "one")
+            self.assertIsNone(row["emoji"])
+            stored = reopened.conn.execute(
+                "SELECT value FROM schema_meta WHERE key='schema_version'"
+            ).fetchone()["value"]
+            self.assertEqual(str(stored), str(SCHEMA_VERSION))
+        finally:
+            reopened.close()

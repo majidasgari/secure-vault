@@ -8,6 +8,7 @@ from unittest import mock
 from support import DEFAULT_PASSWORD, assert_no_plaintext, tmp_vault
 from vault.core import session as session_module
 from vault.errors import (
+    BadRequest,
     DowngradeForbidden,
     NotFound,
     PermissionDenied,
@@ -276,3 +277,96 @@ class SessionMiscTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class EmojiLabelTest(unittest.TestCase):
+    """The emoji label of a folder/file (SPEC/01 §6)."""
+
+    def setUp(self) -> None:
+        self.session = tmp_vault()
+        self.session.mkdir("notes")
+        self.session.write_file("notes/a.md", b"# a\n")
+
+    def tearDown(self) -> None:
+        self.session.close()
+
+    def _entry(self, folder: str, name: str) -> dict:
+        """Return the listing row for ``name`` inside ``folder``."""
+        entries = self.session.list_folder(folder)["entries"]
+        wanted = name if folder == "/" else f"{folder.strip('/')}/{name}"
+        return next(item for item in entries if item["logical_path"] == wanted)
+
+    def test_label_a_folder_and_a_file(self) -> None:
+        """Both kinds of row can carry a label and it reaches every listing."""
+        self.session.set_emoji("notes", "🗂️")
+        self.session.set_emoji("notes/a.md", "📝")
+        self.assertEqual(self._entry("/", "notes")["emoji"], "🗂️")
+        self.assertEqual(self._entry("notes", "a.md")["emoji"], "📝")
+
+    def test_digest_carries_the_label(self) -> None:
+        """The digest (what the tree and the desktop app read) carries it too."""
+        self.session.set_emoji("notes", "🗂️")
+        self.session.set_emoji("notes/a.md", "📝")
+        data = self.session.digest("notes", depth=1)
+        self.assertEqual(data["emoji"], "🗂️")
+        entry = next(item for item in data["entries"] if item["name"] == "a.md")
+        self.assertEqual(entry["emoji"], "📝")
+
+    def test_clearing_a_label(self) -> None:
+        """``None`` and an empty string both remove the label."""
+        self.session.set_emoji("notes", "🗂️")
+        self.session.set_emoji("notes", None)
+        self.assertIsNone(self._entry("/", "notes")["emoji"])
+        self.session.set_emoji("notes", "📁")
+        self.session.set_emoji("notes", "")
+        self.assertIsNone(self._entry("/", "notes")["emoji"])
+
+    def test_label_is_metadata_visible_while_locked(self) -> None:
+        """It labels the name, so the locked vault still shows it."""
+        self.session.set_emoji("notes", "🗂️")
+        self.session.lock()
+        self.assertEqual(self._entry("/", "notes")["emoji"], "🗂️")
+
+    def test_locked_session_cannot_change_it(self) -> None:
+        """Writing metadata is a write: a locked session refuses it."""
+        self.session.lock()
+        with self.assertRaises(VaultLocked):
+            self.session.set_emoji("notes", "🗂️")
+
+    def test_label_survives_a_move(self) -> None:
+        """A rename/move keeps the row's label (it is metadata on the path)."""
+        self.session.set_emoji("notes", "🗂️")
+        self.session.move("notes", "archive")
+        self.assertEqual(self._entry("/", "archive")["emoji"], "🗂️")
+
+    def test_label_survives_rewriting_the_file(self) -> None:
+        """Overwriting the content must not lose the label."""
+        self.session.set_emoji("notes/a.md", "📝")
+        self.session.write_file("notes/a.md", b"# a\n\nmore\n")
+        self.assertEqual(self._entry("notes", "a.md")["emoji"], "📝")
+
+    def test_search_results_carry_the_label(self) -> None:
+        """Filename search rows carry it, so a result list renders like a listing."""
+        self.session.set_emoji("notes/a.md", "📝")
+        hits = self.session.search_filenames("a.md")
+        self.assertEqual(len(hits), 1)
+        self.assertEqual(hits[0]["emoji"], "📝")
+
+    def test_label_and_folder_note_are_independent(self) -> None:
+        """The note and the emoji are two separate fields on the same row."""
+        self.session.set_folder_note("notes", "یادداشت پوشه")
+        self.session.set_emoji("notes", "🗂️")
+        self.session.set_emoji("notes", None)
+        self.assertEqual(self.session.folder_note("notes"), "یادداشت پوشه")
+
+    def test_invalid_values_are_refused(self) -> None:
+        """A word, or a paragraph, is not a label."""
+        with self.assertRaises(BadRequest):
+            self.session.set_emoji("notes", "not an emoji")
+        with self.assertRaises(BadRequest):
+            self.session.set_emoji("notes", "📁" * 20)
+
+    def test_unknown_path_is_refused(self) -> None:
+        """Labelling something that does not exist fails loudly."""
+        with self.assertRaises(NotFound):
+            self.session.set_emoji("ghost", "⭐")

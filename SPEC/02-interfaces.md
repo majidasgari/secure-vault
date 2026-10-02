@@ -38,7 +38,7 @@ Method list (all take a dict, all return a dict; errors raise `VaultError`):
 | `vault.unlock` | ui only | `{"password": str}` → `{"locked": False, "status": {...}}` |
 | `vault.lock` | ui only | `{}` |
 | `vault.list_folder` | ui, mcp | `{"path": "/"}` → `{"path", "note", "entries": [...]}`; entries: `{name, path, is_dir, size, mtime, sensitivity, tags, secret: bool}` |
-| `vault.read_file` | ui, mcp | `{"path", "encoding"?}` → `{"path","content","sensitivity","size"}` (denied for secret+ to mcp) |
+| `vault.read_file` | ui, mcp | `{"path", "encoding"?, "binary"?}` → `{"path","content","sensitivity","size"}`; with `binary` (or `encoding="base64"`) → `{"path","encoding":"base64","content_base64",…}` for pictures and other binaries the caller must decode itself (denied for secret+ to mcp) |
 | `vault.read_lines` | ui, mcp | `{"path","start","count"}` → `{"path","start","count","text","total_lines"}` |
 | `vault.write_file` | ui, mcp | `{"path","content","encoding"?, "sensitivity"?}` → `{"path","size","sensitivity","created": bool}` |
 | `vault.write_lines` | ui, mcp | `{"path","text","mode":"append"|"prepend"|"insert","at_line"?}` → `{"path","size","lines"}` |

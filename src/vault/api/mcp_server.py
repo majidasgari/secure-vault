@@ -98,10 +98,13 @@ _TOOL_SPECS: list[dict[str, Any]] = [
     ),
     _tool(
         "read_file",
-        "Read the content of a normal file. secret/secretfile content is denied to agents.",
+        "Read the content of a normal file. secret/secretfile content is denied to agents. "
+        "Set binary=true for a file that has no text form (a picture, a PDF): the payload is "
+        "then content_base64 with encoding=\"base64\".",
         {
             "path": {"type": "string"},
             "encoding": {"type": "string", "default": "utf-8"},
+            "binary": {"type": "boolean", "default": False},
         },
         ["path"],
         _forward("vault.read_file"),
@@ -251,6 +254,21 @@ _TOOL_SPECS: list[dict[str, Any]] = [
         {"path": {"type": "string"}, "text": {"type": "string"}},
         ["path", "text"],
         _forward("vault.set_file_note"),
+    ),
+    _tool(
+        "set_emoji",
+        "Set the emoji label of a folder or file (it shows beside its name in both UIs; it is "
+        "metadata on the path, never content). Pass an empty string to clear it.",
+        {"path": {"type": "string"}, "emoji": {"type": "string"}},
+        ["path", "emoji"],
+        _forward("vault.set_emoji"),
+    ),
+    _tool(
+        "emoji_palette",
+        "Return the built-in emoji palette, grouped. Use it instead of inventing labels.",
+        {},
+        [],
+        _forward("vault.emoji_palette"),
     ),
     _tool(
         "digest",

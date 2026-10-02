@@ -16,7 +16,7 @@ from PySide6.QtWidgets import (
     QTabWidget,
 )
 
-from . import i18n
+from . import bidi, i18n, image_view
 from .browser import BrowserPanel
 from .editor import EditorPanel
 from .log_panel import LogPanel
@@ -113,7 +113,7 @@ class MainWindow(QMainWindow):
         self.lock_label.setText(
             i18n.tr("status.locked" if locked else "status.unlocked")
         )
-        self.path_label.setText("\u200e" + str(self.controller.vault_home) + "\u200e")
+        self.path_label.setText(bidi.ltr_isolate(str(self.controller.vault_home)))
         self.count_label.setText(i18n.tr("status.files", count=status.get("files", 0)))
         sync = status.get("sync") or {}
         if not sync.get("configured"):
@@ -124,7 +124,7 @@ class MainWindow(QMainWindow):
             sync_text = i18n.tr("status.sync_error")
         else:
             sync_text = i18n.tr("status.sync_owned")
-        self.sync_label.setText("\u200e" + sync_text + "\u200e")
+        self.sync_label.setText(bidi.ltr_isolate(sync_text))
         try:
             connections = int(self.controller.connection_count())
         except Exception:  # noqa: BLE001
@@ -234,6 +234,21 @@ class MainWindow(QMainWindow):
             self.set_current_path(path)
         return bool(result)
 
+    def open_image(self, path: str, data: bytes, *, sensitivity: str = "normal",
+                   note: str = "") -> None:
+        """Show a picture from the vault in the native viewer (SPEC/03 §2.4, §10)."""
+        previous = getattr(self, "image_viewer", None)
+        if previous is not None:
+            try:
+                previous.close()
+            except RuntimeError:  # noqa: BLE001 - already gone
+                pass
+        self.image_viewer = image_view.open_image(
+            self, path, data, sensitivity=sensitivity, tray=self.controller.tray
+        )
+        if note:
+            self.image_viewer.setToolTip(note)
+
     def guard_unsaved(self) -> bool:
         """Return True when it is safe to replace the editor content."""
         if not self.editor.is_dirty():
@@ -256,6 +271,25 @@ class MainWindow(QMainWindow):
         """Refresh the browser and the status bar."""
         self.browser.refresh()
         self.refresh_status()
+
+    def refresh_theme(self) -> None:
+        """Repaint everything that carries theme colours itself (SPEC/03 §10)."""
+        for holder in (self.editor, getattr(self, "image_viewer", None)):
+            if holder is None:
+                continue
+            for name in ("apply_theme",):
+                method = getattr(holder, name, None)
+                if callable(method):
+                    try:
+                        method()
+                    except Exception:  # noqa: BLE001 - cosmetic
+                        pass
+        for view in (getattr(self.browser, "note_edit", None),):
+            if view is not None:
+                try:
+                    view.viewport().update()
+                except Exception:  # noqa: BLE001 - cosmetic
+                    pass
 
     def _open_current_in_browser(self) -> None:
         """Open the current note in the web UI (SPEC/08 §B.7)."""
@@ -292,6 +326,10 @@ class MainWindow(QMainWindow):
         level = str(entry.get("sensitivity", "normal"))
         menu = QMenu(self)
         menu.addAction(i18n.tr("menu.open"), lambda: self.open_file(path))
+        if image_view.looks_like_image(path):
+            menu.addAction(
+                i18n.tr("menu.view_image"), lambda: self.controller.open_path(path)
+            )
         if level in ("secret", "secretfile"):
             menu.addAction(
                 i18n.tr("menu.open_native"), lambda: self.controller.open_path(path)
@@ -320,6 +358,7 @@ class MainWindow(QMainWindow):
                 i18n.tr(f"level.{name}"),
                 lambda _checked=False, value=name: self.controller.set_level(path, value),
             )
+        menu.addAction(i18n.tr("menu.emoji"), lambda: self.controller.edit_emoji(path))
         menu.addAction(i18n.tr("menu.tags"), lambda: self.controller.edit_tags(path))
         menu.exec(self.browser.list.viewport().mapToGlobal(position))
 

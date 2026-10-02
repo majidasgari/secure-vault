@@ -38,6 +38,7 @@ concurrency-safe for writes), so requests serialise without blocking the event s
   | `GET /` and static assets (`/static/*`, `/favicon.ico`) | served **without** a token (they contain no vault data) |
   | `GET /?token=<t>` | sets an `HttpOnly; SameSite=Strict; Path=/` cookie `vault_token` and 302-redirects to `/` — the "click the printed link" flow |
   | `POST /api/session/login {"token": t}` | same cookie, returns `{"ok": true}` |
+  | `POST /api/session/claim` | hands a token to a **loopback** client that sends `X-Vault-Claim: 1`; `{"scope": "browser"}` asks for the narrow autofill token instead (`docs/BROWSER-AUTOFILL.md`) |
   | every `/api/*` call | **requires the header**; the cookie alone is *not* enough (CSRF defence) |
   | wrong/absent token | `401 {"error": {"code": "UNAUTHORIZED"}}`, one `deny` row in the access log with `source="web"` |
 
@@ -56,6 +57,10 @@ concurrency-safe for writes), so requests serialise without blocking the event s
 `Service.dispatch(method, params, role="ui", session_id="web-<n>")`. Unknown method → `400`
 with `code="BAD_REQUEST"`. `vault.unlock`/`vault.lock` are reachable only through the
 `/api/session/*` endpoints, not through `/api/call`.
+
+`/api/autofill/*` is a second, narrower surface on the same listener: `status`, `match` (metadata
+only) and `reveal` (one matched credential, always audited). It accepts the **browser token only** —
+a credential-store add-on must not hold the web token. Full contract: `docs/BROWSER-AUTOFILL.md`.
 
 Convenience endpoints:
 

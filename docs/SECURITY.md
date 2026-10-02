@@ -60,6 +60,13 @@ vault home for known plaintext markers after writes.
 
 Additional rules enforced by the same module:
 
+* **A picture is shown natively at every level.** `png/jpg/jpeg/gif/webp/bmp/ico/tif/tiff/avif`
+  files open in the Qt image viewer (`ui/image_view.py`) rather than the text editor, so a
+  `secret`/`secretfile` picture never reaches a web engine either; the confirmation, the tray
+  notification and the `tool="ui.read_secretfile"` access row are the same as for text. The
+  bytes travel as base64 (`vault.read_file` with `binary`) because they have no text form — the
+  level check runs before any bytes are returned, so the flag is not a way around it.
+
 * **Raise is allowed, lower is not (for agents).** UI, MCP and the importer may raise a
   level; only the UI may lower one, and only to a *different* level. A same-level call is
   a no-op. An MCP downgrade raises `SENSITIVITY_DOWNGRADE_FORBIDDEN`.
@@ -196,3 +203,50 @@ The token is only as safe as the machine: any process running as your user can r
 `web.token`, and anyone with the token **and** the password can read the vault.
 Exposing the server beyond loopback over plain HTTP also exposes the token to
 network sniffers — use a TLS reverse proxy if you need that. See `docs/WEBUI.md`.
+
+## 11. Fingerprint quick unlock (`fprintd`)
+
+An optional convenience layer: open the vault with a finger instead of typing the master
+password. It is **off by default**; enabling it needs the password (already entered, the
+vault is unlocked) *and* a successful fingerprint scan. The password path always stays
+available — losing the sensor, changing it, or deleting the record only costs one password
+entry.
+
+Mechanism:
+
+* Enabling wraps the 32-byte **master key** — never the password text — with
+  AES-256-GCM under a key derived by HKDF-SHA256 from a random 32-byte **device secret**
+  at `<user data>/fingerprint/device.key` (mode `0600`).
+* The AAD binds the vault id, the vault path and the creation time, so the record cannot be
+  moved to another vault or edited in place. The wrap key also mixes in a digest of the
+  machine id, the uid and the home directory, so a copied record does not unwrap on another
+  machine or account.
+* The record lives at `<user data>/fingerprint/<vault id>.json` (mode `0600`), **outside**
+  the vault home — it is machine-local and never syncs (like `web.token`).
+* Every unlock runs `fprintd-verify` and releases the wrapped key only when the scan
+  reports a match. The released key is then validated against the vault canary, so a stale
+  or foreign key is refused exactly like a wrong password (`bad_master_key`). Scans run in
+  a worker thread — the GUI and the web request thread stay responsive — and are killed
+  after 25 s or on cancel.
+* With quick unlock enabled the desktop unlock screen starts a scan by itself right after
+  it appears (and again after an unanswered one), so opening the vault needs no click. The
+  sensor is never armed by an idle auto-lock, and the browser never scans on its own — a
+  page load is not a person asking to authenticate.
+* A scan never outlives the app: typing the password, opening the vault, quitting, or the
+  app being killed ends the scan and terminates its `fprintd` client (the child is started
+  with `PR_SET_PDEATHSIG`), so the sensor is never left claimed by a dead process.
+* The web endpoints (`GET /api/session/quick-unlock`, `POST /api/session/unlock-fingerprint`,
+  `POST /api/session/quick-unlock/enable|disable`) answer **loopback clients only**, so a
+  phone on the LAN can never ask the sensor at your desk to scan. Enable/disable also need
+  the vault to be unlocked.
+* Disabling deletes the record; leaving the vault is irrelevant to it (it is not part of the
+  vault), and a `vault.wipe`-style removal of the user data dir takes it with it.
+* Fingerprint images/templates never leave `fprintd` and the vault key is never derived
+  from them — the finger only gates the release of the wrapped key.
+
+What it does **not** protect against (§9 applies): the device secret is a plain `0600` file,
+so code already running as this user (or root) can unwrap the record without any finger —
+the fingerprint gate is enforced by the application, not by hardware. Someone who steals
+the synced vault **and** the device secret gets in. Binding the device secret to a TPM
+(sealing it so it can only be unsealed on this machine) is the next step if that gap
+matters; it needs `/dev/tpm*` access for the user, which is why it is not the default here.

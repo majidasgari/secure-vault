@@ -7,3 +7,4 @@ __pycache__/
 docs/reports/*.md
 *.tmp
 .DS_Store
+*.egg-info/

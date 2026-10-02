@@ -66,6 +66,13 @@ button.primary { background: var(--accent); border-color: var(--accent); color: 
 button.icon-btn { min-width: var(--tap); display: inline-flex; align-items: center; justify-content: center; }
 button:disabled { opacity: 0.5; cursor: not-allowed; }
 input[type="checkbox"] { min-height: auto; width: 18px; height: 18px; }
+/*: A placeholder answers to the interface language, a typed value to its own content: an empty
+   `dir="auto"` field resolves LTR, which would throw a Persian placeholder to the left edge.
+   Chrome ignores `direction` on ::placeholder but honours `text-align`, which is what shows. */
+[dir="rtl"] input::placeholder, [dir="rtl"] textarea::placeholder {
+  text-align: right;
+  direction: rtl;
+}
 
 .muted { color: var(--muted); }
 .hint { color: var(--muted); font-size: 0.85rem; margin: 4px 0 0; }
@@ -183,6 +190,33 @@ input[type="checkbox"] { min-height: auto; width: 18px; height: 18px; }
   padding: 12px; overflow: auto; direction: ltr; text-align: left;
 }
 #preview code, #note-body code { background: var(--code); border-radius: 4px; padding: 1px 4px; direction: ltr; unicode-bidi: embed; }
+/* A fenced code block is a box with its own header: the language on one side, copy on the other.
+   The ID in the selector is needed — plain `#note-body pre` would win over a class rule. */
+#note-body .code-block, #preview .code-block {
+  margin: 12px 0; border: 1px solid var(--border); border-radius: 8px; overflow: hidden;
+}
+#note-body .code-block pre, #preview .code-block pre {
+  margin: 0; border: none; border-radius: 0; background: var(--code);
+}
+#note-body .code-block .code-head, #preview .code-block .code-head {
+  display: flex; align-items: center; justify-content: space-between; gap: 8px;
+  padding: 2px 8px; background: var(--panel2); border-bottom: 1px solid var(--border);
+}
+#note-body .code-block .code-lang, #preview .code-block .code-lang {
+  font-family: ui-monospace, monospace; font-size: 0.75rem; color: var(--muted);
+  direction: ltr; unicode-bidi: plaintext;
+}
+#note-body .code-block .code-copy, #preview .code-block .code-copy {
+  min-height: 26px; padding: 1px 8px; font-size: 0.75rem; opacity: 0.75;
+}
+#note-body .code-block .code-copy:hover, #preview .code-block .code-copy:hover { opacity: 1; }
+/* The ID-qualified rules above beat the shared `button { min-height: 44px }` phone rule, so the
+   touch target has to be restored here explicitly. */
+@media (max-width: 860px) {
+  #note-body .code-block .code-copy, #preview .code-block .code-copy {
+    min-height: 44px; padding: 4px 12px;
+  }
+}
 #preview blockquote, #note-body blockquote { border-inline-start: 3px solid var(--accent); margin: 8px 0; padding-inline-start: 10px; color: var(--muted); }
 #preview table, #note-body table { border-collapse: collapse; }
 #preview th, #preview td, #note-body th, #note-body td { border: 1px solid var(--border); padding: 4px 8px; }
@@ -558,6 +592,8 @@ input[type="checkbox"] { min-height: auto; width: 18px; height: 18px; }
   font-size: 0.9rem; line-height: 1; background: transparent; border-color: transparent;
   opacity: 0.45; transition: opacity 0.15s ease, border-color 0.15s ease;
 }
+/* A tree row is wide and its count sits next to the name, so the action belongs at the far edge. */
+.tree-row .row-action { margin-inline-start: auto; }
 .tree-row:hover .row-action, .note-row:hover .row-action, .notebook:hover .row-action,
 .row-action:focus-visible { opacity: 1; }
 .row-action:hover { opacity: 1; border-color: var(--danger); background: var(--panel2); }
@@ -587,3 +623,25 @@ button.primary.danger { background: var(--panel2); }
 .note-input { width: 100%; box-sizing: border-box; resize: vertical;
   background: var(--panel2, #0002); color: inherit; border: 1px solid var(--border, #3333);
   border-radius: 6px; padding: 0.4rem 0.5rem; font: inherit; }
+
+/* ------------------------------------------------------- emoji labels (SPEC/07 §9) */
+/*: A label is metadata on the path: it renders as its own span beside the name so the name's
+   dir="auto" keeps deciding the row's direction. */
+.row-emoji { flex: none; font-size: 1.05em; line-height: 1; }
+.modal-hint { margin: 0; color: var(--muted, #8a8f9a); font-size: 0.9rem; }
+.emoji-current { font-size: 1.7rem; line-height: 1.3; text-align: center; }
+.emoji-input {
+  width: 100%; box-sizing: border-box; padding: 6px 10px; font-size: 1.1rem;
+  background: var(--panel2, #262932); color: inherit;
+  border: 1px solid var(--border, #33363f); border-radius: var(--radius, 10px);
+}
+.emoji-scroll { overflow: auto; max-height: 46vh; display: flex; flex-direction: column; gap: 6px; }
+.emoji-group-title { font-size: 0.85rem; color: var(--muted, #8a8f9a); }
+.emoji-grid { display: flex; flex-wrap: wrap; gap: 4px; }
+.emoji-choice {
+  font-size: 1.35rem; line-height: 1; padding: 4px 9px; cursor: pointer;
+  background: transparent; color: inherit;
+  border: 1px solid var(--border, #33363f); border-radius: var(--radius, 10px);
+}
+.emoji-choice:hover { border-color: var(--accent, #5b9dff); }
+.emoji-choice.selected { border-color: var(--accent, #5b9dff); background: var(--panel2, #262932); }

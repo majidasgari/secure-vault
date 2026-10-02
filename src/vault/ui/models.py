@@ -60,6 +60,16 @@ def format_size(size: int) -> str:
     return f"{size} B"  # pragma: no cover - unreachable
 
 
+def display_name(name: str, emoji: Any = None) -> str:
+    """Return ``name`` prefixed with its emoji label, when it has one.
+
+    The label is metadata on the path (SPEC/01 §6) and is only ever a display prefix: the
+    models keep the real name for lookups, so nothing here changes a path or a filter.
+    """
+    glyph = str(emoji or "").strip()
+    return f"{glyph} {name}" if glyph else name
+
+
 def format_mtime(mtime: int) -> str:
     """Format a millisecond epoch as a local ``YYYY-MM-DD HH:MM`` string."""
     try:
@@ -71,12 +81,13 @@ def format_mtime(mtime: int) -> str:
 class _Node:
     """One directory node of the lazy tree."""
 
-    __slots__ = ("path", "name", "parent", "children", "loaded")
+    __slots__ = ("path", "name", "emoji", "parent", "children", "loaded")
 
-    def __init__(self, path: str, name: str, parent: "_Node | None") -> None:
+    def __init__(self, path: str, name: str, parent: "_Node | None", emoji: str = "") -> None:
         """Create an unloaded node for ``path``."""
         self.path = path
         self.name = name
+        self.emoji = emoji
         self.parent = parent
         self.children: list[_Node] = []
         self.loaded = False
@@ -115,7 +126,12 @@ class VaultTreeModel(QAbstractItemModel):
         dirs.sort(key=lambda entry: str(entry.get("name", "")).lower())
         for entry in dirs:
             node.children.append(
-                _Node(str(entry["path"]), str(entry.get("name", "")), node)
+                _Node(
+                    str(entry["path"]),
+                    str(entry.get("name", "")),
+                    node,
+                    emoji=str(entry.get("emoji") or ""),
+                )
             )
 
     def _row_of(self, node: _Node) -> int:
@@ -167,12 +183,12 @@ class VaultTreeModel(QAbstractItemModel):
         return 1
 
     def data(self, index: QModelIndex, role: int = Qt.DisplayRole) -> Any:
-        """Return the folder name for the display role."""
+        """Return the folder name (with its emoji label) for the display role."""
         if not index.isValid():
             return None
         node = index.internalPointer()
         if role == Qt.DisplayRole:
-            return node.name or "/"  # type: ignore[union-attr]
+            return display_name(node.name or "/", node.emoji)  # type: ignore[union-attr]
         return None
 
     def headerData(self, section: int, orientation: Qt.Orientation,
@@ -236,7 +252,9 @@ class VaultListModel(QAbstractTableModel):
         column = index.column()
         if role == Qt.DisplayRole:
             if column == self.COLUMN_NAME:
-                return entry.get("name", "")
+                return display_name(
+                    str(entry.get("name", "")), entry.get("emoji")
+                )
             if column == self.COLUMN_LEVEL:
                 return LEVEL_ICONS.get(str(entry.get("sensitivity")), "")
             if column == self.COLUMN_SIZE:
@@ -275,6 +293,7 @@ __all__ = [
     "DataHub",
     "VaultTreeModel",
     "VaultListModel",
+    "display_name",
     "format_size",
     "format_mtime",
 ]

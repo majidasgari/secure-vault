@@ -20,6 +20,11 @@ SOURCE_UI = "ui"
 SOURCE_MCP = "mcp"
 SOURCE_IMPORTER = "importer"
 SOURCES: tuple[str, str, str] = (SOURCE_UI, SOURCE_MCP, SOURCE_IMPORTER)
+#: The browser-autofill bridge. Deliberately *not* part of :data:`SOURCES`: it is a read-only
+#: consumer, so ``can_raise``/``can_lower`` must keep refusing it (they reject any source that is
+#: not in ``SOURCES``). What it may reach is bounded by the ``browser`` role's method table and
+#: by the credential-root containment check in ``api/browser.py``, not by this flag alone.
+SOURCE_BROWSER = "browser"
 
 
 def _require_level(level: str) -> str:
@@ -55,6 +60,11 @@ class Policy:
         if source == SOURCE_MCP:
             return level == "normal"
         if source in (SOURCE_UI, SOURCE_IMPORTER):
+            return True
+        if source == SOURCE_BROWSER:
+            # Read-only credential bridge: the ``browser`` role has no route to a generic read
+            # (``vault.read_file`` is not in its method table) and every path it may touch is
+            # confined to the credential root, so the level itself adds no further gate here.
             return True
         raise BadRequest("unknown_source", details={"source": source})
 
@@ -116,6 +126,7 @@ __all__ = [
     "SOURCE_UI",
     "SOURCE_MCP",
     "SOURCE_IMPORTER",
+    "SOURCE_BROWSER",
     "SOURCES",
     "rank",
     "is_higher_or_equal",

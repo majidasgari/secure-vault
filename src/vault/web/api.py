@@ -52,6 +52,7 @@ MUTATING_METHODS = frozenset(
         "vault.file_ops",
         "vault.set_sensitivity",
         "vault.set_tags",
+        "vault.set_emoji",
         "vault.set_folder_note",
         "vault.set_file_note",
         "vault.set_settings",
@@ -108,17 +109,21 @@ class WebAPI:
         *,
         throttle: LoginThrottle | None = None,
         i18n_dir: Path | str | None = None,
+        browser: Any | None = None,
     ) -> None:
         """Bind the API to a :class:`~vault.api.service.Service` and its collaborators."""
         self.service = service
         self.auth = auth
         self.events = events
         self.throttle = throttle if throttle is not None else LoginThrottle()
+        #: The browser-autofill bridge (``None`` = the autofill endpoints answer 503).
+        self.browser = browser
         self.i18n_dir = (
             Path(i18n_dir) if i18n_dir is not None else app_paths().i18n_dir
         )
         self._counter = 0
         self._counter_lock = threading.Lock()
+        self._browser_counter = 0
 
     # ------------------------------------------------------------------- helpers
     @property
@@ -132,6 +137,12 @@ class WebAPI:
             self._counter += 1
             return f"web-{self._counter}"
 
+    def browser_session_id(self) -> str:
+        """Return the next ``brw-<n>`` transport session id (browser autofill calls)."""
+        with self._counter_lock:
+            self._browser_counter += 1
+            return f"brw-{self._browser_counter}"
+
     def _log(
         self,
         tool: str,
@@ -140,16 +151,22 @@ class WebAPI:
         target: str | None = None,
         code: str | None = None,
         reason: str | None = None,
+        role: str = "ui",
+        source: str | None = None,
     ) -> None:
-        """Append one access-log row with ``source="web"`` (never logs a secret)."""
+        """Append one access-log row with ``source="web"`` (never logs a secret).
+
+        ``role``/``source`` are overridden for the browser-autofill traffic so the log names the
+        add-on (``source="browser"``) instead of the web UI.
+        """
         self.service._log(
-            role="ui",
+            role=role,
             tool=tool,
             target=target,
             outcome=outcome,
             code=code,
-            session_id=self.session_id(),
-            source="web",
+            session_id=self.browser_session_id() if role == "browser" else self.session_id(),
+            source=source or ("browser" if role == "browser" else "web"),
         )
         if reason:  # pragma: no cover - reason is folded into the code for the log
             LOG.debug("web deny for %s: %s", tool, reason)
@@ -157,6 +174,12 @@ class WebAPI:
     def log_bad_token(self, tool: str) -> None:
         """Record a denied request that carried no/wrong token."""
         self._log(tool, outcome="deny", code="UNAUTHORIZED")
+
+    def log_bad_browser_token(self, tool: str) -> None:
+        """Record a denied ``/api/autofill/*`` request that carried no/wrong browser token."""
+        self._log(
+            tool, outcome="deny", code="UNAUTHORIZED", role="browser", source="browser"
+        )
 
     def _approval_required(self, params: dict) -> tuple[str, str] | None:
         """Return ``(logical_path, level)`` when a plain read needs approval.
@@ -362,8 +385,8 @@ class WebAPI:
             200, {"ok": True}, **{"Set-Cookie": cookie_header(self.auth.token)}
         )
 
-    def claim(self, headers: Any, ip: str, port: int) -> Response:
-        """Hand the access token to a loopback client that explicitly asks for it.
+    def claim(self, headers: Any, ip: str, port: int, payload: Any = None) -> Response:
+        """Hand an access token to a loopback client that explicitly asks for it.
 
         The desktop app writes ``runtime_dir()/web.token`` (mode 0600) and a browser cannot read
         that file, so the SPA asks here instead of making the user copy a 64-hex token by hand.
@@ -374,6 +397,10 @@ class WebAPI:
           reply anyway (no CORS headers are ever sent), and a non-simple header would need a
           preflight this server never approves.
 
+        ``payload == {"scope": "browser"}`` asks for the *browser autofill* token instead: it is
+        a different secret, valid only for the three ``vault.browser_*`` methods, so a browser
+        holding it cannot read or write anything else in the vault (``api/browser.py``).
+
         The reply carries the token, the lock flag and the port — never vault content.
         """
         header = ""
@@ -381,8 +408,19 @@ class WebAPI:
             header = str(headers.get("X-Vault-Claim") or "")
         except Exception:  # noqa: BLE001 - a malformed header object simply fails the check
             header = ""
+        scope = ""
+        if isinstance(payload, dict):
+            raw = payload.get("scope")
+            scope = str(raw).strip().lower() if isinstance(raw, str) else ""
+        browser_scope = scope == "browser"
         if not is_loopback(str(ip)) or header != "1":
-            self._log("session.claim", outcome="deny", code="FORBIDDEN")
+            self._log(
+                "session.claim",
+                outcome="deny",
+                code="FORBIDDEN",
+                role="browser" if browser_scope else "ui",
+                source="browser" if browser_scope else "web",
+            )
             return json_response(
                 403,
                 {
@@ -394,18 +432,137 @@ class WebAPI:
                     },
                 },
             )
+        browser = self.browser
+        if browser_scope and browser is None:
+            return json_response(
+                503,
+                {
+                    "ok": False,
+                    "error": {
+                        "code": "PROVIDER_UNAVAILABLE",
+                        "message": "browser_bridge_unavailable",
+                        "details": {},
+                    },
+                },
+            )
         session = self.session
         locked = bool(session.is_locked)
+        if browser_scope and browser is not None:
+            self._log(
+                "session.claim",
+                outcome="allow",
+                role="browser",
+                source="browser",
+            )
+            return json_response(
+                200,
+                {
+                    "ok": True,
+                    "scope": "browser",
+                    "token": browser.token,
+                    "unlocked": not locked,
+                    "port": int(port),
+                },
+            )
         self._log("session.claim", outcome="allow", code=None)
         return json_response(
             200,
             {
                 "ok": True,
+                "scope": "vault",
                 "token": self.auth.token,
                 "unlocked": not locked,
                 "port": int(port),
             },
         )
+
+    # --------------------------------------------------------------- /api/autofill
+    def autofill_status(self) -> Response:
+        """Return the browser-bridge state for the add-on (metadata only)."""
+        return self._autofill_call("vault.browser_status", {})
+
+    def autofill_match(self, payload: Any) -> Response:
+        """Return the credential candidates for one page host (never a password)."""
+        params: dict[str, Any] = {}
+        if isinstance(payload, dict):
+            for key in ("host", "url", "limit"):
+                value = payload.get(key)
+                if isinstance(value, (str, int)) and not isinstance(value, bool):
+                    params[key] = value
+        return self._autofill_call("vault.browser_match", params)
+
+    def autofill_reveal(self, payload: Any) -> Response:
+        """Return the fields of one matched credential entry (the audited reveal)."""
+        params: dict[str, Any] = {}
+        if isinstance(payload, dict):
+            for key in ("path", "host"):
+                value = payload.get(key)
+                if isinstance(value, str) and value:
+                    params[key] = value
+        return self._autofill_call("vault.browser_reveal", params)
+
+    def _autofill_call(self, method: str, params: dict[str, Any]) -> Response:
+        """Dispatch one browser-role call and shape its errors like the rest of the API.
+
+        The caller has already been authenticated with the *browser* token (see
+        ``web/server.py``); this only routes, maps errors and publishes the same ``log`` event
+        the web UI's own calls publish.
+        """
+        if self.browser is None:
+            return json_response(
+                503,
+                {
+                    "ok": False,
+                    "error": {
+                        "code": "PROVIDER_UNAVAILABLE",
+                        "message": "browser_bridge_unavailable",
+                        "details": {},
+                    },
+                },
+            )
+        if not self.session.is_locked:
+            self.session.touch()
+        try:
+            result = self.service.dispatch(
+                method,
+                params,
+                role="browser",
+                session_id=self.browser_session_id(),
+                source="browser",
+            )
+        except VaultError as exc:
+            self.events.publish(
+                "log", {"tool": method, "outcome": _outcome_for(exc), "code": exc.code}
+            )
+            if isinstance(exc, BadRequest):
+                status = 400
+            elif isinstance(exc, Unauthorized):
+                status = 401
+            elif isinstance(exc, VaultLocked):
+                status = 423
+            elif isinstance(exc, (PermissionDenied, DowngradeForbidden, SyncReadOnly)):
+                status = 403
+            else:
+                status = 200
+            return json_response(status, {"ok": False, "error": exc.to_dict()})
+        except Exception:  # noqa: BLE001 - never leak a traceback to the add-on
+            LOG.exception("internal error handling %s", method)
+            self.events.publish(
+                "log", {"tool": method, "outcome": "error", "code": "ERROR"}
+            )
+            return json_response(
+                500,
+                {
+                    "ok": False,
+                    "error": {
+                        "code": "ERROR",
+                        "message": "internal_error",
+                        "details": {},
+                    },
+                },
+            )
+        self.events.publish("log", {"tool": method, "outcome": "allow"})
+        return json_response(200, {"ok": True, "result": result})
 
     # --------------------------------------------------------- /api/session/unlock
     def unlock(self, payload: Any, ip: str) -> Response:
@@ -479,6 +636,119 @@ class WebAPI:
         )
         self.events.publish("lock", {"locked": True})
         return json_response(200, {"ok": True, "locked": True})
+
+    # ------------------------------------------------------- /api/session/quick-unlock
+    def quick_unlock_info(self) -> Response:
+        """Return the fingerprint quick-unlock state (sensor, record, loopback flag)."""
+        from ..core import fingerprint
+
+        session = self.session
+        state = fingerprint.quick_unlock_state(session.home)
+        state["loopback"] = True  # the route is only reachable from this machine
+        return json_response(200, {"ok": True, **state})
+
+    def quick_unlock_unlock(self, ip: str) -> Response:
+        """Unlock after a fingerprint scan on this machine (loopback clients only).
+
+        The blocked call is a ``fprintd`` verification running in this process (the web
+        server owns the vault, exactly like the desktop app), so it is restricted to
+        loopback: a phone on the LAN can never trigger a scan on your desk.
+        """
+        from ..core import fingerprint
+
+        if not is_loopback(str(ip)):
+            return self._quick_unlock_denied("loopback_only")
+        session = self.session
+        state = fingerprint.quick_unlock_state(session.home)
+        if not state.get("enabled"):
+            return self._quick_unlock_denied("not_enabled")
+        verification = fingerprint.verify()
+        if not verification.matched:
+            self._log("vault.quick_unlock", outcome="deny", code="UNAUTHORIZED", reason=verification.reason)
+            return json_response(
+                401,
+                {
+                    "ok": False,
+                    "code": "UNAUTHORIZED",
+                    "error": {
+                        "code": "UNAUTHORIZED",
+                        "message": "fingerprint_not_verified",
+                        "details": {"reason": verification.reason},
+                    },
+                },
+            )
+        try:
+            key = fingerprint.release_master_key(session.home, verification)
+        except VaultError as exc:
+            self._log("vault.quick_unlock", outcome="deny", code=exc.code)
+            return json_response(401, {"ok": False, "error": exc.to_dict()})
+        with self.service._lock:
+            try:
+                session.unlock_with_master_key(key)
+            except VaultError as exc:
+                return json_response(401, {"ok": False, "error": exc.to_dict()})
+        self._log("vault.quick_unlock", outcome="allow")
+        self.events.publish("unlock", {"locked": False})
+        return json_response(200, {"ok": True, "locked": False})
+
+    def quick_unlock_enable(self, ip: str) -> Response:
+        """Store the quick-unlock record after a scan (loopback, vault unlocked)."""
+        from ..core import fingerprint
+
+        if not is_loopback(str(ip)):
+            return self._quick_unlock_denied("loopback_only")
+        session = self.session
+        if session.is_locked:
+            return json_response(
+                409,
+                {"ok": False, "error": {"code": "VAULT_LOCKED", "message": "vault_locked", "details": {}}},
+            )
+        verification = fingerprint.verify()
+        if not verification.matched:
+            self._log(
+                "vault.quick_unlock_enable", outcome="deny", code="UNAUTHORIZED",
+                reason=verification.reason,
+            )
+            return json_response(
+                401,
+                {
+                    "ok": False,
+                    "error": {
+                        "code": "UNAUTHORIZED",
+                        "message": "fingerprint_not_verified",
+                        "details": {"reason": verification.reason},
+                    },
+                },
+            )
+        state = session.quick_unlock_enable(verification)
+        self._log("vault.quick_unlock_enable", outcome="allow")
+        return json_response(200, {"ok": True, **state})
+
+    def quick_unlock_disable(self, ip: str) -> Response:
+        """Forget the quick-unlock record (loopback, vault unlocked)."""
+        if not is_loopback(str(ip)):
+            return self._quick_unlock_denied("loopback_only")
+        session = self.session
+        removed = session.quick_unlock_disable()
+        self._log(
+            "vault.quick_unlock_disable", outcome="allow" if removed else "no_record"
+        )
+        return json_response(200, {"ok": True, "removed": bool(removed)})
+
+    def _quick_unlock_denied(self, reason: str) -> Response:
+        """Answer a refused quick-unlock request (never leaks anything about the vault)."""
+        LOG.info("quick unlock refused: %s", reason)
+        return json_response(
+            403,
+            {
+                "ok": False,
+                "error": {
+                    "code": "FORBIDDEN",
+                    "message": "quick_unlock_denied",
+                    "details": {"reason": reason},
+                },
+            },
+        )
 
     # ------------------------------------------------------------------- /api/blob
     def blob(self, path: str | None) -> Response:

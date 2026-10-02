@@ -90,7 +90,7 @@ All tools accept a JSON object and return an object. Paths use the vault-absolut
 | `vault_status` | — | `{"locked","home","files","folders","by_level","semantic","auto_lock_seconds","store","daemon":{"running":true}}` |
 | `list_folder` | `path` (default `/`) | `{"path","note","entries":[{name,path,is_dir,size,mtime,sensitivity,tags,note,secret}]}` |
 | `digest` | `path` (default `/`), `depth` (default 1) | one overview: `{name,path,is_dir,note,entries:[{name,path,size,sensitivity,tags,note,first_line}]}` (recursive to `depth`); replaces N+1 list/read calls |
-| `read_file` | `path` (req), `encoding` (default `utf-8`) | `{"path","content","sensitivity","size","note"}` |
+| `read_file` | `path` (req), `encoding?`, `binary?` | `{"path","content","sensitivity","size"}` — with `binary` the payload is `content_base64` + `encoding="base64"` |
 | `read_lines` | `path` (req), `start` (1-based, default 1), `count` (default 200) | `{"path","start","count","text","total_lines"}` |
 | `write_file` | `path` (req), `content` (req), `encoding`, `sensitivity` (`normal`/`secret`/`secretfile`) | `{"path","size","sensitivity","created"}` |
 | `write_lines` | `path` (req), `text` (req), `mode` (`append`/`prepend`/`insert`), `at_line` | `{"path","size","lines"}` |

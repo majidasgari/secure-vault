@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import unittest
+from unittest import mock
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -25,6 +26,16 @@ _BENIGN = (
 
 
 @unittest.skipUnless(HAVE_QT, "PySide6 is not installed")
+def _block_direction(fmt):
+    """Return a block's direction, whichever name this PySide6 version uses.
+
+    Qt 6 renamed ``QTextBlockFormat.textDirection`` to ``layoutDirection``; PySide6 6.11 only
+    has the new name, older versions only the old one.
+    """
+    getter = getattr(fmt, "layoutDirection", None) or getattr(fmt, "textDirection")
+    return getter()
+
+
 class UiSmokeTest(unittest.TestCase):
     """Build the whole UI against a scratch vault and assert the flows."""
 
@@ -184,16 +195,33 @@ class EditorBidiTest(unittest.TestCase):
             preview_enabled=True,
         )
         document = editor.source.document()
-        first = document.begin()
-        self.assertEqual(first.blockFormat().textDirection(), Qt.RightToLeft)
-        self.assertEqual(first.blockFormat().alignment(), Qt.AlignRight)
-        english = first.next()
-        self.assertEqual(english.blockFormat().textDirection(), Qt.LeftToRight)
-        fence = english.next()
-        self.assertEqual(fence.blockFormat().textDirection(), Qt.LeftToRight)
-        cursor = QTextCursor(document)
-        cursor.setPosition(fence.position() + 1)
-        self.assertTrue(cursor.charFormat().fontFixedPitch())
+        by_text = {}
+        block = document.begin()
+        while block.isValid():
+            by_text.setdefault(block.text(), block)
+            block = block.next()
+        # Blocks are picked by their text: a blank separator block simply inherits the
+        # direction of the block before it, so counting `next()` steps is not meaningful.
+        first = by_text["متن فارسی"]
+        self.assertEqual(_block_direction(first.blockFormat()), Qt.RightToLeft)
+        # Qt keeps the absolute bit alongside the logical alignment (AlignRight|AlignAbsolute).
+        self.assertTrue(first.blockFormat().alignment() & Qt.AlignRight)
+        english = by_text["English text"]
+        self.assertEqual(_block_direction(english.blockFormat()), Qt.LeftToRight)
+        fence = by_text["```"]
+        self.assertEqual(_block_direction(fence.blockFormat()), Qt.LeftToRight)
+        # A highlighter writes its formats into the block *layout*, not into the character
+        # format the cursor reports: read them where they are.
+        self.app.processEvents()
+        layout = fence.layout()
+        ranges = list(layout.formats()) if layout is not None else []
+        families = [str(name) for item in ranges for name in item.format.fontFamilies()]
+        self.assertTrue(
+            any("mono" in name.lower() for name in families),
+            f"fenced code is not monospace: {families}",
+        )
+        colours = [item.format.background().color().name() for item in ranges]
+        self.assertTrue(colours, "fenced code carries no background colour")
         self.assertFalse(editor.is_dirty())
 
     def test_cycle_direction_uniform(self) -> None:
@@ -207,12 +235,12 @@ class EditorBidiTest(unittest.TestCase):
         self.assertEqual(editor.cycle_direction(), "rtl")
         block = editor.source.document().begin()
         while block.isValid():
-            self.assertEqual(block.blockFormat().textDirection(), Qt.RightToLeft)
+            self.assertEqual(_block_direction(block.blockFormat()), Qt.RightToLeft)
             block = block.next()
         self.assertEqual(editor.cycle_direction(), "ltr")
         block = editor.source.document().begin()
         while block.isValid():
-            self.assertEqual(block.blockFormat().textDirection(), Qt.LeftToRight)
+            self.assertEqual(_block_direction(block.blockFormat()), Qt.LeftToRight)
             block = block.next()
 
     def test_preview_dir_attributes(self) -> None:
@@ -513,6 +541,103 @@ class WebShellSmokeTest(unittest.TestCase):
                 os.environ.pop("XDG_CONFIG_HOME", None)
             else:
                 os.environ["XDG_CONFIG_HOME"] = previous_config
+
+
+class QuickUnlockAutoScanTest(unittest.TestCase):
+    """With quick unlock enabled the unlock screen offers the sensor by itself."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        """Ensure a single offscreen QApplication exists."""
+        from PySide6.QtWidgets import QApplication
+
+        cls.app = QApplication.instance() or QApplication(["sv-quick-unlock"])
+
+    def setUp(self) -> None:
+        """Build a scratch vault with quick unlock enabled and a fake sensor."""
+        from support import tmp_vault
+        from vault.core import fingerprint
+        from vault.ui.app import VaultApplication
+
+        self.session = tmp_vault()
+        self.addCleanup(self.session.close)
+        self.session.quick_unlock_enable(
+            fingerprint.VerifyResult(True, "match", "0.0s", ("test-finger",))
+        )
+        device = mock.patch.object(
+            fingerprint,
+            "device_info",
+            return_value={
+                "available": True,
+                "device": "Test Sensor",
+                "fingers": ["right-index-finger"],
+                "username": "tester",
+                "reason": "ok",
+            },
+        )
+        device.start()
+        self.addCleanup(device.stop)
+        self.controller = VaultApplication(
+            self.app, home=self.session.home, no_tray=True, self_test=True
+        )
+        self.addCleanup(self.controller.shutdown)
+
+    def test_enabled_quick_unlock_arms_the_scan(self) -> None:
+        """Showing the unlock screen schedules a scan and keeps the button reachable."""
+        screen = self.controller.show_unlock()
+        self.assertTrue(self.controller.auto_scan_armed())
+        self.assertFalse(screen.fingerprint_button.isHidden())
+
+    def test_armed_scan_starts_by_itself(self) -> None:
+        """The scheduled scan calls the unlock path with ``auto`` set."""
+        self.controller.show_unlock()
+        with mock.patch.object(
+            self.controller, "unlock_with_fingerprint", return_value=True
+        ) as scan:
+            self.controller._auto_scan_fire()
+        scan.assert_called_once_with(auto=True)
+        self.assertFalse(self.controller.auto_scan_armed())
+
+    def test_typing_the_password_cancels_the_scan(self) -> None:
+        """A typed password takes over: the sensor is not offered any more."""
+        screen = self.controller.show_unlock()
+        screen.password.setText("master-phrase")
+        screen.password.textEdited.emit("master-phrase")
+        self.assertFalse(self.controller.auto_scan_armed())
+        with mock.patch.object(
+            self.controller, "unlock_with_fingerprint", return_value=True
+        ) as scan:
+            self.controller._auto_scan_fire()
+        scan.assert_not_called()
+
+    def test_unanswered_scan_keeps_waiting(self) -> None:
+        """A scan nobody answered re-arms instead of reporting a failure."""
+        from vault.ui import i18n
+
+        screen = self.controller.show_unlock()
+        self.controller._on_fingerprint_finished(
+            {"action": "unlock", "ok": False, "reason": "timeout", "auto": True}
+        )
+        self.assertTrue(self.controller.auto_scan_armed())
+        self.assertIn(i18n.tr("unlock.fingerprint_scanning"), screen.fingerprint_status.text())
+
+    def test_manual_failure_is_reported(self) -> None:
+        """A scan the user asked for reports its reason and does not re-arm."""
+        from vault.ui import i18n
+
+        screen = self.controller.show_unlock()
+        self.controller._on_fingerprint_finished(
+            {"action": "unlock", "ok": False, "reason": "no_match", "auto": False}
+        )
+        self.assertFalse(self.controller.auto_scan_armed())
+        self.assertIn(i18n.tr("fingerprint.reason.no_match"), screen.fingerprint_status.text())
+
+    def test_disabled_quick_unlock_does_not_arm(self) -> None:
+        """Without a record the screen waits for the password only."""
+        self.session.quick_unlock_disable()
+        screen = self.controller.show_unlock()
+        self.assertFalse(self.controller.auto_scan_armed())
+        self.assertTrue(screen.fingerprint_button.isHidden())
 
 
 if __name__ == "__main__":

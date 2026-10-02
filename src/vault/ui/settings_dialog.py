@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import logging
+import threading
 from pathlib import Path
 from typing import Any
 
-from PySide6.QtCore import Qt, QUrl
+from PySide6.QtCore import Qt, QUrl, Signal
 from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import (
     QCheckBox,
@@ -32,14 +33,140 @@ from ..config import load_sync_config
 from ..core.chunking import CHUNK_MODES, DEFAULT_CHUNK_MODE
 from ..core.semantics import folder_included, normalize_folder_key
 from ..util import is_within
-from . import i18n
+from . import i18n, theme
 
 _LEVELS = ("normal", "secret", "secretfile")
+#: Example endpoint shown as a placeholder — an address, not translatable copy.
+_ENDPOINT_EXAMPLE = "https://s3.example.com"
 _LEVEL_KEYS = {
     "normal": "level.normal",
     "secret": "level.secret",
     "secretfile": "level.secretfile",
 }
+
+
+def _error_text(exc: Exception) -> str:
+    """Return a user-facing message for an exception (reuses ``ui.app.error_message``)."""
+    from .app import error_message  # noqa: PLC0415 - import cycle safety, call time only
+
+    try:
+        return error_message(exc)
+    except Exception:  # noqa: BLE001 - a message must never raise
+        return str(exc)
+
+
+class FingerprintScanDialog(QDialog):
+    """Modal «put your finger on the sensor» dialog running one verification.
+
+    ``fprintd-verify`` blocks until a finger is presented (or the timeout expires), so the
+    scan runs in a worker thread and the outcome arrives through a Qt signal — the dialog
+    and the rest of the app stay responsive, and Cancel stops the scan immediately.
+    """
+
+    #: Emitted from the worker thread with the scan payload (``ok``/``reason``/...).
+    scan_finished = Signal(object)
+
+    def __init__(self, controller: Any, *, action: str, parent: Any = None) -> None:
+        """Build the dialog; ``action`` is ``enable`` (store the key) or ``verify``."""
+        super().__init__(parent)
+        self._controller = controller
+        self._action = action
+        self._cancel = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._done = False
+        #: The worker's payload: keys ``ok``, ``reason``, ``message``, ``verification``.
+        self.result_payload: dict[str, Any] = {}
+        self.setModal(True)
+        self.setMinimumWidth(380)
+
+        layout = QVBoxLayout(self)
+        self.title_label = QLabel(self)
+        self.title_label.setWordWrap(True)
+        font = self.title_label.font()
+        font.setBold(True)
+        self.title_label.setFont(font)
+        layout.addWidget(self.title_label)
+        self.status_label = QLabel(self)
+        self.status_label.setWordWrap(True)
+        self.status_label.setObjectName("fingerprint-scan-status")
+        layout.addWidget(self.status_label)
+        self.hint_label = QLabel(self)
+        self.hint_label.setWordWrap(True)
+        layout.addWidget(self.hint_label)
+        self.cancel_button = QPushButton(self)
+        self.cancel_button.clicked.connect(self.reject)
+        layout.addWidget(self.cancel_button)
+
+        self.scan_finished.connect(self._on_scan_finished)
+        self.retranslate()
+
+    # ---------------------------------------------------------------- lifecycle
+    def showEvent(self, event: Any) -> None:  # noqa: N802 - Qt naming
+        """Start the scan once the dialog is on screen."""
+        super().showEvent(event)
+        if self._thread is None:
+            thread = threading.Thread(
+                target=self._run_scan, name="vault-fingerprint", daemon=True
+            )
+            self._thread = thread
+            thread.start()
+
+    def reject(self) -> None:
+        """Cancel a running scan and close."""
+        self._cancel.set()
+        super().reject()
+
+    def _run_scan(self) -> None:
+        """Verify a finger (and, for ``enable``, store the wrapped key) off the GUI thread."""
+        from ..core import fingerprint
+
+        payload: dict[str, Any] = {
+            "action": self._action,
+            "ok": False,
+            "reason": "",
+            "message": "",
+            "verification": None,
+        }
+        try:
+            verification = fingerprint.verify(cancel=self._cancel)
+            payload.update(
+                ok=verification.matched,
+                reason=verification.reason,
+                message=verification.message,
+                verification=verification,
+            )
+            if verification.matched and self._action == "enable":
+                session = getattr(self._controller, "session", None)
+                if session is None or session.is_locked:
+                    payload.update(ok=False, reason="vault_locked")
+                else:
+                    payload["state"] = session.quick_unlock_enable(verification)
+        except Exception as exc:  # noqa: BLE001 - report, never crash the dialog
+            payload.update(ok=False, reason="error", message=_error_text(exc))
+        self.scan_finished.emit(payload)
+
+    def _on_scan_finished(self, payload: dict[str, Any]) -> None:
+        """Close the dialog with the scan outcome (a late result after Cancel is dropped)."""
+        if self._done:
+            return
+        self._done = True
+        self.result_payload = dict(payload)
+        if payload.get("ok"):
+            self.accept()
+            return
+        if payload.get("reason") == "cancelled":
+            super().reject()
+            return
+        self.reject()
+
+    # ------------------------------------------------------------------- i18n
+    def retranslate(self) -> None:
+        """Re-apply translated strings."""
+        self.setWindowTitle(i18n.tr("fingerprint.scan_title"))
+        self.title_label.setText(i18n.tr("fingerprint.scan_title"))
+        self.status_label.setText(i18n.tr("fingerprint.scan_waiting"))
+        self.hint_label.setText(i18n.tr("fingerprint.scan_hint"))
+        self.cancel_button.setText(i18n.tr("fingerprint.scan_cancel"))
 
 
 class SettingsDialog(QDialog):
@@ -62,6 +189,7 @@ class SettingsDialog(QDialog):
         self._build_semantic()
         self._build_importer()
         self._build_web()
+        self._build_fingerprint()
         self._build_sync()
         self._build_log()
 
@@ -87,6 +215,16 @@ class SettingsDialog(QDialog):
         if index >= 0:
             self.language_combo.setCurrentIndex(index)
         form.addRow(self._language_label(), self.language_combo)
+
+        self.theme_combo = QComboBox(page)
+        for choice in theme.THEMES:
+            self.theme_combo.addItem("", choice)
+        current = str(self._controller.config.data.get("theme", "system"))
+        theme_index = self.theme_combo.findData(current)
+        if theme_index >= 0:
+            self.theme_combo.setCurrentIndex(theme_index)
+        self.theme_combo.currentIndexChanged.connect(self._on_theme_changed)
+        form.addRow(self._theme_label(), self.theme_combo)
 
         home_row = QHBoxLayout()
         self.home_edit = QLineEdit(str(self._controller.vault_home), page)
@@ -351,6 +489,16 @@ class SettingsDialog(QDialog):
         self.web_open = QCheckBox(page)
         self.web_open.setChecked(bool(web.get("open_browser_on_start", False)))
         form.addRow(self._label("settings.web_open_browser"), self.web_open)
+        # The add-on switch lives here because it is the same listener the Web UI tab describes:
+        # the add-on talks to the loopback bridge and fills forms from the credential folder.
+        browser = self._settings.get("browser") or {}
+        self.browser_autofill = QCheckBox(page)
+        self.browser_autofill.setChecked(bool(browser.get("enabled", True)))
+        form.addRow(self._label("settings.browser_autofill"), self.browser_autofill)
+        self.browser_hint = QLabel(page)
+        self.browser_hint.setWordWrap(True)
+        self.browser_hint.setEnabled(False)
+        form.addRow(self.browser_hint)
         self.web_url = QLabel(page)
         self.web_url.setWordWrap(True)
         self.web_url.setTextInteractionFlags(Qt.TextSelectableByMouse)
@@ -358,8 +506,42 @@ class SettingsDialog(QDialog):
         if web_server is not None:
             self.web_url.setText(f"http://{web_server.host}:{web_server.port}/")
         else:
-            self.web_url.setText("—")
+            self.web_url.setText(i18n.tr("common.dash"))
         form.addRow(self._label("settings.web_url"), self.web_url)
+        self.tabs.addTab(page, "")
+
+    def _build_fingerprint(self) -> None:
+        """Build the quick-unlock (fingerprint) tab.
+
+        Quick unlock stores a wrapped copy of the master key **machine-locally** (user data
+        dir, ``0600``), released only after a successful ``fprintd`` verification; it is
+        never part of the vault settings, so it is not synced.
+        """
+        page = QWidget(self)
+        form = QFormLayout(page)
+        self.fingerprint_status = QLabel(page)
+        self.fingerprint_status.setWordWrap(True)
+        form.addRow(self._label("settings.fingerprint_status"), self.fingerprint_status)
+
+        self.fingerprint_device = QLabel(page)
+        self.fingerprint_device.setWordWrap(True)
+        form.addRow(self._label("settings.fingerprint_device"), self.fingerprint_device)
+
+        row = QHBoxLayout()
+        self.fingerprint_enable_button = QPushButton(page)
+        self.fingerprint_enable_button.clicked.connect(self._fingerprint_enable)
+        self.fingerprint_test_button = QPushButton(page)
+        self.fingerprint_test_button.clicked.connect(self._fingerprint_test)
+        self.fingerprint_disable_button = QPushButton(page)
+        self.fingerprint_disable_button.clicked.connect(self._fingerprint_disable)
+        row.addWidget(self.fingerprint_enable_button)
+        row.addWidget(self.fingerprint_test_button)
+        row.addWidget(self.fingerprint_disable_button)
+        form.addRow(row)
+
+        self.fingerprint_hint = QLabel(page)
+        self.fingerprint_hint.setWordWrap(True)
+        form.addRow(self.fingerprint_hint)
         self.tabs.addTab(page, "")
 
     def _build_sync(self) -> None:
@@ -376,7 +558,7 @@ class SettingsDialog(QDialog):
         self.sync_prefix = QLineEdit(str(sync.get("prefix", "")), page)
         form.addRow(self._label("settings.sync_prefix"), self.sync_prefix)
         self.sync_endpoint = QLineEdit(str(sync.get("endpoint", "")), page)
-        self.sync_endpoint.setPlaceholderText("https://s3.example.com")
+        self.sync_endpoint.setPlaceholderText(_ENDPOINT_EXAMPLE)
         form.addRow(self._label("settings.sync_endpoint"), self.sync_endpoint)
         self.sync_region = QLineEdit(str(sync.get("region", "")), page)
         form.addRow(self._label("settings.sync_region"), self.sync_region)
@@ -484,6 +666,20 @@ class SettingsDialog(QDialog):
         """Create the language label."""
         return self._label("settings.language")
 
+    def _theme_label(self) -> QLabel:
+        """Create the appearance label."""
+        return self._label("settings.theme")
+
+    def _on_theme_changed(self) -> None:
+        """Apply the appearance choice immediately (the dialog follows along)."""
+        choice = self.theme_combo.currentData()
+        setter = getattr(self._controller, "set_theme", None)
+        if callable(setter):
+            try:
+                setter(str(choice))
+            except Exception:  # noqa: BLE001 - cosmetic
+                pass
+
     def _open_home(self) -> None:
         """Open the vault home in the desktop file manager."""
         QDesktopServices.openUrl(QUrl.fromLocalFile(str(self._controller.vault_home)))
@@ -509,6 +705,110 @@ class SettingsDialog(QDialog):
         """Persist the settings, then rebuild the semantic index in the background."""
         self._on_accept()
         self._controller.semantic_index_now()
+
+    # ------------------------------------------------------------ quick unlock
+    def _fingerprint_enable(self) -> None:
+        """Scan a finger and (re)write the quick-unlock record for this vault."""
+        session = getattr(self._controller, "session", None)
+        if session is None or session.is_locked:
+            QMessageBox.warning(
+                self, i18n.tr("settings.title"), i18n.tr("error.VAULT_LOCKED")
+            )
+            return
+        dialog = FingerprintScanDialog(self._controller, action="enable", parent=self)
+        accepted = dialog.exec() == QDialog.Accepted
+        self._refresh_fingerprint_status()
+        if accepted:
+            QMessageBox.information(
+                self, i18n.tr("settings.title"), i18n.tr("settings.fingerprint_enabled")
+            )
+        elif dialog.result_payload.get("reason"):
+            QMessageBox.warning(
+                self,
+                i18n.tr("settings.title"),
+                i18n.tr(
+                    "settings.fingerprint_failed",
+                    reason=i18n.reason_text(str(dialog.result_payload.get("reason", ""))),
+                ),
+            )
+
+    def _fingerprint_test(self) -> None:
+        """Run a scan without changing anything (sensor sanity check)."""
+        session = getattr(self._controller, "session", None)
+        if session is None or session.is_locked:
+            QMessageBox.warning(
+                self, i18n.tr("settings.title"), i18n.tr("error.VAULT_LOCKED")
+            )
+            return
+        dialog = FingerprintScanDialog(self._controller, action="verify", parent=self)
+        if dialog.exec() == QDialog.Accepted:
+            QMessageBox.information(
+                self, i18n.tr("settings.title"), i18n.tr("settings.fingerprint_test_ok")
+            )
+        else:
+            QMessageBox.warning(
+                self,
+                i18n.tr("settings.title"),
+                i18n.tr(
+                    "settings.fingerprint_failed",
+                    reason=i18n.reason_text(str(dialog.result_payload.get("reason", ""))),
+                ),
+            )
+
+    def _fingerprint_disable(self) -> None:
+        """Delete the stored quick-unlock record."""
+        session = getattr(self._controller, "session", None)
+        if session is None or session.is_locked:
+            QMessageBox.warning(
+                self, i18n.tr("settings.title"), i18n.tr("error.VAULT_LOCKED")
+            )
+            return
+        try:
+            removed = session.quick_unlock_disable()
+        except Exception as exc:  # noqa: BLE001 - report instead of crashing
+            QMessageBox.warning(self, i18n.tr("settings.title"), str(exc))
+            return
+        self._refresh_fingerprint_status()
+        QMessageBox.information(
+            self,
+            i18n.tr("settings.title"),
+            i18n.tr("settings.fingerprint_disabled" if removed else "settings.fingerprint_none"),
+        )
+
+    def _refresh_fingerprint_status(self) -> None:
+        """Update the quick-unlock status and device lines."""
+        session = getattr(self._controller, "session", None)
+        state: dict[str, Any] = {}
+        try:
+            if session is not None and not session.is_locked:
+                state = session.quick_unlock_status()
+        except Exception:  # noqa: BLE001 - the tab must render even when the probe fails
+            state = {}
+        if not state:
+            self.fingerprint_status.setText(i18n.tr("settings.fingerprint_unavailable"))
+            self.fingerprint_device.setText(i18n.tr("common.dash"))
+            self.fingerprint_enable_button.setEnabled(False)
+            self.fingerprint_test_button.setEnabled(False)
+            self.fingerprint_disable_button.setEnabled(False)
+            return
+        enabled = bool(state.get("enabled"))
+        self.fingerprint_status.setText(
+            i18n.tr("settings.fingerprint_on" if enabled else "settings.fingerprint_off")
+        )
+        self.fingerprint_device.setText(
+            i18n.tr(
+                "settings.fingerprint_device_line",
+                device=state.get("device") or "—",
+                fingers=", ".join(state.get("fingers") or []) or "—",
+                uses=int(state.get("uses") or 0),
+            )
+        )
+        self.fingerprint_enable_button.setEnabled(bool(state.get("available")))
+        self.fingerprint_test_button.setEnabled(bool(state.get("available")))
+        self.fingerprint_disable_button.setEnabled(enabled)
+        self.fingerprint_hint.setText(
+            i18n.tr("settings.fingerprint_hint", protection=state.get("protection") or "")
+        )
 
     def _run_import(self) -> None:
         """Persist the current settings, then run the Joplin importer (SPEC/04)."""
@@ -574,6 +874,7 @@ class SettingsDialog(QDialog):
                 "allow_lan": bool(self.web_lan.isChecked()),
                 "open_browser_on_start": bool(self.web_open.isChecked()),
             },
+            "browser": {"enabled": bool(self.browser_autofill.isChecked())},
         }
         try:
             self._controller.set_settings(payload)
@@ -596,10 +897,14 @@ class SettingsDialog(QDialog):
         self.tabs.setTabText(2, i18n.tr("settings.tab_semantic"))
         self.tabs.setTabText(3, i18n.tr("settings.tab_importer"))
         self.tabs.setTabText(4, i18n.tr("settings.tab_web"))
-        self.tabs.setTabText(5, i18n.tr("settings.tab_sync"))
-        self.tabs.setTabText(6, i18n.tr("settings.tab_log"))
+        self.browser_hint.setText(i18n.tr("settings.browser_autofill_hint"))
+        self.tabs.setTabText(5, i18n.tr("settings.tab_fingerprint"))
+        self.tabs.setTabText(6, i18n.tr("settings.tab_sync"))
+        self.tabs.setTabText(7, i18n.tr("settings.tab_log"))
         self.language_combo.setItemText(0, i18n.tr("language.fa"))
         self.language_combo.setItemText(1, i18n.tr("language.en"))
+        for index, choice in enumerate(theme.THEMES):
+            self.theme_combo.setItemText(index, i18n.tr(f"theme.{choice}"))
         for index, level in enumerate(_LEVELS):
             self.level_combo.setItemText(index, i18n.tr(_LEVEL_KEYS[level]))
         self.open_home_button.setText(i18n.tr("settings.open_folder"))
@@ -623,8 +928,12 @@ class SettingsDialog(QDialog):
         self.sync_now_button.setText(i18n.tr("settings.sync_now"))
         self.sync_acquire_button.setText(i18n.tr("settings.sync_acquire"))
         self.sync_release_button.setText(i18n.tr("settings.sync_release"))
+        self.fingerprint_enable_button.setText(i18n.tr("settings.fingerprint_enable"))
+        self.fingerprint_test_button.setText(i18n.tr("settings.fingerprint_test"))
+        self.fingerprint_disable_button.setText(i18n.tr("settings.fingerprint_disable"))
         self._refresh_semantic_status()
         self._refresh_sync_state()
+        self._refresh_fingerprint_status()
 
     def _refresh_semantic_status(self) -> None:
         """Update the semantic availability, cache and last-reset lines."""

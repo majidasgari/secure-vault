@@ -88,21 +88,22 @@ def _fmt(*, color: str | None = None, bold: bool = False, italic: bool = False,
     return fmt
 
 
-def pick_palette(app: Any = None) -> dict[str, str]:
-    """Return the palette that matches the current application theme."""
-    dark = False
-    try:
-        from PySide6.QtGui import QPalette
-        from PySide6.QtWidgets import QApplication
-
-        application: Any = app or QApplication.instance()
-        if application is not None:
-            color = application.palette().color(QPalette.ColorRole.Window)
-            # Perceived luminance (ITU-R BT.601) — under 40 % means a dark theme.
-            dark = (0.299 * color.red() + 0.587 * color.green() + 0.114 * color.blue()) < 102
-    except Exception:  # noqa: BLE001 - headless / no palette: keep the light default
-        dark = False
+def palette_colors(dark: bool) -> dict[str, str]:
+    """Return a copy of the colour table for ``dark`` (``True``) or light (``False``)."""
     return dict(_DARK if dark else _LIGHT)
+
+
+def pick_palette(app: Any = None, *, dark: bool | None = None) -> dict[str, str]:
+    """Return the palette that matches the current application theme.
+
+    ``dark`` forces the choice; when it is ``None`` the theme module decides, which means an
+    explicit preference from Settings wins over what the desktop reports.
+    """
+    if dark is None:
+        from . import theme
+
+        dark = theme.is_dark(app)
+    return palette_colors(bool(dark))
 
 
 def _matches(pattern: QRegularExpression, text: str) -> list[Any]:

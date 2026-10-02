@@ -22,11 +22,11 @@ from PySide6.QtWidgets import QApplication, QMessageBox
 
 from . import __version__
 from .config import DEFAULT_VAULT_HOME, runtime_dir, user_config
-from .core import semantics
+from .core import fingerprint, semantics
 from .core.session import VaultSession
 from .errors import Unauthorized
 from .ui import editor as editor_module
-from .ui import i18n, theme, viewer
+from .ui import i18n, image_view, theme, viewer
 from .ui.app import VaultApplication
 from .ui.settings_dialog import SettingsDialog
 
@@ -103,6 +103,21 @@ def _acquire_single_instance() -> Any:
         handle.close()
         return None
     return handle
+
+
+def _png_bytes(width: int = 4, height: int = 3) -> bytes:
+    """Build a small PNG in memory so the picture flows can be exercised for real."""
+    from PySide6.QtCore import QBuffer, QByteArray
+    from PySide6.QtGui import QColor, QPixmap
+
+    pixmap = QPixmap(width, height)
+    pixmap.fill(QColor("#336699"))
+    array = QByteArray()
+    buffer = QBuffer(array)
+    buffer.open(QBuffer.OpenModeFlag.WriteOnly)
+    pixmap.save(buffer, "PNG")
+    buffer.close()
+    return bytes(array.data())
 
 
 def run_self_test(
@@ -184,6 +199,35 @@ def run_self_test(
     checks["viewer_text"] = viewer.last_text
     checks["viewer_uses_web"] = viewer.uses_web_engine
     checks["web_views_for_secretfile"] = editor_module.web_views_created - web_before
+
+    # Pictures go to the native image viewer, not the editor or a web engine (SPEC/03 §2.4).
+    picture = _png_bytes()
+    session.write_file("notes/shot.png", picture)
+    session.write_file("secrets/scan.png", picture)
+    session.set_sensitivity("secrets/scan.png", "secret")
+    checks["image_suffix_yes"] = image_view.looks_like_image("/notes/shot.png")
+    checks["image_suffix_no"] = image_view.looks_like_image("/notes/hello.md")
+    web_before = editor_module.web_views_created
+    checks["open_image"] = bool(window.open_file("/notes/shot.png"))
+    checks["image_size"] = image_view.last_size
+    checks["image_bytes_roundtrip"] = controller.read_bytes("/notes/shot.png") == picture
+    checks["image_uses_web"] = editor_module.web_views_created - web_before
+    checks["image_viewer_open"] = bool(getattr(window, "image_viewer", None))
+    checks["open_secret_image"] = bool(controller.open_path("/secrets/scan.png"))
+    checks["secret_image_shown"] = image_view.last_path == "/secrets/scan.png"
+
+    # Appearance: a forced dark theme repaints the widgets that carry their own colours.
+    light_bg = theme.colors()["bg"]
+    checks["theme_default"] = theme.preference()
+    checks["theme_set_dark"] = controller.set_theme("dark")
+    checks["theme_dark_active"] = theme.is_dark()
+    checks["theme_dark_palette"] = theme.colors()["bg"] != light_bg
+    checks["theme_persisted"] = controller.config.data.get("theme")
+    checks["theme_canvas_dark"] = (
+        theme.colors()["code_bg"] in window.image_viewer.canvas.styleSheet()
+    )
+    checks["theme_back_to_system"] = controller.set_theme("system")
+    checks["theme_system_restored"] = theme.preference() == "system"
     audit = controller.dispatch_ui("vault.access_log", {"limit": 50}).get("entries", [])
     checks["secretfile_logged"] = any(
         entry.get("tool") == "ui.read_secretfile" for entry in audit
@@ -215,18 +259,46 @@ def run_self_test(
     dialog = SettingsDialog(controller, window)
     dialog.show()
     qapp.processEvents()
-    dialog.close()
     checks["settings_ok"] = True
+    checks["settings_tabs"] = dialog.tabs.count()
+    checks["settings_fingerprint_tab"] = bool(dialog.fingerprint_enable_button.text())
+
+    # Quick unlock: store a wrapped key, release it with a fabricated match, then drop it again
+    # (the scratch XDG_DATA_HOME keeps this away from the user's real record).
+    verification = fingerprint.VerifyResult(True, "match", "0.0s", ("self-test",))
+    quick_state = session.quick_unlock_enable(verification)
+    checks["quick_unlock_enabled"] = bool(quick_state.get("enabled"))
+    released = fingerprint.release_master_key(vault_home, verification)
+    checks["quick_unlock_release"] = bytes(released) == bytes(session._master_key or b"")
+    checks["quick_unlock_removed"] = bool(session.quick_unlock_disable())
+    checks["quick_unlock_off"] = not fingerprint.quick_unlock_state(vault_home)["enabled"]
+    # Enable it once more so the unlock screen has something to offer after locking.
+    checks["quick_unlock_reenabled"] = bool(session.quick_unlock_enable(verification)["enabled"])
+    dialog.close()
 
     controller.lock()
     checks["locked_screen"] = controller.current_screen == "unlock"
     checks["session_locked"] = bool(session.is_locked)
+    unlock_screen = controller.unlock_screen
+    unlock_state = unlock_screen.fingerprint_state() if unlock_screen is not None else {}
+    checks["unlock_fingerprint_state"] = "available" in unlock_state
+    # Quick unlock is on, so the screen offers the sensor by itself and keeps its button.
+    checks["unlock_auto_scan_armed"] = controller.auto_scan_armed()
+    checks["unlock_fingerprint_button"] = bool(
+        unlock_screen is not None and not unlock_screen.fingerprint_button.isHidden()
+    )
+    # Never let the scheduled scan reach the real sensor during a self-test.
+    controller.cancel_auto_scan()
+    checks["unlock_auto_scan_cancelled"] = not controller.auto_scan_armed()
+    checks["quick_unlock_cleaned"] = bool(fingerprint.disable_quick_unlock(vault_home))
+    checks["quick_unlock_absent"] = not fingerprint.quick_unlock_state(vault_home)["enabled"]
     checks["selftest_ok"] = all(
         bool(value)
         for key, value in checks.items()
         if key not in ("tree_rows", "viewer_text", "viewer_uses_web",
                        "web_views_for_secretfile", "search_filename", "search_text",
-                       "search_semantic", "last_results_filename", "log_rows")
+                       "search_semantic", "last_results_filename", "log_rows",
+                       "image_suffix_no", "image_uses_web", "image_size")
     )
 
     return SelfTestResult(

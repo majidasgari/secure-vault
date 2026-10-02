@@ -38,7 +38,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from . import bidi, i18n
+from . import bidi, i18n, theme
 from .highlight import MarkdownHighlighter, pick_palette
 
 _LOG = logging.getLogger(__name__)
@@ -297,12 +297,37 @@ class EditorPanel(QWidget):
             self.preview_kind = "web"
             web_views_created += 1
             view = QWebEngineView(self)
+            self._paint_preview_background(view)
             # A failed load means the engine cannot render here: swap to a text browser.
             view.loadFinished.connect(self._on_preview_loaded)
             return view
         except Exception:  # noqa: BLE001 - offscreen/no-engine fallback
             self.preview_kind = "text"
             return QTextBrowser(self)
+
+    def _paint_preview_background(self, view: Any) -> None:
+        """Tint the web view itself, not just the page it loads (SPEC/03 §10).
+
+        The HTML body is themed, but a web view still paints the area around a short document
+        — and every frame before the document arrives — in its own white. That white slab is
+        what shows up in the middle of a dark window, so the widget gets the theme colour too.
+        """
+        try:
+            from PySide6.QtGui import QColor
+
+            view.setBackgroundColor(QColor(theme.colors()["code_bg"]))
+        except Exception:  # noqa: BLE001 - text fallback has no such method
+            pass
+
+    def apply_theme(self) -> None:
+        """Re-apply the theme to the preview (called when the appearance changes)."""
+        if self.preview_kind == "web":
+            self._paint_preview_background(self.preview)
+        self._render_preview()
+
+    def refresh_theme(self) -> None:
+        """Alias kept for the window-level theme refresh."""
+        self.apply_theme()
 
     def _on_preview_loaded(self, ok: bool) -> None:
         """Remember whether the web engine managed to load the page."""

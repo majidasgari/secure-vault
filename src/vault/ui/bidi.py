@@ -145,7 +145,18 @@ def split_blocks(markdown: str) -> list[tuple[str, bool]]:
     return blocks
 
 
+#: Left-to-right mark: an invisible bidi control that keeps a path/URL from being reordered
+#: inside a right-to-left line (the status bar).
+LTR_MARK = "\u200e"
+
+
+def ltr_isolate(text: str) -> str:
+    """Wrap ``text`` in left-to-right marks so a path or URL keeps its own direction."""
+    return f"{LTR_MARK}{text}{LTR_MARK}"
+
+
 __all__ = [
+    "LTR_MARK",
     "needs_rtl",
     "block_direction",
     "split_blocks",
@@ -153,4 +164,5 @@ __all__ = [
     "is_arabic_letter",
     "is_arabic_strong",
     "is_latin_strong",
+    "ltr_isolate",
 ]

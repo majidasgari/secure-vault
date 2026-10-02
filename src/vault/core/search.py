@@ -34,6 +34,7 @@ def _result(row: dict[str, Any], match: str) -> dict[str, Any]:
         "sensitivity": row["sensitivity"],
         "size": int(row["size"]),
         "mtime": int(row["mtime"]),
+        "emoji": row.get("emoji"),
         "match": match,
     }
 

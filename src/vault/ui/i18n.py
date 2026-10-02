@@ -115,6 +115,21 @@ def tr(key: str, **fmt: object) -> str:
     return _translator.t(key, **fmt)
 
 
+def reason_text(reason: str) -> str:
+    """Translate a machine-readable reason (``fingerprint.reason.<value>``).
+
+    Falls back to the raw reason when no catalogue entry exists, so a new reason code can
+    never render as a ⟦missing⟧ marker.
+    """
+    if not reason:
+        return ""
+    key = f"fingerprint.reason.{reason}"
+    text = tr(key)
+    if text == MISSING_TEMPLATE.format(key=key):
+        return reason
+    return text
+
+
 def set_language(lang: str) -> None:
     """Switch the current language and refresh registered widgets."""
     _translator.set_language(lang)

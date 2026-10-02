@@ -88,6 +88,11 @@ logged, echoed or stored.
   for secret levels), used by the SPA's «متن خام» button.
 * `GET /api/session` — locked state, home, language, auto-lock seconds, version,
   and counts **only while unlocked** (locked mode leaks no counts).
+* `GET /api/session/quick-unlock` — `{available, enabled, device, fingers, reason}` for the
+  fingerprint button; `POST /api/session/unlock-fingerprint` runs one scan and unlocks on a
+  match; `POST /api/session/quick-unlock/enable` and `.../disable` enrol or drop the record
+  (they need an unlocked vault). Answering **loopback clients only** keeps a phone on the
+  LAN from triggering a scan at your desk. See `docs/SECURITY.md` §11.
 * `GET /api/i18n?lang=fa|en` — the catalogue (`i18n/*.json`, single source of truth).
 * `GET /api/events` — Server-Sent Events (`log`, `lock`, `unlock`,
   `secret_request`, `data_changed`, `ping` keepalive ≤ 10 s). The browser consumes
@@ -111,7 +116,11 @@ The single page mirrors the standalone mirror browser and adds the vault's level
   status line: lock state · file count · agents · auto-lock countdown.
 * **Sidebar**: a collapsible folder tree from `/api/index` where every row shows the
   note count of its whole subtree and a 🔓/🔒/🔑 level badge; tag chips below it carry
-  counts and run `tag:<name>` on click.
+  counts and run `tag:<name>` on click. Every tree row also carries the **🗑 حذف پوشه**
+  row action (faint until hover, always visible on touch widths), so a folder — including
+  a direct child of `/`, which the tree is the only place to list — can be deleted without
+  opening its parent first. Right-clicking a row (tree or notebook list) opens the folder's
+  menu: باز کردن · تغییر نام · حذف پوشه · رونوشت مسیر.
 * **Views**: welcome state; folder view with breadcrumbs, sub-notebooks **with
   counts**, notes with their updated date; note view with title, `📅 ویرایش` /
   `🕓 ساخت` dates, clickable tag chips, `🔗 منبع` when `source:` metadata exists, and
@@ -121,6 +130,27 @@ The single page mirrors the standalone mirror browser and adds the vault's level
   opens `/api/raw` as plain text in a new tab; and an edit view with a formatting
   toolbar (bold, italic, strike, code, heading, quote, bullet, numbered, link, image,
   rule), Save/Cancel, `Ctrl+S` and a dirty guard.
+* **Code is previewed, not dumped.** A fenced block (` ``` ` or `~~~`, with or without a language,
+  indented under a list step or at column 0) renders as a box with its own header: the fence's
+  language on the inline-start side and a «رونوشت کد» copy button on the other, code LTR and
+  monospace inside. The fence's own indentation is stripped like CommonMark does, so a block written
+  inside a numbered step does not keep the list's eight spaces; a fence left open at the end of the
+  note still closes its markup.
+* **Direction is decided per line, never inherited.** Every block the renderer emits carries its
+  own direction: headings and paragraphs `dir="auto"`, list items `dir="auto"`, table cells
+  `dir="auto"`, code `dir="ltr"` — so a Persian line is right-aligned inside an English note and a
+  Latin line stays left inside a Persian one. Containers cannot use `auto`: the browser ignores
+  text that sits inside a descendant carrying its own `dir` attribute, so a list whose items are all
+  `dir="auto"` used to resolve LTR and draw its bullets on the left, and a table put its first
+  column there too. `renderMarkdown` therefore decides the container itself — `<ul>`/`<ol>`,
+  `<table>` and `<blockquote>` get `dir="rtl"` when any of their own lines has a Persian/Arabic
+  letter, `dir="ltr"` otherwise — and `#note-body` / `#preview` follow the note's own language.
+  Blockquote lines (`> …`) render as real quotes.
+* Deleting a folder is recursive: the confirmation says so («… و همهٔ محتویات داخلش حذف شود؟»)
+  and the call is `vault.file_ops {op: delete, recursive: true}`, which takes the folder,
+  its subfolders, its notes and its secretfiles (and their blobs) out in one step. Deleting a
+  folder that still has children without `recursive` is refused, and `/` itself is never
+  deletable.
 * Secret/secretfile files never reach the markdown renderer: a plain read is refused
   and the content is shown only in the plain-text modal (or opened natively by the
   desktop UI), exactly as before.
@@ -232,6 +262,8 @@ responsive (single column, slide-over panels, ≥ 40 px tap targets) and Persian
   request must carry `X-Vault-Claim: 1` — a cross-origin page cannot read the reply (no CORS
   headers are ever sent) and the non-simple header needs a preflight this server never approves.
   Both allow and deny are written to the access log as `session.claim`; no content is returned.
+  `{"scope": "browser"}` claims the *narrow* autofill token instead (valid only on
+  `/api/autofill/*`), which is what a browser add-on uses — see `docs/BROWSER-AUTOFILL.md`.
 
 The browser follows the same sensitivity rules as the desktop UI:
 

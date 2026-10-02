@@ -9,8 +9,10 @@ from __future__ import annotations
 import http.client
 import json
 import re
+import shutil
 import subprocess
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -302,6 +304,14 @@ class CallTest(_WebTestCase):
         )
         self.assertEqual(data["result"]["tags"], ["x", "y"])
 
+        status, data = self.call("vault.set_emoji", {"path": "/notes", "emoji": "🗂️"})
+        self.assertEqual(data["result"]["emoji"], "🗂️")
+        self.assertEqual(data["result"]["name"], "notes")
+        status, data = self.call("vault.emoji_palette", {})
+        self.assertTrue(data["result"]["groups"])
+        status, data = self.call("vault.set_emoji", {"path": "/notes", "emoji": ""})
+        self.assertIsNone(data["result"]["emoji"])
+
         status, data = self.call(
             "vault.set_folder_note", {"path": "/notes", "text": "a note"}
         )
@@ -445,16 +455,18 @@ class I18nTest(_WebTestCase):
         return json.loads((I18N_DIR / f"{lang}.json").read_text(encoding="utf-8"))
 
     def test_i18n_endpoint_matches_catalogue(self) -> None:
-        """GET /api/i18n?lang=fa returns exactly the file's key set."""
+        """GET /api/i18n?lang=fa returns the file's key set plus the private `_languages` hint."""
         status, data = self.json_request("GET", "/api/i18n?lang=fa")
         self.assertEqual(status, 200)
-        self.assertEqual(set(data), set(self._catalogue("fa")))
+        self.assertEqual({k for k in data if not k.startswith("_")}, set(self._catalogue("fa")))
+        self.assertIn("_languages", data)
 
     def test_i18n_en(self) -> None:
-        """GET /api/i18n?lang=en returns exactly the file's key set."""
+        """GET /api/i18n?lang=en returns the file's key set plus the private `_languages` hint."""
         status, data = self.json_request("GET", "/api/i18n?lang=en")
         self.assertEqual(status, 200)
-        self.assertEqual(set(data), set(self._catalogue("en")))
+        self.assertEqual({k for k in data if not k.startswith("_")}, set(self._catalogue("en")))
+        self.assertIn("_languages", data)
 
     def test_data_i18n_keys_exist(self) -> None:
         """Every data-i18n attribute in index.html exists in both catalogues."""
@@ -503,7 +515,8 @@ class SecretApprovalTest(_WebTestCase):
 
         rows = self.session.access_log(limit=100)
         pairs = {(row["tool"], row["outcome"]) for row in rows}
-        self.assertIn(("vault.read_file", "deny"), pairs)
+        # The log records the tool name the call arrived under ("read_file" for the agent role).
+        self.assertIn(("read_file", "deny"), pairs)
         self.assertIn(("vault.read_secret", "allow"), pairs)
 
     def test_normal_read_is_not_gated(self) -> None:
@@ -513,6 +526,59 @@ class SecretApprovalTest(_WebTestCase):
         self.assertEqual(data["result"]["content"], "plain body")
         self.assertIn("mtime", data["result"])
         self.assertIn("tags", data["result"])
+
+
+class FolderDeleteTest(_WebTestCase):
+    """Deleting a folder through the web API, recursively (the web UI's 🗑 row action)."""
+
+    def _tree(self) -> None:
+        """A folder tree whose leaves include a secretfile."""
+        self.unlock()
+        for folder in ("/tree", "/tree/sub", "/tree/sub/deep"):
+            self.call("vault.mkdir", {"path": folder})
+        self.call("vault.write_file", {"path": "/tree/plain.md", "content": "plain"})
+        self.call("vault.write_file", {"path": "/tree/sub/note.md", "content": "note"})
+        self.call(
+            "vault.write_file",
+            {"path": "/tree/sub/deep/hidden.md", "content": "hidden", "sensitivity": "secretfile"},
+        )
+
+    def test_recursive_delete_removes_the_whole_subtree(self) -> None:
+        """``recursive`` takes the folder, its folders and its secretfiles out in one call."""
+        self._tree()
+        status, data = self.call(
+            "vault.file_ops", {"op": "delete", "src": "/tree", "recursive": True}
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(data["result"]["affected"], 6)
+        status, data = self.call("vault.list_folder", {"path": "/"})
+        self.assertNotIn("tree", [entry["name"] for entry in data["result"]["entries"]])
+        status, data = self.call("vault.read_file", {"path": "/tree/sub/deep/hidden.md"})
+        self.assertEqual(data["error"]["code"], "NOT_FOUND")
+
+    def test_non_recursive_delete_refuses_a_folder_with_children(self) -> None:
+        """Without ``recursive`` a folder that still has children is refused, not emptied."""
+        self._tree()
+        status, data = self.call("vault.file_ops", {"op": "delete", "src": "/tree/sub"})
+        self.assertEqual(data["error"]["code"], "BAD_REQUEST")
+        status, data = self.call("vault.list_folder", {"path": "/tree/sub"})
+        self.assertEqual(
+            sorted(entry["name"] for entry in data["result"]["entries"]), ["deep", "note.md"]
+        )
+
+    def test_root_can_never_be_deleted(self) -> None:
+        """``/`` itself is not deletable, recursive or not, and nothing under it is touched."""
+        self._tree()
+        for payload in (
+            {"op": "delete", "src": "/", "recursive": True},
+            {"op": "delete", "src": "/", "recursive": False},
+        ):
+            status, data = self.call("vault.file_ops", payload)
+            self.assertFalse(data["ok"], payload)
+            self.assertIn(data["error"]["code"], ("BAD_REQUEST", "NOT_FOUND"), payload)
+        status, data = self.call("vault.list_folder", {"path": "/"})
+        names = sorted(entry["name"] for entry in data["result"]["entries"])
+        self.assertIn("tree", names)
 
 
 class ActivitySseTest(_WebTestCase):
@@ -651,11 +717,216 @@ class ParitySpaTest(unittest.TestCase):
         self.assertIn("subtreeNoteCounts", js)
         self.assertIn('dir="auto"', html)
         self.assertIn('setAttribute("dir"', js)
-        for endpoint in ("/api/index", "/api/search", "/api/raw", "/api/blob"):
+        for endpoint in ("/api/index", "/api/call", "/api/raw", "/api/blob"):
             self.assertIn(endpoint, js)
         self.assertNotIn("http://", js)
         self.assertNotIn("https://", js)
         self.assertNotIn("localStorage", js)
+
+
+class FolderDeleteSpaTest(unittest.TestCase):
+    """Every folder listing carries the folder delete action (web UI)."""
+
+    def setUp(self) -> None:
+        self.js = (WEBUI_DIR / "app.js").read_text(encoding="utf-8")
+
+    def _function(self, name: str) -> str:
+        """Return the source of ``function <name>(…​) { … }`` by brace matching."""
+        start = self.js.index(f"function {name}(")
+        index = self.js.index("{", start)
+        depth = 0
+        for offset in range(index, len(self.js)):
+            if self.js[offset] == "{":
+                depth += 1
+            elif self.js[offset] == "}":
+                depth -= 1
+                if depth == 0:
+                    return self.js[start : offset + 1]
+        raise AssertionError(f"unbalanced braces in {name}")
+
+    def test_folder_tree_rows_have_the_delete_action(self) -> None:
+        """A tree row — the only listing of a folder under ``/`` — carries 🗑."""
+        body = self._function("buildTreeRow")
+        self.assertIn("rowDeleteButton(node)", body)
+        self.assertIn("bindRowMenu(li, node)", body)
+
+    def test_notebook_rows_have_the_delete_action(self) -> None:
+        """The centre folder list keeps its own 🗑 plus the row menu."""
+        body = self._function("renderFolderView")
+        self.assertIn("rowDeleteButton(entry)", body)
+        self.assertIn("bindRowMenu(li, entry)", body)
+
+    def test_folder_delete_is_labelled_and_recursive(self) -> None:
+        """The action and the confirmation both speak about a folder and its contents."""
+        self.assertIn('entry.is_dir ? t("menu.delete_folder")', self.js)
+        self.assertIn('t("dialog.delete_folder_confirm"', self.js)
+        self.assertIn("recursive: isDir", self._function("performDelete"))
+
+    def test_context_menu_offers_the_folder_actions(self) -> None:
+        """Right-clicking a folder lists open / rename / delete / copy path — never note-only items."""
+        body = self._function("showContextMenu")
+        self.assertIn('item(t("menu.delete_folder")', body)
+        self.assertLess(body.index("if (entry.is_dir)"), body.index('t("menu.tags")'))
+
+
+NODE_RENDER = r'''
+const fs = require("fs");
+const payload = JSON.parse(fs.readFileSync(process.argv[2], "utf8"));
+const src = fs.readFileSync(payload.appjs, "utf8");
+const code = src.slice(src.indexOf("  function escapeHtml(text) {"),
+                       src.indexOf("  function hydrateImages(root) {"));
+const build = new Function("window", "TextEncoder", "Blob", "URL", "navigator",
+  code + "\nreturn { renderMarkdown };");
+const api = build({}, TextEncoder, Blob,
+  { createObjectURL: () => "blob:x", revokeObjectURL: () => {} }, {});
+process.stdout.write(JSON.stringify(payload.cases.map((c) => api.renderMarkdown(c, "/note.md"))));
+'''
+
+
+def render_markdown(*sources: str) -> list[str]:
+    """Render each markdown source through the real ``renderMarkdown`` in Node.
+
+    Skips the calling test when Node is unavailable; the SPA functions are sliced out of
+    ``app.js`` (see the harness note in the ops skill) so no browser is needed.
+    """
+    node = shutil.which("node")
+    if not node:
+        raise unittest.SkipTest("node is not installed")
+    with tempfile.TemporaryDirectory() as tmp:
+        script = Path(tmp) / "render.js"
+        payload = Path(tmp) / "payload.json"
+        script.write_text(NODE_RENDER, encoding="utf-8")
+        payload.write_text(
+            json.dumps({"appjs": str(WEBUI_DIR / "app.js"), "cases": list(sources)}),
+            encoding="utf-8",
+        )
+        proc = subprocess.run(
+            [node, str(script), str(payload)], capture_output=True, text=True, timeout=60
+        )
+    if proc.returncode != 0:
+        raise AssertionError(f"node failed: {proc.stderr[-800:]}")
+    return json.loads(proc.stdout)
+
+
+class MarkdownCodeBlockTest(unittest.TestCase):
+    """Fenced code renders as a code block — the real ``renderMarkdown`` driven in Node.
+
+    ``tools/ui_probe.py`` proves the pixels in a browser; this proves the function itself, so a
+    fence that is indented under a list item (the common way to write one) cannot regress into
+    literal ``` text again.
+    """
+
+    def _render(self, *sources: str) -> list[str]:
+        """Render each source through app.js (skipping when node is missing)."""
+        return render_markdown(*sources)
+
+    def test_indented_fence_inside_a_list_item(self) -> None:
+        """A fence indented under a step loses its ``` lines and its extra indentation."""
+        (html,) = self._render(
+            "1.  **تنظیم:** فایل را بساز:\n"
+            "        ```\n"
+            "        /srv/shared_folder   IP_CLIENT(rw,sync)\n"
+            "        ```\n"
+            "        ادامهٔ متن.\n"
+        )
+        self.assertNotIn("```", html)
+        self.assertIn('<div class="code-block"><pre><code dir="ltr">', html)
+        self.assertIn("/srv/shared_folder   IP_CLIENT(rw,sync)", html)
+        self.assertIn("</code></pre></div>", html)
+        self.assertIn("ادامهٔ متن.", html)
+
+    def test_language_from_the_info_string(self) -> None:
+        """```bash becomes a data-lang + language-bash class (the header badge reads it)."""
+        (html,) = self._render("    ```bash\n    sudo mount /mnt/x\n    ```\n")
+        self.assertIn('<div class="code-block" data-lang="bash">', html)
+        self.assertIn('class="language-bash"', html)
+        self.assertIn("sudo mount /mnt/x", html)
+        self.assertNotIn("    sudo", html)
+
+    def test_tilde_fence_and_unterminated_block(self) -> None:
+        """~~~ closes like ``` and a fence left open at the end still closes its markup."""
+        tilde, open_end = self._render("~~~python\nprint(1)\n~~~\n", "```\nlast line\n")
+        self.assertIn('data-lang="python"', tilde)
+        self.assertNotIn("~~~", tilde)
+        self.assertTrue(open_end.rstrip().endswith("</code></pre></div>"), open_end[-60:])
+
+    def test_code_content_is_escaped_not_executed(self) -> None:
+        """Markup inside a code block stays text."""
+        (html,) = self._render("```html\n<script>alert(1)</script>\n```\n")
+        self.assertIn("&lt;script&gt;alert(1)&lt;/script&gt;", html)
+        self.assertNotIn("<script>", html)
+
+    def test_block_starts_with_its_first_line(self) -> None:
+        """No newline right after <code>: <pre> would paint it as an empty first line."""
+        (html,) = self._render("```bash\nsudo mount /mnt/x\nsudo mount -a\n```\n")
+        self.assertIn(
+            '<pre><code dir="ltr" class="language-bash">sudo mount /mnt/x\nsudo mount -a</code>',
+            html,
+        )
+
+    def test_inline_code_is_untouched(self) -> None:
+        """A single backtick pair is still inline code, not a block."""
+        (html,) = self._render("متن با `inline code` ادامه.\n")
+        self.assertNotIn("code-block", html)
+        self.assertIn('<code dir="ltr">inline code</code>', html)
+
+
+class MarkdownDirectionTest(unittest.TestCase):
+    """Per-line direction: a Persian line is RTL, a Latin line is LTR, containers follow content.
+
+    The container direction cannot come from ``dir="auto"``: the browser ignores text that sits
+    inside a descendant carrying its own dir attribute, so a list whose items are all `dir="auto"`
+    resolved LTR and drew its bullets on the left (Max reported it as «بعضی مواقع چیزهایی که باید
+    RTL باشند، نیستند»). The renderer therefore decides the container itself.
+    """
+
+    def test_persian_list_is_rtl_english_list_is_ltr(self) -> None:
+        """Bullets follow the content, and each item keeps its own per-line direction."""
+        persian, english = render_markdown(
+            "- مستنداتش همه استاندارد و تی‌م‌زند (TASK_SPEC, AGENTS.md)\n- نحوه‌ی حرف زدنش\n",
+            "- file entries and English first item\n- attachments\n",
+        )
+        self.assertIn('<ul dir="rtl">', persian)
+        self.assertIn('<li dir="auto">', persian)
+        self.assertIn('<ul dir="ltr">', english)
+        self.assertNotIn('<ul dir="rtl">', english)
+
+    def test_mixed_list_keeps_the_persian_item_rtl(self) -> None:
+        """One Persian line is enough for a right-hand marker; the Latin item stays auto."""
+        (html,) = render_markdown("- file entries first\n- مستنداتش فارسی است\n")
+        self.assertIn('<ul dir="rtl">', html)
+        self.assertIn('<li dir="auto">file entries first</li>', html)
+
+    def test_numbered_and_task_items_carry_dir(self) -> None:
+        """Ordered lists and task lists are per-line too."""
+        numbered, tasks = render_markdown("1. یک\n2. دو\n", "- [x] انجام شد\n- [ ] باقی\n")
+        self.assertIn('<ol dir="rtl">', numbered)
+        self.assertIn('<li dir="auto">یک</li>', numbered)
+        self.assertIn('<ul dir="rtl">', tasks)
+        self.assertIn('<li dir="auto" class="task done">', tasks)
+
+    def test_table_direction_follows_its_cells(self) -> None:
+        """A Persian table starts its first column on the right; an English one on the left."""
+        persian, english = render_markdown(
+            "| ستون اول | ستون دوم |\n| --- | --- |\n| خانهٔ یک | خانهٔ دو |\n",
+            "| first | second |\n| --- | --- |\n| alpha | beta |\n",
+        )
+        self.assertIn('<table dir="rtl"><tbody>', persian)
+        self.assertIn('<td dir="auto">ستون اول</td>', persian)
+        self.assertIn('<table dir="ltr"><tbody>', english)
+
+    def test_quote_direction_follows_its_lines(self) -> None:
+        """The quote's border side follows its own content, not the note body."""
+        persian, english = render_markdown("> نقل قول فارسی\n", "> quoted in english\n")
+        self.assertIn('<blockquote dir="rtl">', persian)
+        self.assertIn('<blockquote dir="ltr">', english)
+
+    def test_paragraphs_and_headings_stay_auto(self) -> None:
+        """Mixed content per line is the browser's job — those blocks keep dir=auto."""
+        (html,) = render_markdown("# عنوان\n\nمتن انگلیسی mixed with فارسی\n")
+        self.assertIn('<h1 dir="auto">عنوان</h1>', html)
+        self.assertIn('<p dir="auto">', html)
+        self.assertNotIn('dir="rtl">عنوان', html)
 
 
 class NetworkFreeTest(unittest.TestCase):
@@ -703,3 +974,160 @@ class HostGuardTest(unittest.TestCase):
 
 if __name__ == "__main__":  # pragma: no cover - manual run
     unittest.main()
+
+
+class EmojiTest(_WebTestCase):
+    """The emoji label surface (SPEC/07 §9)."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.session.mkdir("notes")
+        self.session.write_file("notes/a.md", b"# a\n")
+
+    def test_palette_is_quiet_and_readable_before_unlocking(self) -> None:
+        """The picker list is static metadata: no unlock, no content, no state change."""
+        status, data = self.call("vault.emoji_palette")
+        self.assertEqual(status, 200, data)
+        groups = data["result"]["groups"]
+        self.assertTrue(groups)
+        self.assertTrue(all(group["items"] for group in groups))
+        self.assertTrue(all(str(g["group"]).startswith("emoji.group.") for g in groups))
+
+    def test_set_label_on_a_folder_and_read_it_back(self) -> None:
+        """The label reaches the listing row the browser renders."""
+        self.unlock()
+        status, data = self.call("vault.set_emoji", {"path": "/notes", "emoji": "🗂️"})
+        self.assertEqual(status, 200, data)
+        self.assertEqual(data["result"]["emoji"], "🗂️")
+        self.assertEqual(data["result"]["name"], "notes")
+
+        status, data = self.call("vault.list_folder", {"path": "/"})
+        entry = next(e for e in data["result"]["entries"] if e["name"] == "notes")
+        self.assertEqual(entry["emoji"], "🗂️")
+
+    def test_set_label_on_a_file_and_read_it_back(self) -> None:
+        """The note payload carries it too, so the note head can show it."""
+        self.unlock()
+        status, data = self.call("vault.set_emoji", {"path": "/notes/a.md", "emoji": "📝"})
+        self.assertEqual(status, 200, data)
+        status, data = self.call("vault.read_file", {"path": "/notes/a.md"})
+        self.assertEqual(data["result"]["emoji"], "📝")
+        status, data = self.call("vault.search_filenames", {"query": "a.md"})
+        hits = data["result"]["results"]
+        self.assertEqual(hits[0]["emoji"], "📝")
+
+    def test_clearing_a_label(self) -> None:
+        """An empty string clears it and the listing stops showing a prefix."""
+        self.unlock()
+        self.call("vault.set_emoji", {"path": "/notes", "emoji": "🗂️"})
+        status, data = self.call("vault.set_emoji", {"path": "/notes", "emoji": ""})
+        self.assertEqual(status, 200, data)
+        self.assertIsNone(data["result"]["emoji"])
+
+    def test_labels_are_refused_when_they_are_not_glyphs(self) -> None:
+        """A word and an over-long value are both BAD_REQUEST."""
+        self.unlock()
+        for bad in ("notes", "📁" * 20):
+            status, data = self.call("vault.set_emoji", {"path": "/notes", "emoji": bad})
+            self.assertEqual(status, 400, data)
+            self.assertEqual(data["error"]["code"], "BAD_REQUEST")
+
+    def test_unknown_path_is_not_found(self) -> None:
+        """Labelling a path that does not exist is NOT_FOUND."""
+        self.unlock()
+        status, data = self.call("vault.set_emoji", {"path": "/ghost", "emoji": "⭐"})
+        self.assertEqual(data["error"]["code"], "NOT_FOUND")
+
+    def test_a_locked_browser_cannot_relabel(self) -> None:
+        """It is a write: a locked vault refuses it rather than queueing it."""
+        self.unlock()
+        self.session.lock()
+        status, data = self.call("vault.set_emoji", {"path": "/notes", "emoji": "🗂️"})
+        self.assertEqual(data["error"]["code"], "VAULT_LOCKED")
+
+
+class EmojiSpaTest(unittest.TestCase):
+    """Both listings of the browser render the label beside the name (web UI)."""
+
+    def setUp(self) -> None:
+        self.js = (WEBUI_DIR / "app.js").read_text(encoding="utf-8")
+
+    def _function(self, name: str) -> str:
+        """Return the source of ``function <name>(…​) { … }`` by brace matching."""
+        start = self.js.index(f"function {name}(")
+        index = self.js.index("{", start)
+        depth = 0
+        for offset in range(index, len(self.js)):
+            if self.js[offset] == "{":
+                depth += 1
+            elif self.js[offset] == "}":
+                depth -= 1
+                if depth == 0:
+                    return self.js[start : offset + 1]
+        raise AssertionError(f"unbalanced braces in {name}")
+
+    def test_the_folder_list_uses_the_label_with_a_folder_fallback(self) -> None:
+        """A labelled folder shows its glyph, an unlabelled one shows 📁."""
+        body = self._function("renderFolderView")
+        self.assertIn('entry.emoji || "📁"', body)
+
+    def test_the_note_and_tree_rows_carry_the_label(self) -> None:
+        """Files and tree nodes render it as their own span, beside the name."""
+        self.assertIn("emojiSpan(entry)", self._function("renderFolderView"))
+        self.assertIn("emojiSpan(node)", self._function("buildTreeRow"))
+        self.assertIn("emojiSpan(hit)", self._function("renderSearchResults"))
+        self.assertIn("state.file.emoji", self._function("renderNoteView"))
+
+    def test_the_picker_posts_the_label_and_refreshes(self) -> None:
+        """Saving calls ``vault.set_emoji`` and re-renders the surfaces on screen."""
+        body = self._function("editEmoji")
+        self.assertIn('call("vault.set_emoji"', body)
+        self.assertLess(body.index("EMOJI_MAX"), body.index('call("vault.set_emoji"'))
+        self.assertIn("refreshAfterEmoji()", body)
+
+    def test_the_context_menu_offers_the_picker(self) -> None:
+        """Right-clicking any row offers the emoji action."""
+        body = self._function("showContextMenu")
+        self.assertIn('t("menu.emoji")', body)
+        self.assertIn("editEmoji(entry)", body)
+
+    def test_the_palette_comes_from_the_service(self) -> None:
+        """The SPA never hard-codes the groups, and a failed fetch still opens the dialog."""
+        body = self._function("loadEmojiPalette")
+        self.assertIn('call("vault.emoji_palette"', body)
+        self.assertIn(".catch(", body)
+
+
+class EmojiUiTest(unittest.TestCase):
+    """The desktop picker reads the same palette and keeps the name untouched."""
+
+    def test_display_name_prefixes_only_when_labelled(self) -> None:
+        """``display_name`` is a pure prefix helper; no label means no change at all."""
+        from vault.ui.models import display_name
+
+        self.assertEqual(display_name("notes"), "notes")
+        self.assertEqual(display_name("notes", ""), "notes")
+        self.assertEqual(display_name("notes", None), "notes")
+        self.assertEqual(display_name("notes", "🗂️"), "🗂️ notes")
+        self.assertEqual(display_name("notes", "  🗂️ "), "🗂️ notes")
+
+    def test_the_dialog_offers_the_palette_and_an_explicit_clearing(self) -> None:
+        """The picker carries the hint and a "no emoji" action; its value can be empty."""
+        import inspect
+
+        from vault.ui import emoji_dialog
+
+        source = inspect.getsource(emoji_dialog)
+        self.assertIn("emoji.clear", source)
+        self.assertIn("emoji.hint", source)
+        self.assertTrue(callable(emoji_dialog.EmojiDialog.value))
+
+    def test_the_controller_reads_the_palette_from_the_service(self) -> None:
+        """``edit_emoji`` never hard-codes glyphs: it asks the service, then posts the label."""
+        import inspect
+
+        from vault.ui import app as app_module
+
+        source = inspect.getsource(app_module.VaultApplication.edit_emoji)
+        self.assertIn("vault.emoji_palette", source)
+        self.assertIn("vault.set_emoji", source)

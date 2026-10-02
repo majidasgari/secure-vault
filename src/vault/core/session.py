@@ -8,6 +8,7 @@ before raising.
 
 from __future__ import annotations
 
+import base64
 import difflib
 import logging
 import threading
@@ -32,7 +33,7 @@ from ..util import is_within, normalize_vault_path, now_ms, sha256_hex, wipe
 from . import search as search_mod
 from . import semantics
 from . import retention
-from .crypto import derive_master_key
+from .crypto import check_canary, derive_master_key
 from .index import Index
 from .meta import META_FILENAME, VaultMeta
 from .security import (
@@ -96,6 +97,10 @@ class VaultSession:
         # SPEC/09 §7: metadata-only activity feed hook (never carries content).
         self.on_activity: ActivityCallback | None = None
         self._activity_source: str | None = None
+        #: True while a bulk internal scan runs (the browser bridge's credential index): the
+        #: per-file read events of such a scan would flood the tray feed with hundreds of rows
+        #: that describe bookkeeping rather than use. The *reveal* is never suppressed.
+        self._suppress_activity = False
 
     # ------------------------------------------------------------------ lifecycle
     @staticmethod
@@ -154,9 +159,33 @@ class VaultSession:
             raise Unauthorized("bad_password")
         if not self.is_locked:
             return
+        master_key = derive_master_key(password, meta.kdf_params())
+        self._open_with_master_key(master_key)
+
+    def unlock_with_master_key(self, master_key: bytes | bytearray) -> None:
+        """Unlock the vault with a raw master key (fingerprint quick unlock).
+
+        The key is validated against the vault's canary before any state is opened, so a
+        stale or foreign key is refused exactly like a wrong password.
+
+        Raises:
+            Unauthorized: when the key does not reproduce the canary (``bad_master_key``).
+        """
+        meta = self._require_meta()
+        candidate = bytearray(master_key)
+        canary = base64.b64decode(meta.data.get("canary_b64", ""))
+        if not check_canary(bytes(candidate), canary):
+            wipe(candidate)
+            raise Unauthorized("bad_master_key", details={"reason": "canary_mismatch"})
+        if not self.is_locked:
+            wipe(candidate)
+            return
+        self._open_with_master_key(candidate)
+
+    def _open_with_master_key(self, master_key: bytearray) -> None:
+        """Open the store, filesystem and index around ``master_key`` (assumes valid)."""
         if self._index is None:
             self._index = Index(self._home / "meta.sqlite")
-        master_key = derive_master_key(password, meta.kdf_params())
         self._master_key = master_key
         self._fs = VaultFS(
             self._home,
@@ -168,6 +197,66 @@ class VaultSession:
         self._prune_access_log()
         self.touch()
         self._init_sync()
+
+    # --------------------------------------------------------------- quick unlock
+    def quick_unlock_status(self) -> dict[str, Any]:
+        """Return the fingerprint quick-unlock state for this vault.
+
+        Combines the sensor/enrolment facts (machine-wide) with the stored record for this
+        vault: ``available``, ``enabled``, ``device``, ``fingers``, ``protection`` and the
+        usage counters.
+        """
+        meta = self._require_meta()
+        from . import fingerprint  # noqa: PLC0415 - keep the core import graph flat
+
+        state = fingerprint.quick_unlock_state(self._home)
+        state["vault_id"] = meta.vault_id
+        return state
+
+    def quick_unlock_enable(
+        self,
+        verification: Any,
+        *,
+        finger: str | None = None,
+    ) -> dict[str, Any]:
+        """Store a wrapped copy of the master key, gated by a matched ``verification``.
+
+        Args:
+            verification: the :class:`fingerprint.VerifyResult` of a real scan; a result
+                that did not match refuses the write.
+            finger: optional single finger name to remember (display only).
+
+        Raises:
+            VaultLocked: when the vault is not open (there is no key to wrap).
+            Unauthorized: when ``verification`` did not match.
+        """
+        self._require_unlocked()
+        from . import fingerprint  # noqa: PLC0415 - keep the core import graph flat
+
+        assert self._master_key is not None
+        state = fingerprint.enable_quick_unlock(
+            self._home, self._master_key, verification, finger=finger
+        )
+        self._log(
+            source=SOURCE_UI,
+            tool="vault.quick_unlock_enable",
+            outcome="allow",
+            details=f"protection={state.get('protection')}",
+        )
+        return state
+
+    def quick_unlock_disable(self) -> bool:
+        """Forget the stored quick-unlock record for this vault (idempotent)."""
+        self._require_unlocked()
+        from . import fingerprint  # noqa: PLC0415 - keep the core import graph flat
+
+        removed = fingerprint.disable_quick_unlock(self._home)
+        self._log(
+            source=SOURCE_UI,
+            tool="vault.quick_unlock_disable",
+            outcome="allow" if removed else "no_record",
+        )
+        return removed
 
     def reindex_search(
         self, progress: Callable[[str, int, int], None] | None = None
@@ -514,6 +603,11 @@ class VaultSession:
         """
         callback = self.on_activity
         if callback is None:
+            return
+        # A bulk internal metadata scan (the browser bridge's credential index) reads every
+        # credential file once; those *allowed* reads describe bookkeeping, not use, and would
+        # bury the feed under hundreds of rows. Refusals and errors are still emitted.
+        if self._suppress_activity and outcome == "allow":
             return
         event = {
             "ts": now_ms(),
@@ -1266,6 +1360,36 @@ class VaultSession:
         )
         return row
 
+    def set_emoji(
+        self, path: str, emoji: str | None, *, source: str = SOURCE_UI
+    ) -> dict[str, Any]:
+        """Set (or clear, with ``None``) the emoji label of a folder or file.
+
+        Returns the updated entry, so a caller can re-render one row without re-listing the
+        folder. The label is metadata on the path (plaintext, synced, visible while locked),
+        which is why it needs no content access — but it still requires an unlocked, writable
+        session: an unlocked vault is the only state in which the index may be changed.
+        """
+        from .emoji import normalize as normalize_emoji  # noqa: PLC0415 - tiny helper
+
+        logical = normalize_vault_path(path)
+        label = normalize_emoji(emoji)
+        self._require_unlocked()
+        self._require_writable("set_emoji")
+        idx = self._require_index()
+        idx.set_emoji(logical, label)
+        self.flush()
+        self._log(source=source, tool="set_emoji", target_path=logical, outcome="allow")
+        row = idx.require_file(logical)
+        self._emit_activity(
+            kind="write",
+            tool="set_emoji",
+            path=logical,
+            sensitivity=str(row["sensitivity"]),
+            outcome="allow",
+        )
+        return row
+
     def folder_note(self, path: str, *, source: str = SOURCE_UI) -> str | None:
         """Return the note attached to a folder, if any."""
         logical = normalize_vault_path(path)
@@ -1369,14 +1493,17 @@ class VaultSession:
                         "sensitivity": child["sensitivity"],
                         "tags": idx.get_tags(child_path),
                         "note": self._store.get_folder_note(child_path),
+                        "emoji": child.get("emoji"),
                         "entries": [],
                     }
                 )
+        folder_row = idx.get_file(logical) or {}
         return {
             "name": "/" if logical == "/" else logical.rsplit("/", 1)[-1],
             "path": "/" + logical.lstrip("/"),
             "is_dir": True,
             "note": self._store.get_folder_note(logical),
+            "emoji": folder_row.get("emoji"),
             "entries": entries,
         }
 
@@ -1393,6 +1520,7 @@ class VaultSession:
             "sensitivity": row["sensitivity"],
             "tags": idx.get_tags(logical),
             "note": self._store.get_file_note(int(row["id"])),
+            "emoji": row.get("emoji"),
             "first_line": None,
         }
         if row["sensitivity"] == "normal":

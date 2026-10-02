@@ -30,7 +30,7 @@ sys.path.insert(0, str(REPO / "src"))
 from vault.api.client import RefreshingClient, VaultClient  # noqa: E402
 from vault.errors import VaultError, VaultNotRunning  # noqa: E402
 
-ROOT_NOTE = """**گنجینهٔ رمزها (مهاجرت از KeePass).** هر ورودی یک فایل `secretfile` است: نام و مسیرش دیده
+ROOT_NOTE = """**گنجینهٔ رمزها (مهاجرت از KeePass/Bitwarden).** هر ورودی یک فایل `secretfile` است: نام و مسیرش دیده
 می‌شود ولی محتوایش فقط با درخواست نمایش روی دسکتاپ باز می‌شود (دکمهٔ کپی).
 
 - ساختار: `دسته/<سایت>/<ورودی>.md` — مثلاً `بانک و پرداخت/بلوبانک/کارت بلوبانک.md`.
