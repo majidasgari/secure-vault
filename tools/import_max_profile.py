@@ -22,6 +22,7 @@ Requires the app to be running and unlocked (content tools need a session).
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 from pathlib import Path
 
@@ -30,9 +31,27 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 from vault.api.client import VaultClient  # noqa: E402  (path set above)
 
 SIDES = ("max_auto_bio", "hermes_knowing_from_max")
-DEFAULT_SOURCE = Path(
-    "/data/Cloud/Documents/Writing/M. for me/hermes"
-)
+DEFAULT_SOURCE_POSIX = Path("/data/Cloud/Documents/Writing/M. for me/hermes")
+DEFAULT_SOURCE_WINDOWS = Path("D:/Cloud/Documents/Writing/M. for me/hermes")
+
+
+def default_source() -> Path:
+    """Return the plaintext profile source, preferring what actually exists here.
+
+    The profile lives on a mounted cloud drive (``/data/Cloud`` on Linux, ``D:\\Cloud`` on
+    Windows). ``SECURE_VAULT_PROFILE_SOURCE`` wins; otherwise the first candidate directory
+    that exists is used, falling back to the POSIX default so the message stays meaningful on
+    a machine where the drive is not mounted at all.
+    """
+    env = os.environ.get("SECURE_VAULT_PROFILE_SOURCE")
+    if env:
+        return Path(env)
+    for candidate in (DEFAULT_SOURCE_WINDOWS, DEFAULT_SOURCE_POSIX):
+        if candidate.is_dir():
+            return candidate
+    return DEFAULT_SOURCE_POSIX if os.name != "nt" else DEFAULT_SOURCE_WINDOWS
+
+
 DEFAULT_DEST = "/max-profile"
 SOURCE_DOC = "max_full_profile.md"
 
@@ -70,12 +89,12 @@ def _iter_source_files(source: Path) -> list[tuple[str, Path]]:
 def main(argv: list[str] | None = None) -> int:
     """Import the profile files and print a per-file receipt."""
     ap = argparse.ArgumentParser(description="Import Max's profile folders into Secure Vault.")
-    ap.add_argument("--source", default=str(DEFAULT_SOURCE), help="plaintext profile dir")
+    ap.add_argument("--source", default=None, help="plaintext profile dir (default: the cloud drive)")
     ap.add_argument("--dest", default=DEFAULT_DEST, help="vault folder (vault-absolute)")
     ap.add_argument("--dry-run", action="store_true", help="list what would be written")
     args = ap.parse_args(argv)
 
-    source = Path(args.source).expanduser()
+    source = Path(args.source).expanduser() if args.source else default_source()
     dest = "/" + args.dest.strip("/")
     items = _iter_source_files(source)
     if not items:

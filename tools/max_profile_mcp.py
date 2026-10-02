@@ -30,6 +30,8 @@ from __future__ import annotations
 
 import json
 import os
+import socket
+import sys
 from pathlib import Path
 
 from mcp.server.fastmcp import FastMCP
@@ -48,6 +50,7 @@ mcp = FastMCP("max-profile")
 # ------------------------------------------------------------------ vault socket client
 
 SOCKET_FILENAME = "daemon.sock"
+ENDPOINT_FILENAME = "endpoint.json"
 TOKENS_FILENAME = "tokens.json"
 
 
@@ -57,8 +60,6 @@ class VaultUnavailable(RuntimeError):
 
 def _runtime_dir() -> Path:
     """Mirror ``vault.config.runtime_dir()`` — decrypted scratch lives outside the vault."""
-    import sys
-
     base = os.environ.get("XDG_RUNTIME_DIR")
     if base:
         return Path(base) / "secure-vault"
@@ -68,22 +69,51 @@ def _runtime_dir() -> Path:
     return Path("/tmp") / f"secure-vault-{os.getuid()}"
 
 
-def _endpoint():
-    """Return the live daemon endpoint (Unix socket, or loopback TCP on Windows)."""
-    import sys
+def _endpoint() -> tuple[str, object]:
+    """Return the daemon endpoint the running app published: ``("unix", Path)`` or ``("tcp", (host, port))``.
 
-    if sys.platform == "win32":
-        from vault.api.transport import read_endpoint
+    Read here rather than imported from ``vault.api.transport``: this server runs from its own
+    isolated environment (PEP 723 / ``mcp/.venv``) and must never import the vault package — the
+    wire format and ``runtime_dir``/``endpoint.json`` layout are the only contracts, and they are
+    frozen (keep in sync with ``src/vault/api/transport.py``).
+    """
+    published = _runtime_dir() / ENDPOINT_FILENAME
+    if published.exists():
+        try:
+            data = json.loads(published.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            data = {}
+        if isinstance(data, dict):
+            kind = str(data.get("kind") or "").lower()
+            if kind == "tcp" and data.get("port"):
+                return "tcp", (str(data.get("host") or "127.0.0.1"), int(data["port"]))
+            if data.get("path"):
+                return "unix", Path(str(data["path"]))
+    if hasattr(socket, "AF_UNIX"):  # nothing published yet: the POSIX default still applies
+        return "unix", _runtime_dir() / SOCKET_FILENAME
+    raise VaultUnavailable(
+        "VAULT_NOT_RUNNING: برنامهٔ Secure Vault در حال اجرا نیست — آن را باز کن"
+    )
 
-        published = read_endpoint(_runtime_dir())
-        if published is None or not published.port:
-            raise VaultUnavailable(
-                "VAULT_NOT_RUNNING: برنامهٔ Secure Vault در حال اجرا نیست — آن را باز کن"
-            )
-        return published
-    from vault.api.transport import Endpoint
 
-    return Endpoint.unix(_runtime_dir() / SOCKET_FILENAME)
+def _connect(timeout: float):
+    """Return a connected socket to the daemon, whatever transport the platform uses."""
+    kind, address = _endpoint()
+    if kind == "unix":
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    else:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.settimeout(timeout)
+    try:
+        if kind == "unix":
+            sock.connect(str(address))
+        else:
+            host, port = address  # type: ignore[misc]
+            sock.connect((host, port))
+    except OSError:
+        sock.close()
+        raise
+    return sock
 
 
 def _token() -> str | None:
@@ -97,11 +127,11 @@ def _token() -> str | None:
 
 
 def _roundtrip(method: str, params: dict, token: str | None) -> dict:
-    """Send one request line to the daemon socket and return the decoded response."""
+    """Send one request line to the daemon endpoint and return the decoded response."""
     request = {"id": 1, "token": token, "method": method, "params": params}
     payload = json.dumps(request, ensure_ascii=False).encode("utf-8") + b"\n"
     try:
-        sock = _endpoint().connect(30.0)
+        sock = _connect(30.0)
     except OSError as exc:
         raise VaultUnavailable(
             "VAULT_NOT_RUNNING: برنامهٔ Secure Vault در حال اجرا نیست — آن را باز کن "

@@ -1,9 +1,11 @@
 .venv/
+mcp/.venv/
 portable/
 __pycache__/
 *.pyc
 *.pyo
 .pytest_cache/
+.ruff_cache/
 docs/reports/*.md
 *.tmp
 .DS_Store
