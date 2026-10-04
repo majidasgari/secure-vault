@@ -175,6 +175,8 @@ input[type="checkbox"] { min-height: auto; width: 18px; height: 18px; }
 .view-pane h2 { font-size: 1rem; color: var(--muted); margin: 10px 0 2px; }
 .meta-line { color: var(--muted); font-size: 0.85rem; margin: 0; }
 .note-actions { display: flex; gap: 8px; }
+/* The paper orientation lives with the print button it belongs to, not in a settings panel. */
+.note-actions select { min-height: 34px; padding: 4px 8px; }
 
 .format-toolbar { display: flex; flex-wrap: wrap; gap: 4px; }
 .format-btn { min-width: 38px; min-height: 36px; padding: 2px 8px; font-weight: 600; }
@@ -617,6 +619,9 @@ button.primary.danger { background: var(--panel2); }
 .note-text { max-width: 46ch; overflow: hidden; text-overflow: ellipsis;
   white-space: nowrap; opacity: 0.85; }
 
+/* The file note as it appears on paper (see the print block at the end of this file). */
+#file-note-print { display: none; }
+
 /* Folder / file note editors */
 .note-label { display: block; margin: 0.6rem 0 0.2rem; font-size: 0.85rem;
   color: var(--muted, #8a8a8a); }
@@ -645,3 +650,71 @@ button.primary.danger { background: var(--panel2); }
 }
 .emoji-choice:hover { border-color: var(--accent, #5b9dff); }
 .emoji-choice.selected { border-color: var(--accent, #5b9dff); background: var(--panel2, #262932); }
+
+/* ---------------------------------------------------------------- print */
+/*: Printing used to be whatever the browser guessed: a near-black page carrying the app's header,
+   sidebar, buttons and status bar, with the note clipped to a single viewport — `.layout` lives
+   inside `#app-view`, a `100dvh` flex column whose panels scroll, so a long note simply stopped at
+   the fold and a dark background turned the paper black. A printed note is a document: white paper,
+   dark text, its own title and body, as many pages as it needs. This block is paper only. */
+@media print {
+  /* The paper palette wins over whichever theme is on; both themes are declared earlier in this
+     file, so these later declarations take it. */
+  :root, [data-theme="dark"], [data-theme="light"] {
+    --bg: #ffffff; --panel: #ffffff; --panel2: #ffffff; --border: #b9b9b9;
+    --text: #111111; --muted: #444444; --note: #ffffff; --code: #f4f4f4;
+    --accent: #1f4e9c; --danger: #a02020; --warn: #6b4f10; --ok: #1e6b3a;
+  }
+  html, body { height: auto !important; background: #fff !important; color: #111 !important; }
+
+  /* The shell stops being a viewport-high column, so the document can run past one screen. */
+  #app-view { display: block !important; height: auto !important; overflow: visible !important; }
+  .layout { display: block !important; background: none !important; }
+  .panel { overflow: visible !important; padding: 0 !important; background: #fff !important; }
+
+  /* Only the open note reaches paper: no header, tree, status bar, action buttons, note editors,
+     the note's path (Max's call: the breadcrumb is navigation, not part of the document), tag chips,
+     source link, modals or the other view panes. */
+  .app-header, .statusbar, .panel-left, .stale-banner, .sync-progress, #mobile-backdrop,
+  .note-actions, .format-toolbar, .editor-toolbar, .note-label, .note-input, #note-crumbs,
+  #note-tags,
+  #note-source, #modal-root, #toast-root, #busy-overlay, .row-action, .code-head,
+  .view-pane:not(#view-note), #login-view { display: none !important; }
+  #view-note { display: block !important; }
+  /* The file note is an editor on screen; on paper it is a line of metadata, and it only appears
+     when the note actually has one (`:not([hidden])` keeps `[hidden]`'s `display:none` in charge). */
+  #file-note-print:not([hidden]) { display: block !important; }
+
+  /* The note, as a document */
+  #note-title { font-size: 18pt; line-height: 1.4; margin: 0 0 2pt; }
+  #note-crumbs { font-size: 8pt; color: #555 !important; }
+  #note-meta { font-size: 8pt; color: #555 !important; }
+  #file-note-print { margin: 4pt 0 10pt; font-size: 9pt; color: #333 !important; }
+  #note-body {
+    font-size: 10.5pt; line-height: 1.75 !important;
+    overflow: visible !important; height: auto !important;
+  }
+  /* A code line longer than the page must wrap, not vanish: `overflow: auto` clips it on paper. */
+  #note-body pre, #note-body .code-block pre {
+    font-size: 9pt; white-space: pre-wrap !important; overflow: visible !important;
+    word-break: break-word;
+  }
+  #note-body code { font-size: 9.5pt; }
+  #note-body table { width: 100%; }
+  #note-body thead { display: table-header-group; }
+  #note-body a { color: #1f4e9c !important; text-decoration: underline; }
+  #note-body blockquote { color: #333 !important; border-inline-start-color: #999 !important; }
+  #note-body hr { border-top-color: #bbb !important; }
+
+  /* Pagination hygiene: never cut a code block, table row, list item or picture in half, and never
+     leave a heading stranded at the bottom of a page. */
+  #note-body tr, #note-body li, #note-body img, #note-body blockquote, #note-body pre,
+  #note-body .code-block, #note-body table {
+    break-inside: avoid; page-break-inside: avoid;
+  }
+  #note-body h1, #note-body h2, #note-body h3, #note-body h4 {
+    break-after: avoid; page-break-after: avoid;
+  }
+
+  @page { margin: 14mm 12mm; }
+}

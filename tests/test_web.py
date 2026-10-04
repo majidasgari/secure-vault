@@ -1131,3 +1131,109 @@ class EmojiUiTest(unittest.TestCase):
         source = inspect.getsource(app_module.VaultApplication.edit_emoji)
         self.assertIn("vault.emoji_palette", source)
         self.assertIn("vault.set_emoji", source)
+
+
+class PrintSpaTest(unittest.TestCase):
+    """Printing a note: only the document reaches paper, in full, and the paper can be turned.
+
+    The layout claims of the print block are measured in a real browser (headless Chrome, print
+    media) during the change that added them; these tests pin the rules that make it work, so a
+    later edit cannot quietly put the header back on the page or clip a long note at the fold.
+    """
+
+    def setUp(self) -> None:
+        self.js = (WEBUI_DIR / "app.js").read_text(encoding="utf-8")
+        self.css = (WEBUI_DIR / "styles.css").read_text(encoding="utf-8")
+        self.html = (WEBUI_DIR / "index.html").read_text(encoding="utf-8")
+        self.print_block = self.css[self.css.index("@media print {") :]
+
+    def _function(self, name: str) -> str:
+        """Return the source of ``function <name>(…) { … }`` by brace matching."""
+        start = self.js.index(f"function {name}(")
+        index = self.js.index("{", start)
+        depth = 0
+        for offset in range(index, len(self.js)):
+            if self.js[offset] == "{":
+                depth += 1
+            elif self.js[offset] == "}":
+                depth -= 1
+                if depth == 0:
+                    return self.js[start : offset + 1]
+        raise AssertionError(f"unbalanced braces in {name}")
+
+    def test_the_print_block_repaints_the_page_for_paper(self) -> None:
+        """Paper is white with dark text, whatever theme the interface is wearing."""
+        for selector in (
+            ".app-header", ".statusbar", ".panel-left", ".note-actions", ".note-input",
+            "#note-crumbs", "#note-tags", "#note-source", "#modal-root", "#toast-root",
+            ".view-pane:not(#view-note)",
+        ):
+            self.assertIn(selector, self.print_block, selector)
+        for rule in ("--bg: #ffffff", "--text: #111111", "background: #fff !important",
+                     "color: #111 !important"):
+            self.assertIn(rule, self.print_block, rule)
+
+    def test_the_shell_stops_clipping_the_document_at_one_viewport(self) -> None:
+        """`#app-view` is a `100dvh` column with scrolling panels on screen — not on paper."""
+        self.assertIn(
+            "#app-view { display: block !important; height: auto !important; "
+            "overflow: visible !important; }",
+            self.print_block,
+        )
+        self.assertIn(".panel { overflow: visible !important", self.print_block)
+        self.assertIn(".layout { display: block !important", self.print_block)
+        # a long code line must wrap instead of being clipped by `overflow: auto`
+        self.assertIn("white-space: pre-wrap !important", self.print_block)
+        self.assertIn("@page { margin:", self.print_block)
+        for rule in ("break-inside: avoid", "break-after: avoid", "display: table-header-group"):
+            self.assertIn(rule, self.print_block, rule)
+        # the file note is metadata on paper, and only when the file has one
+        self.assertIn("#file-note-print:not([hidden]) { display: block !important; }",
+                      self.print_block)
+
+    def test_the_note_view_carries_the_print_controls(self) -> None:
+        """A print button, and the paper orientation next to it — both in the note's own row."""
+        self.assertIn('id="btn-note-print"', self.html)
+        self.assertIn('data-i18n="web.print"', self.html)
+        self.assertIn('id="print-orientation"', self.html)
+        self.assertIn('<option value="portrait" data-i18n="web.print_portrait">', self.html)
+        self.assertIn('<option value="landscape" data-i18n="web.print_landscape">', self.html)
+        self.assertIn('id="file-note-print"', self.html)
+
+    def test_the_button_hands_over_to_the_browser_dialog(self) -> None:
+        """No export endpoint and no server round-trip: the page *is* the document."""
+        self.assertIn("window.print()", self.js)
+
+    def test_the_paper_orientation_is_written_into_the_document(self) -> None:
+        """Ctrl+P must honour the choice too, so it goes in as an `@page` rule, not a button state."""
+        body = self._function("applyPrintOrientation")
+        self.assertIn('"@media print { @page { size: A4 " + value', body)
+        # session storage, like the language and the theme: this interface writes nothing to disk
+        self.assertIn("sessionStorage.setItem(PRINT_KEY", body)
+        self.assertIn("sessionStorage.getItem(PRINT_KEY", self._function("savedPrintOrientation"))
+        self.assertIn('mode === "landscape" ? "landscape" : "portrait"', body)
+        self.assertIn("applyPrintOrientation(savedPrintOrientation())", self.js)
+        self.assertIn('"#print-orientation"', self.js)
+
+    def test_printing_is_offered_only_when_there_is_something_to_print(self) -> None:
+        """A secret's text never reaches the browser, and a non-image blob has only a placeholder."""
+        body = self._function("renderNoteView")
+        self.assertIn('state.file.sensitivity === "normal"', body)
+        self.assertIn('"#btn-note-print"', body)
+        self.assertIn('"#print-orientation"', body)
+        self.assertIn("fileNotePrint", body)
+        # a file note is mirrored for paper only when the file has one — otherwise the print block
+        # would leave an empty line of metadata on the page
+        self.assertIn("fileNotePrint.hidden = !notePrintText", body)
+        self.assertIn('"#file-note-print"', body)
+
+    def test_the_print_labels_exist_in_every_language(self) -> None:
+        keys = ("web.print", "web.print_title", "web.print_orientation",
+                "web.print_portrait", "web.print_landscape")
+        languages = sorted(I18N_DIR.glob("*.json"))
+        self.assertTrue(languages, "no interface languages found")
+        for path in languages:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            for key in keys:
+                self.assertIn(key, data, f"{key} missing in {path.name}")
+                self.assertTrue(str(data[key]).strip(), f"{key} empty in {path.name}")

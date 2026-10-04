@@ -1235,6 +1235,39 @@
     refreshStatusBar();
   }
 
+  // -------------------------------------------------------------------- printing
+  //: Printing runs through the browser's own dialog and the `@media print` block in styles.css, so
+  //: Ctrl+P and the «چاپ» button produce the same clean document. The stylesheet cannot decide the
+  //: paper orientation per run, so it is stored here and written into the document as an `@page`
+  //: rule: the print preview honours it, and the choice survives a reload of this tab.
+  //: Session storage, like the language and the theme, so the interface leaves nothing on disk.
+  var PRINT_KEY = "vault_print";
+
+  function savedPrintOrientation() {
+    try {
+      return window.sessionStorage.getItem(PRINT_KEY) || "portrait";
+    } catch (err) {
+      return "portrait";  // private mode: the choice simply does not persist
+    }
+  }
+
+  function applyPrintOrientation(mode) {
+    var value = mode === "landscape" ? "landscape" : "portrait";
+    var margin = value === "landscape" ? "12mm 14mm" : "14mm 12mm";
+    var node = document.getElementById("print-page-style");
+    if (!node) {
+      node = document.createElement("style");
+      node.id = "print-page-style";
+      document.head.appendChild(node);
+    }
+    node.textContent =
+      "@media print { @page { size: A4 " + value + "; margin: " + margin + "; } }";
+    try {
+      window.sessionStorage.setItem(PRINT_KEY, value);
+    } catch (err) { /* nothing to persist to; the document still prints in this orientation */ }
+    return value;
+  }
+
   function renderNoteView() {
     if (!state.file) { return; }
     renderBreadcrumbs($("#note-crumbs"), state.file.path, navigateFolder, { file: true });
@@ -1247,6 +1280,14 @@
       "📅 " + t("web.updated_at") + " " + updated + " · 🕓 " + t("web.created_at") + " " + created;
     var fileNote = $("#file-note-input");
     if (fileNote) { fileNote.value = state.file.note || ""; }
+    //: The file note is an editor on screen and a line of metadata on paper — same text, and it is
+    //: only there when the file actually has one (see the print block in styles.css).
+    var fileNotePrint = $("#file-note-print");
+    if (fileNotePrint) {
+      var notePrintText = (state.file.note || "").trim();
+      fileNotePrint.textContent = notePrintText;
+      fileNotePrint.hidden = !notePrintText;
+    }
     var sourceLink = $("#note-source");
     if (sourceLink) {
       if (state.file.source_url) {
@@ -1301,6 +1342,14 @@
     ["#btn-note-edit-top", "#btn-note-raw-top"].forEach(function (selector) {
       var button = $(selector);
       if (button) { button.hidden = !!state.file.binary; }
+    });
+    //: Printing is offered only when there is something to print: a normal note's rendered
+    //: markdown or a picture. A secret's text never reaches the web UI (it shows a notice and asks
+    //: the desktop app for the file), and a non-image binary has nothing but a placeholder box.
+    var printable = !!(state.file.image || state.file.sensitivity === "normal");
+    ["#btn-note-print", "#print-orientation"].forEach(function (selector) {
+      var node = $(selector);
+      if (node) { node.hidden = !printable; }
     });
     $("#level-select").value = state.file.sensitivity;
     $("#level-select").hidden = false;
@@ -2653,6 +2702,22 @@
       });
     };
     $("#btn-note-raw-top").addEventListener("click", rawHandler);
+    //: Printing is the browser's own dialog over the print stylesheet — no server call, no export
+    //: endpoint, and nothing leaves the machine: the page is already the document. Ctrl+P needs no
+    //: button at all; both paths print exactly the same thing.
+    var printTop = $("#btn-note-print");
+    if (printTop) {
+      printTop.addEventListener("click", function () { window.print(); });
+    }
+    //: The one thing a stylesheet cannot decide per run is the paper orientation, so the choice is
+    //: kept here and written into the document as an `@page` rule — which Ctrl+P then picks up too.
+    var orientationSelect = $("#print-orientation");
+    if (orientationSelect) {
+      orientationSelect.value = applyPrintOrientation(savedPrintOrientation());
+      orientationSelect.addEventListener("change", function () {
+        applyPrintOrientation(orientationSelect.value);
+      });
+    }
     var historyTop = $("#btn-note-history-top");
     if (historyTop) {
       historyTop.addEventListener("click", function () {
@@ -2680,6 +2745,11 @@
         call("vault.set_file_note", { path: state.file.path, text: fileNoteInput.value })
           .then(function () {
             state.file.note = fileNoteInput.value;
+            var mirror = $("#file-note-print");
+            if (mirror) {
+              mirror.textContent = fileNoteInput.value.trim();
+              mirror.hidden = !mirror.textContent;
+            }
             showToast(t("web.saved"), "ok");
           })
           .catch(function (err) { showToast(errorText(err), "error"); });

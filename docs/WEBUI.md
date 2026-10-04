@@ -224,6 +224,38 @@ The browser is the primary interface, so the shell stays deliberately small:
   the search group moves to its own header row, the editor stacks above the preview, and the
   status bar keeps `env(safe-area-inset-*)` padding.
 
+## 3d. Printing: the note, not the interface
+
+`Ctrl+P` prints the open note; the **چاپ** button in the note's action row only calls
+`window.print()`, so both paths print exactly the same thing — no server call, no export endpoint,
+nothing to configure.
+
+* **Only the document.** The `@media print` block at the end of `webui/styles.css` paints the page
+  white with dark text and takes the shell off it: app header, status bar, left panel, the note's
+  action row, the tag/source/file-note editors, toasts and modals.
+* **In full.** On screen the shell is a `100dvh` column whose panels scroll; on paper `#app-view`,
+  `.layout` and the panels go back to `height: auto; overflow: visible`, so a long note is never cut
+  off at the fold. Long code lines wrap (`white-space: pre-wrap`) instead of being clipped by the
+  editor's `overflow: auto`; tables repeat their header row and blocks avoid breaking mid-way.
+* **Metadata.** The title, the «ویرایش‌شده…» line and the file note (mirrored from the editor into
+  `#file-note-print`) stay on the page. The note's breadcrumb path (`#note-crumbs`) does **not** —
+  where the note lives is navigation, not part of the document — and neither do the folder note, the
+  file-note *editor* or the tag chips.
+* **Paper orientation.** The `<select id="print-orientation">` beside the button chooses
+  عمودی/افقی. The choice is written into the document as `@media print { @page { size: A4 … } }`
+  through an injected `<style id="print-page-style">` — which is what makes `Ctrl+P` honour it as
+  well — and kept in `sessionStorage` under `vault_print`, like the language and the theme (this
+  interface writes nothing to `localStorage`).
+* **Not offered** when there is nothing to print: a secret's content never reaches the browser (the
+  note shows a notice and hands the file to the desktop app) and a binary blob has no preview.
+
+Verified in headless Chrome over CDP: under `print` media the shell elements measure `display: none`
+while the note grows past the viewport (1813px of document in a 900px viewport), and
+`Page.printToPDF {preferCSSPageSize: true}` yields A4 portrait 594.96×841.92pt or landscape
+841.92×594.96pt with both the last line of the note and the long code line present in the text layer
+— neither was in the output before this block existed. Pinned by `PrintSpaTest` in
+`tests/test_web.py`.
+
 ## 4. LAN / mobile access
 
 Binding a non-loopback host is refused unless you explicitly opt in:

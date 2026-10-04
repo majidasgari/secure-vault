@@ -585,5 +585,10 @@
   "web.unavailable_reason": "رابط وب در دسترس نیست ({reason})",
   "web.unlock_button": "باز کن",
   "web.updated_at": "ویرایش",
-  "web.welcome": "یک دفترچه یا یادداشت را از کنار انتخاب کن."
+  "web.welcome": "یک دفترچه یا یادداشت را از کنار انتخاب کن.",
+  "web.print": "چاپ",
+  "web.print_title": "چاپ این یادداشت",
+  "web.print_orientation": "جهت کاغذ",
+  "web.print_portrait": "عمودی",
+  "web.print_landscape": "افقی"
 }

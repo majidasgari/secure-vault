@@ -585,5 +585,10 @@
   "web.unavailable_reason": "The web UI is unavailable ({reason})",
   "web.unlock_button": "Unlock",
   "web.updated_at": "Edited",
-  "web.welcome": "Select a notebook or note on the side."
+  "web.welcome": "Select a notebook or note on the side.",
+  "web.print": "Print",
+  "web.print_title": "Print this note",
+  "web.print_orientation": "Paper orientation",
+  "web.print_portrait": "Portrait",
+  "web.print_landscape": "Landscape"
 }
