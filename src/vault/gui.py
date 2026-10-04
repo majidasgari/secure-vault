@@ -258,6 +258,35 @@ def run_self_test(
     checks["viewer_text"] = viewer.last_text
     checks["viewer_uses_web"] = viewer.uses_web_engine
     checks["web_views_for_secretfile"] = editor_module.web_views_created - web_before
+    # A plain secret note carries no credential fields, so no copy button is offered for one.
+    checks["viewer_actions_absent_for_note"] = not any((viewer.last_actions or {}).values())
+
+    # A credential entry (the /رمزها shape) carries its OTP field in the body, so the native
+    # viewer must show a live code — and nothing about it may reach a web engine (SPEC/09 §5).
+    session.write_file(
+        "secrets/cred.md",
+        "# GitHub\n\nسایت: github.com | دسته: برنامه‌نویسی\n\n"
+        "نام کاربری: demo\nگذرواژه: demo-pass\n"
+        "کد یکبارمصرف (otp): otpauth://totp/demo?secret=JBSWY3DPEHPK3PXP\n".encode("utf-8"),
+    )
+    session.set_sensitivity("secrets/cred.md", "secretfile")
+    web_before = editor_module.web_views_created
+    checks["open_secretfile_otp"] = bool(controller.open_path("/secrets/cred.md"))
+    checks["viewer_otp_live"] = bool(viewer.last_otp and viewer.last_otp["live"])
+    checks["viewer_otp_digits"] = len(viewer.last_otp["code"]) if viewer.last_otp else 0
+    checks["viewer_otp_grouped"] = bool(
+        viewer.last_otp
+        and " " in viewer.last_otp["display"]
+        and viewer.last_otp["display"].replace(" ", "") == viewer.last_otp["code"]
+    )
+    checks["viewer_copy_username"] = bool(viewer.last_actions and viewer.last_actions["username"])
+    checks["viewer_copy_password"] = bool(viewer.last_actions and viewer.last_actions["password"])
+    checks["viewer_otp_countdown"] = bool(
+        viewer.last_otp
+        and viewer.last_otp["remaining"] is not None
+        and 0 < viewer.last_otp["remaining"] <= viewer.last_otp["period"]
+    )
+    checks["web_views_for_otp"] = editor_module.web_views_created - web_before
 
     # Pictures go to the native image viewer, not the editor or a web engine (SPEC/03 §2.4).
     picture = _png_bytes()
@@ -362,7 +391,8 @@ def run_self_test(
         if key not in ("tree_rows", "viewer_text", "viewer_uses_web",
                        "web_views_for_secretfile", "search_filename", "search_text",
                        "search_semantic", "last_results_filename", "log_rows",
-                       "image_suffix_no", "image_uses_web", "image_size")
+                       "image_suffix_no", "image_uses_web", "image_size",
+                       "web_views_for_otp")
     )
 
     return SelfTestResult(

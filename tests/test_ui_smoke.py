@@ -106,6 +106,15 @@ class UiSmokeTest(unittest.TestCase):
         self.assertEqual(self.checks["web_views_for_secretfile"], 0)
         self.assertTrue(self.checks["secretfile_logged"])
 
+    def test_secretfile_otp_code_shown(self) -> None:
+        """A credential body with an OTP field shows a live code and never a web view."""
+        self.assertTrue(self.checks["open_secretfile_otp"])
+        self.assertTrue(self.checks["viewer_otp_live"])
+        self.assertEqual(self.checks["viewer_otp_digits"], 6)
+        self.assertTrue(self.checks["viewer_otp_grouped"])
+        self.assertTrue(self.checks["viewer_otp_countdown"])
+        self.assertEqual(self.checks["web_views_for_otp"], 0)
+
     def test_search_three_kinds(self) -> None:
         """All three search kinds return results (semantic via the stub)."""
         self.assertGreater(self.checks["search_filename"], 0)
@@ -638,6 +647,153 @@ class QuickUnlockAutoScanTest(unittest.TestCase):
         screen = self.controller.show_unlock()
         self.assertFalse(self.controller.auto_scan_armed())
         self.assertTrue(screen.fingerprint_button.isHidden())
+
+
+@unittest.skipUnless(HAVE_QT, "PySide6 is not installed")
+class SecretViewerOtpTest(unittest.TestCase):
+    """The native viewer renders a live code for a credential body (desktop-only surface)."""
+
+    BODY = (
+        "# GitHub\n\nسایت: github.com | دسته: برنامه‌نویسی\n\n"
+        "نام کاربری: demo\nگذرواژه: demo-pass\n"
+        "کد یکبارمصرف (otp): otpauth://totp/github.com:demo"
+        "?secret=GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ&issuer=GitHub\n"
+    )
+    PLAIN_BODY = "# بانک نمونه\n\nسایت: bank.ir\n\nشماره کارت: 6037991234567890\n"
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        """Ensure a single offscreen QApplication exists and the fa catalogue is active."""
+        from PySide6.QtWidgets import QApplication
+
+        from vault.ui import i18n
+
+        cls.app = QApplication.instance() or QApplication(["sv-viewer-otp"])
+        i18n.set_language("fa")
+
+    def test_live_code_countdown_and_copy(self) -> None:
+        """The code comes from the RFC algorithm, the countdown tracks the step, copy is code-only."""
+        from PySide6.QtGui import QGuiApplication
+
+        from vault.ui import notifications, viewer
+
+        dialog = viewer.SecretViewer(None, "/رمزها/گیت‌هاب/github.com.md", self.BODY)
+        try:
+            dialog.refresh_otp(at=59)          # 8-digit vector 94287082 → 6 digits 287082
+            self.assertEqual(dialog.otp_code.text(), "287 082")
+            assert dialog.otp is not None
+            self.assertEqual(dialog.otp.code, "287082")      # what the copy button puts out
+            self.assertTrue(dialog.otp_box.isVisibleTo(dialog))
+            self.assertEqual(dialog.otp_remaining.text(), "1 ثانیه مانده")
+            self.assertEqual(dialog.otp_bar.maximum(), 30)
+            self.assertEqual(dialog.otp_bar.value(), 1)
+            self.assertTrue(dialog.otp_code.layoutDirection().name == "LeftToRight")
+
+            dialog.refresh_otp(at=60)          # next step: a different code, full countdown
+            self.assertNotEqual(dialog.otp_code.text(), "287 082")
+            self.assertEqual(dialog.otp_bar.value(), 30)
+
+            dialog.copy_otp()
+            self.assertEqual(QGuiApplication.clipboard().text(), dialog.otp_code.text().replace(" ", ""))
+            self.assertIn(dialog.path, notifications.recent()[-1]["body"])
+            self.assertNotIn(dialog.otp_code.text(), notifications.recent()[-1]["body"])
+            self.assertFalse(viewer.uses_web_engine)
+        finally:
+            dialog.close()
+
+    def test_body_without_otp_shows_no_row(self) -> None:
+        """A card entry has nothing to count down: the row stays hidden."""
+        from vault.ui import viewer
+
+        dialog = viewer.SecretViewer(None, "/رمزها/بانک/bank.md", self.PLAIN_BODY)
+        try:
+            self.assertIsNone(dialog.otp)
+            self.assertFalse(dialog.otp_box.isVisibleTo(dialog))
+            # A card number is neither a user name nor a password: no copy button for it.
+            self.assertFalse(dialog.field_actions.isVisibleTo(dialog))
+            self.assertFalse(dialog.copy_username_button.isVisibleTo(dialog))
+            self.assertFalse(dialog.copy_password_button.isVisibleTo(dialog))
+        finally:
+            dialog.close()
+
+    def test_username_and_password_copy_buttons(self) -> None:
+        """Each field gets its own copy button and copies only that value."""
+        from PySide6.QtGui import QGuiApplication
+
+        from vault.ui import notifications, viewer
+
+        dialog = viewer.SecretViewer(None, "/رمزها/گیت‌هاب/github.com.md", self.BODY)
+        try:
+            self.assertTrue(dialog.field_actions.isVisibleTo(dialog))
+            self.assertTrue(dialog.copy_username_button.isVisibleTo(dialog))
+            self.assertTrue(dialog.copy_password_button.isVisibleTo(dialog))
+            self.assertEqual(dialog.copy_username_button.text(), "رونوشت نام کاربری")
+            self.assertEqual(dialog.copy_password_button.text(), "رونوشت رمز عبور")
+
+            dialog.copy_username()
+            self.assertEqual(QGuiApplication.clipboard().text(), "demo")
+            dialog.copy_password()
+            self.assertEqual(QGuiApplication.clipboard().text(), "demo-pass")
+
+            # The notice names the file and the field, never the value.
+            body = notifications.recent()[-1]["body"]
+            self.assertIn(dialog.path, body)
+            self.assertNotIn("demo-pass", body)
+
+            recorded = viewer.open_viewer(None, dialog.path, self.BODY)
+            try:
+                self.assertEqual(
+                    viewer.last_actions, {"username": True, "password": True, "otp": True}
+                )
+            finally:
+                recorded.close()
+        finally:
+            dialog.close()
+
+    def test_field_buttons_absent_for_a_plain_note(self) -> None:
+        """A note with no credential fields offers no copy button at all."""
+        from vault.ui import viewer
+
+        dialog = viewer.open_viewer(None, "/memory/dream.md", "# رویا\n\nمتن ساده\n")
+        try:
+            self.assertFalse(dialog.field_actions.isVisibleTo(dialog))
+            self.assertEqual(viewer.last_actions, {"username": False, "password": False, "otp": False})
+        finally:
+            dialog.close()
+
+    def test_backup_code_is_shown_without_a_countdown(self) -> None:
+        """A pasted code is displayed as-is, with the static hint and no progress bar."""
+        from vault.ui import viewer
+
+        body = self.BODY.replace(
+            "otpauth://totp/github.com:demo?secret=GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ&issuer=GitHub",
+            "987654",
+        )
+        dialog = viewer.SecretViewer(None, "/x/backup.md", body)
+        try:
+            self.assertIsNotNone(dialog.otp)
+            self.assertFalse(dialog.otp.live)
+            self.assertEqual(dialog.otp_code.text(), "987654")
+            self.assertFalse(dialog.otp_bar.isVisibleTo(dialog))
+            self.assertEqual(dialog.otp_remaining.text(), "کد پشتیبان (بدون شمارش)")
+        finally:
+            dialog.close()
+
+    def test_open_viewer_records_the_code_for_the_self_test(self) -> None:
+        """``open_viewer`` records a seed-free descriptor (the code, never the secret)."""
+        from vault.ui import viewer
+
+        dialog = viewer.open_viewer(None, "/x/demo.md", self.BODY)
+        try:
+            recorded = viewer.last_otp
+            self.assertIsNotNone(recorded)
+            assert recorded is not None
+            self.assertEqual(len(recorded["code"]), 6)
+            self.assertTrue(recorded["live"])
+            self.assertNotIn("secret", recorded)
+            self.assertNotIn("GEZDGNBVGY3TQOJQ", str(recorded))
+        finally:
+            dialog.close()
 
 
 if __name__ == "__main__":

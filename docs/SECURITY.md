@@ -67,6 +67,15 @@ Additional rules enforced by the same module:
   bytes travel as base64 (`vault.read_file` with `binary`) because they have no text form — the
   level check runs before any bytes are returned, so the flag is not a way around it.
 
+* **A one-time code is generated only inside the desktop UI, and the copy buttons live there too.**
+  A credential body may carry an `otp` field (an `otpauth://totp/…` URI or a bare base32 seed);
+  `core/totp.py` turns it into the current code and the native viewer shows it with a countdown and
+  a copy button, next to a «copy user name» / «copy password» button for the fields the body
+  actually has. There is deliberately **no API route** for any of them, so neither the agent role
+  nor the browser bridge can ask for a live code or a password: the bridge receives the stored
+  *value* and the add-on generates/uses it itself, and a copy notification names the file and the
+  field but never the value.
+
 * **Raise is allowed, lower is not (for agents).** UI, MCP and the importer may raise a
   level; only the UI may lower one, and only to a *different* level. A same-level call is
   a no-op. An MCP downgrade raises `SENSITIVITY_DOWNGRADE_FORBIDDEN`.
