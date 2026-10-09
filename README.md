@@ -1,43 +1,51 @@
 # Secure Vault
 
-**Secure Vault** is a personal, encrypted notes-and-passwords application that replaces
-Joplin and KeePass and is **agent-aware**: agents reach it over MCP, but the content of
-*secret* and *secretfile* files is never handed to them — only names, structure and
-sensitivity level are visible, and every access is recorded in an append-only log.
-Quick start:
+**Secure Vault** is a personal, offline-first encrypted vault for notes **and** credentials.
+It is three interfaces over one folder — a Qt (PySide6) desktop app, a local browser web UI and
+an MCP server — and it is **agent-aware**: an agent can see the structure and read ordinary
+notes, but the content of `secret` and `secretfile` entries is never handed to it, and every
+access is recorded in an append-only log.
 
-```bash
-tools/bootstrap.sh
-./bin/secure-vault          # on this machine: QT_QPA_PLATFORM=offscreen ./bin/secure-vault --self-test
-```
+It is the final replacement for Joplin (an importer reads the existing mirror), it keeps
+passwords and one-time codes in the same vault as everything else, and its dependency set is
+deliberately tiny: Python, PySide6, `cryptography`, `argon2-cffi`, `markdown-it-py` and Pygments.
 
-Windows (PowerShell/cmd; `docs/WINDOWS.md` has the full story):
+> **The master password is never stored and there is no way to recover it.**
 
-```bat
-uv venv --python 3.12 .venv
-uv pip install --python .venv\Scripts\python.exe -r requirements.txt
-bin\secure-vault.cmd
-```
-
-> **Important:** the master password is never stored and there is no way to recover it.
+**Companions:** a read-only
+[Android client](https://github.com/majidasgari/secure-vault-android) (گنجینه) and a
+[Firefox add-on](https://github.com/majidasgari/secure-vault-firefox) use the same vault —
+see [the family](#the-family--three-repositories) below.
 
 ---
 
+## The family — three repositories
+
+| repository | what it is |
+| --- | --- |
+| **secure-vault** ← this one | The vault itself: the storage format and crypto, the Qt desktop app, the browser web UI, the credential/one-time-code surface, the MCP bridge, two-way S3 sync, the importers and the packaging tools. |
+| **[secure-vault-android](https://github.com/majidasgari/secure-vault-android)** | **گنجینه (Ganjineh)** — the read-only Android client. It pulls the encrypted vault from any S3-compatible bucket, unlocks it on the phone and gives you browsing, Persian-normalised literal search, one-time codes and per-field copy. It never writes: the desktop stays the single writer. |
+| **[secure-vault-firefox](https://github.com/majidasgari/secure-vault-firefox)** | The Firefox add-on (MV3). While the vault is running it puts a small icon inside login fields and, **only when you click it**, fills the user name, password and one-time code of the entry you choose. Nothing is ever filled automatically. |
+
+All three speak the **same on-disk format**, so the phone and the browser are *clients* of one
+vault rather than copies of it. The add-on talks to this app's loopback bridge
+([`docs/BROWSER-AUTOFILL.md`](docs/BROWSER-AUTOFILL.md)) and every value it reveals appends an
+access-log row with `source=browser`; the Android app reads exactly the folder layout,
+`meta.sqlite` and `secure.store` that this repository writes.
+
 ## What it is
 
-Secure Vault is a personal, offline-first encrypted vault with a Qt (PySide6) desktop
-GUI. It stores notes and secrets as AES-256-GCM blobs in a single folder you can sync
-with any cloud drive, keeps a plaintext metadata index (names, levels, tags, access
-log) so locked-mode listing still works, and exposes an MCP server so agents can see
-the structure and read `normal` files while `secret`/`secretfile` content stays
-hidden. It is the final replacement for Joplin, with a deliberately tiny dependency
-set: Python, PySide6, `cryptography`, `argon2-cffi`, `markdown-it-py` and Pygments.
+Secure Vault is a personal, offline-first encrypted vault with a Qt (PySide6) desktop GUI. It
+stores notes and secrets as AES-256-GCM blobs in a single folder you can sync with any cloud
+drive, keeps a plaintext metadata index (names, levels, tags, access log) so locked-mode listing
+still works, and exposes an MCP server so agents can see the structure and read `normal` files
+while `secret`/`secretfile` content stays hidden.
 
 ## Status
 
 * Core, socket API, MCP bridge, Qt UI, browser web UI (with Joplin-mirror parity),
-  Joplin importer, tray shell, desktop integration and the Windows portable
-  **builder** are implemented.
+  Joplin importer, KeePass migration tooling, tray shell, desktop integration and the Windows
+  portable **builder** are implemented.
 * Two-way S3 sync with a cooperative write lock, **restore-from-S3** (adopt the vault
   that is already in the bucket, `secure-vault-import` on headless machines) and safety
   rails that refuse to mirror one vault onto another (docs/SYNC.md §8/§9).
@@ -67,21 +75,30 @@ set: Python, PySide6, `cryptography`, `argon2-cffi`, `markdown-it-py` and Pygmen
   The user picks the granularity — whole document, paragraph (default) or sentence — and
   can tick exactly which folders are included; inline `data:` URIs/base64 images are
   stripped before embedding.
+* A live one-time code is generated **only inside the desktop UI**: there is deliberately no
+  API, MCP or web route that can ask for one.
 
 ## Install
 
-Requires Python ≥ 3.11. On the target machine the venv already exists; on a fresh
-checkout:
+Requires Python ≥ 3.11. On a fresh checkout:
 
 ```bash
 tools/bootstrap.sh
 ```
 
-This creates `.venv`, writes `.venv/pip.conf` pointing at the local PyPI mirror
-(`https://mirror-pypi.runflare.com/simple/`), installs `requirements.txt`, downloads
-the optional Vazirmatn fonts (a failure is only a warning), and prints the next
-commands. It is idempotent. Use `--skip-deps` when the dependencies are already
-installed and `--desktop` to also install the desktop entry.
+This creates `.venv`, writes `.venv/pip.conf` pointing at a PyPI mirror
+(`PIP_INDEX_URL` / `PIP_TRUSTED_HOST` override it — the default is the mirror the author
+uses), installs `requirements.txt`, downloads the optional Vazirmatn fonts (a failure is
+only a warning), and prints the next commands. It is idempotent. Use `--skip-deps` when the
+dependencies are already installed and `--desktop` to also install the desktop entry.
+
+Windows (PowerShell/cmd; `docs/WINDOWS.md` has the full story):
+
+```bat
+uv venv --python 3.12 .venv
+uv pip install --python .venv\Scripts\python.exe -r requirements.txt
+bin\secure-vault.cmd
+```
 
 ## First run
 
@@ -89,8 +106,9 @@ installed and `--desktop` to also install the desktop entry.
 ./bin/secure-vault
 ```
 
-1. The first-run wizard asks for the vault home folder (default
-   `/data/Cloud/SecureVault`, changeable in Settings) and a master password.
+1. The first-run wizard asks for the vault home folder (a synced, user-visible folder;
+   `SECURE_VAULT_HOME` overrides it at start-up and the choice is remembered) and for a
+   master password.
 2. It can create the recommended top-level folders (`notes/`, `journal/`, `secrets/`,
    `attachments/`).
 3. **There is no password recovery.** If you forget the master password the content is
@@ -106,8 +124,12 @@ QT_QPA_PLATFORM=offscreen PYTHONPATH=src ./.venv/bin/python -m vault --self-test
 
 ## Quick tour
 
-* **Browser** (left dock): a tree of folders/files with a sensitivity label per entry.
-* **Editor**: markdown source with a live preview for `normal` files, per-block
+* **Browser** (left dock): a tree of folders/files with a sensitivity label per entry and an
+  optional emoji in front of every folder/file name (a `files.emoji` column; the shared
+  palette lives in `core/emoji.py`, and the desktop list, the web rows and the Android app
+  all show it).
+* **Editor**: markdown source with a preview for `normal` files (off by default — View ▸
+  preview or the toolbar button turns it on, and the choice is remembered), per-block
   RTL/LTR formatting (auto / RTL / LTR, `Ctrl+Shift+D`) and monospace fences. For
   `secret` files the preview is disabled; `secretfile` files never reach the editor
   at all. **Edit in browser** opens the current note in the web UI. Each file also has
@@ -118,14 +140,48 @@ QT_QPA_PLATFORM=offscreen PYTHONPATH=src ./.venv/bin/python -m vault --self-test
 * **Sensitivity levels**: right-click a file → *Set level* → `normal`, `secret` or
   `secretfile`. Lowering requires confirmation and is only possible from the UI.
 * **Secret viewer**: a native plain-text window (no web engine) for `secretfile`
-  content, so it cannot leak into the markdown renderer.
+  content, so it cannot leak into the markdown renderer. A credential body gets the actions
+  its fields call for — see [credentials and one-time codes](#credentials-and-one-time-codes).
+* **Picture viewer**: images open in a native viewer at every sensitivity level, never in
+  the web view (`vault.read_file` can return bytes intact via `binary`).
 * **Search** (right dock): three separate searches — filenames, literal content
   (FTS5) and semantic (opt-in) — never hybridized.
 * **Log panel** (right dock): the append-only access log; every agent call is there.
+* **Window arrangement**: whatever you set — geometry, which docks are open and how they are
+  sized, the active right-dock tab, the source/preview split and the preview itself — is
+  written to `ui.json` and restored on the next start (closing to the tray counts as setting it).
+* **Appearance**: system / dark / light, applied as a real Fusion palette; the web preview
+  and the picture canvas follow it.
+* **Fingerprint quick unlock** (Linux, via `fprintd`): the master password can be replaced on
+  the unlock screen by a finger, backed by a machine-local device secret; the password stays
+  as the fallback and the record is dropped when you turn the option off.
 * **Tray**: the always-on shell — open/copy the web UI link, lock, the last reads
   (with a 🔑 badge for recent secret reads), settings and quit. `secret` reads raise a
   desktop notification, an agent `request_open_secret` pops a **Show & copy** dialog
   on your desktop, and the tooltip always names the file being read.
+
+## Credentials and one-time codes
+
+Credential entries live under the vault folder **`/رمزها`** — one file per entry, laid out as
+`دسته/<site>/<entry>.md`, with a `# title` heading, one `سایت: … | دسته: …` line and one
+`label: value` line per field (user name, password, URL, one-time code). The file bodies are
+`secretfile`s: their names are visible in the structure (and in locked mode), their content is
+not readable without the master password, and an agent can only *ask you* to display one.
+
+Opening such an entry in the native viewer shows, above the text:
+
+* a **one-time-code card** when the entry carries a code — a full `otpauth://totp/…` URI, a
+  bare base32 seed, or a code you pasted by hand (a backup code, shown as stored and never
+  regenerated). `core/totp.py` is RFC 6238 (HMAC-SHA1/256/512), the digits are grouped for the
+  eye (3+3, 4+4, 3+3+3), and a countdown with a progress bar shows when the next code arrives;
+* **per-field copy buttons** — one for the code, one for the user name and one for the
+  password, each copying only its own value and unformatted. A field the entry does not have
+  gets no button, and a copy never puts the value in a notification or a log line.
+
+`core/totp.py` is deliberately pure Python with **no API or MCP surface at all**, so a live code
+cannot be requested by anything but the person in front of the desktop UI (the self-test asserts
+`web_views_for_otp = 0` as a regression guard). The Android app and the Firefox add-on generate
+their codes themselves, on the device, from the value they are allowed to read.
 
 ## Giving agents access (MCP)
 
@@ -140,7 +196,7 @@ Register it with Hermes (the `mcp_servers` map):
 {
   "mcp_servers": {
     "secure-vault": {
-      "command": "/data/Codes/secure-vault/bin/secure-vault-mcp",
+      "command": "/path/to/secure-vault/bin/secure-vault-mcp",
       "args": [],
       "env": {}
     }
@@ -151,7 +207,7 @@ Register it with Hermes (the `mcp_servers` map):
 Or with the CLI:
 
 ```bash
-hermes config set mcp_servers.secure-vault.command "/data/Codes/secure-vault/bin/secure-vault-mcp"
+hermes config set mcp_servers.secure-vault.command "/path/to/secure-vault/bin/secure-vault-mcp"
 hermes config set mcp_servers.secure-vault.args "[]"
 ```
 
@@ -163,9 +219,13 @@ What agents can do: list names/structure, read/write `normal` files, search file
 the content of `normal` files (scoped with `path_prefix`), read/write **folder and file
 notes**, get a one-call `digest` of a folder, list tags (`all_tags`/`files_by_tag`), read
 the semantic status and trigger a scoped `semantic_reindex`, **raise** a level (never
-lower), and ask you to display a `secretfile`. What they can **never** do: read
-`secret`/`secretfile` content, search it, lower a level, or receive the content of a
-`request_open_secret` call. See `docs/MCP.md` for the full tool reference.
+lower), set a folder/file **emoji**, and ask you to display a `secretfile`. What they can
+**never** do: read `secret`/`secretfile` content, search it, lower a level, or receive the
+content of a `request_open_secret` call. See `docs/MCP.md` for the full tool reference.
+
+The repository also carries a small worked example of a *second* MCP server on the same
+session — `tools/max_profile_mcp.py` serves one vault subtree read-only, with no storage of
+its own — as a template for narrow, purpose-built bridges.
 
 ## Using it from a browser (web UI)
 
@@ -188,15 +248,67 @@ edit views with a formatting toolbar, and a parity `/api/index` + `/api/search` 
 `/api/raw` surface. `--allow-lan` is required to bind a non-loopback host. See
 `docs/WEBUI.md` for the token flow, the API and the security caveats.
 
+**Printing** is part of the note view: the pane head has a **Print** button (a bare
+`window.print()` — no export endpoint, no server call) and a paper-orientation select. The
+printed page is the note *alone*: in `@media print` the shell (header, folder tree, status
+bar, action row, breadcrumb, tag chips, note editors, modals) is dropped, the page turns
+paper-white with dark text, long code lines wrap instead of being clipped and tables repeat
+their header row — without that the note was silently cut off at the fold. The orientation is
+injected into the document as an `@page` rule, so `Ctrl+P` honours it too, and the choice is
+kept in `sessionStorage` (`docs/WEBUI.md` §3d).
+
 **You normally do not start it by hand.** The Qt app is the shell: after unlock it
 starts the same `WebServer` in-process on the same session (`web.enabled`, default
 true) and the tray menu opens/copies the token URL. If another instance already owns
 the port/token, the app does not take over the vault and points the tray at the
 already-running instance instead.
 
-## Importing from Joplin
+## Browser autofill (the Firefox add-on)
 
-The importer reads the existing markdown mirror **read-only** and writes into a vault:
+The vault can hand a login form the user name and password of an entry under `/رمزها`, the way
+a password-manager add-on does — but only to a browser holding a **narrow, separate token**:
+`/api/autofill/*` is the entire surface that token opens (`vault.browser_status`,
+`vault.browser_match`, `vault.browser_reveal`), it can never call `read_file` or `write_file`,
+every path it may name has to live under the credential root, an entry is only handed over to
+**its own host**, and every reveal writes one access-log row with `source=browser` (plus an
+activity event, so the tray shows it). Matching answers metadata only — never a password.
+
+The client is the Firefox add-on in
+**[secure-vault-firefox](https://github.com/majidasgari/secure-vault-firefox)**: it puts an
+icon inside the fields, shows the entries for the page's host when you click it, fills them
+only on your click (into a closed shadow DOM, so the page's own scripts cannot click for you),
+reads one-time codes in its popup, and adds nothing automatic. The switch is in the desktop
+app: **Settings → Web UI → browser autofill**. `docs/BROWSER-AUTOFILL.md` is the contract of
+the bridge.
+
+## Android client — گنجینه (Ganjineh)
+
+**[secure-vault-android](https://github.com/majidasgari/secure-vault-android)** is the
+read-only phone client, written in Kotlin/Compose. It pulls `meta.sqlite`, `secure.store` and
+the `files/<aa>/<blob>.enc` blobs from a bucket prefix (GET only — it never PUTs, never DELETEs
+and never touches the write lock), derives the key with the same Argon2id parameters as this
+app, and then offers browsing, folder notes, file notes and tags, Persian-normalised literal
+search (names of *all* files, text of the ones on the device), markdown rendering with the
+per-line RTL rule, one-time codes with per-field copy, an optional fingerprint unlock, and a
+local "recently opened" list. Its unit tests build their fixtures **with this repository's own
+desktop implementation** (`tools/make_test_fixture.py`, `tools/make_totp_fixture.py`), so a
+format drift here turns its tests red. What it deliberately does not do: write, edit, delete,
+change levels or tags, semantic search, version history, sharing, MCP, access-log panel.
+
+## Firefox add-on — fill logins from the vault
+
+**[secure-vault-firefox](https://github.com/majidasgari/secure-vault-firefox)** is the MVP
+add-on described under [browser autofill](#browser-autofill-the-firefox-add-on). It claims a
+browser-scoped token from the loopback bridge, keeps no password of its own (only the port and
+a revocable token), never fills anything without a click, and memoises a one-time code seed for
+at most five minutes in the event page's memory so the countdown does not become one vault read
+per second. It works against the vault running in this repository — the two are versioned
+together through `docs/BROWSER-AUTOFILL.md`.
+
+## Importing
+
+**From Joplin.** The importer reads the existing markdown mirror **read-only** and writes into a
+vault:
 
 ```bash
 printf '%s' 'your-master-password' > /tmp/sv.pw && chmod 600 /tmp/sv.pw
@@ -208,9 +320,16 @@ printf '%s' 'your-master-password' > /tmp/sv.pw && chmod 600 /tmp/sv.pw
 ```
 
 It is idempotent (a second run is a no-op), rewrites `:/<id>` resource references to
-`vault:/attachments/<file>` links, and never modifies the mirror. KeePass is an
-explicit non-goal: passwords belong in `secretfile` files. See
+`vault:/attachments/<file>` links, and never modifies the mirror. See
 `docs/IMPORT_JOPLIN.md`.
+
+**From KeePass/Bitwarden.** `tools/keepass-migration/` is a plan-then-apply pipeline
+(`extract.py` → `plan.py`/`curate.py` → `apply.py`, with `verify.py` at the end) that turns an
+export into the `/رمزها` tree: one `secretfile` per entry, `دسته/<site>/<entry>.md`, no secret
+value ever leaving the 0600 working files or reaching an agent transcript. `apply.py` is
+idempotent and pushes over the local socket (each entry is created `normal`, then raised to
+`secretfile`, then given its note — raising a level drops the note, so the order matters).
+`tools/label_folders.py` can then emoji-label a live vault in bulk without the master key.
 
 ## Syncing
 
@@ -228,9 +347,12 @@ banner with the take-control button. Semantic vectors and the
 embedding cache live outside the vault and are **never synced**; Settings refuses a
 vector-cache path inside the vault. You can also sync the folder with
 Dropbox/OneDrive/Google Drive as before — never sync the runtime directory
-(`$XDG_RUNTIME_DIR/secure-vault`, which holds `store.*.dec`, the socket and the token)
+(`$XDG_RUNTIME_DIR/secure-vault`, which holds `store.*.dec`, the socket and the tokens)
 or `semantic.db`, and do not run two daemons against the same synced folder at once.
 See `docs/SYNC.md`.
+
+The Android client pulls from the same bucket (read-only), and **restore-from-S3** lets a new
+machine adopt the vault that is already there instead of overwriting it.
 
 ## Security notes
 
@@ -238,8 +360,9 @@ Names, sizes, mtimes, sensitivity levels, tags and the access log are readable
 without the password (they live in the plaintext `meta.sqlite`). File content, folder
 notes, the FTS index and embeddings are never readable without the password. Files
 strictly larger than 10 MB are stored **unencrypted** (a deliberate user decision);
-keep secrets in small files. The master password is never stored. See
-`docs/SECURITY.md` for the full threat model and the sensitivity matrix.
+keep secrets in small files. The master password is never stored. A one-time code is
+generated only in the desktop UI. See `docs/SECURITY.md` for the full threat model and the
+sensitivity matrix, and `docs/BROWSER-AUTOFILL.md` for the browser token's exact reach.
 
 ## Tests
 
@@ -282,10 +405,19 @@ secure-vault/
 ├── i18n/                fa.json, en.json UI catalogues
 ├── src/vault/           the package (core, api, ui, web, webui, importers)
 ├── tests/               unittest suites + run_tests.py
-├── tools/               bootstrap, desktop install, importer CLI, smoke scripts, Windows builder
-├── docs/                ARCHITECTURE, SECURITY, MCP, SYNC, IMPORT_JOPLIN, WINDOWS, TESTING, WEBUI
+├── tools/               bootstrap, desktop install, importers (Joplin + keepass-migration),
+│                        smoke scripts, label_folders, max_profile_mcp, Windows builder
+├── docs/                ARCHITECTURE, SECURITY, MCP, SYNC, BROWSER-AUTOFILL,
+│                        IMPORT_JOPLIN, WINDOWS, TESTING, WEBUI
 └── portable/win/        output of the Windows builder (git-ignored)
 ```
+
+## Related repositories
+
+* [secure-vault-android](https://github.com/majidasgari/secure-vault-android) — the read-only
+  Android client (گنجینه).
+* [secure-vault-firefox](https://github.com/majidasgari/secure-vault-firefox) — the Firefox
+  log-in autofill add-on.
 
 ## Licence
 
