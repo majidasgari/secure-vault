@@ -156,9 +156,15 @@ QT_QPA_PLATFORM=offscreen PYTHONPATH=src ./.venv/bin/python -m vault --self-test
   the unlock screen by a finger, backed by a machine-local device secret; the password stays
   as the fallback and the record is dropped when you turn the option off.
 * **Tray**: the always-on shell — open/copy the web UI link, lock, the last reads
-  (with a 🔑 badge for recent secret reads), settings and quit. `secret` reads raise a
-  desktop notification, an agent `request_open_secret` pops a **Show & copy** dialog
-  on your desktop, and the tooltip always names the file being read.
+  (with a 🔑 badge for recent secret reads), settings and quit. **No agent call is
+  silent**: every MCP/socket access — a read, a write, a delete, a move, a folder
+  listing, or a filename/text/semantic search — raises a desktop notification titled
+  *Agent access (source)* that names the action and the path as it happens (for a search:
+  the tool and the query, truncated to 160 characters), the tray's activity feed keeps the
+  newest 200 of them and the tooltip names the file being read right now. A `secret` read
+  gets its own notification naming the file and who asked for it, an agent
+  `request_open_secret` pops a **Show & copy** dialog on your desktop, and identical events
+  are collapsed within 1.5 s so a burst never becomes a wall of popups.
 
 ## Credentials and one-time codes
 
@@ -222,6 +228,13 @@ the semantic status and trigger a scoped `semantic_reindex`, **raise** a level (
 lower), set a folder/file **emoji**, and ask you to display a `secretfile`. What they can
 **never** do: read `secret`/`secretfile` content, search it, lower a level, or receive the
 content of a `request_open_secret` call. See `docs/MCP.md` for the full tool reference.
+
+**Nothing an agent does is silent on your side.** Every call reaches the tray's activity feed
+(newest 200 events) and raises a desktop notification — *Agent access (mcp)*, then the action
+and the path, or the tool and the query when it was a search — at the moment it happens;
+identical events are collapsed within 1.5 s. A refused call notifies as well, and a read of a
+`secret`/`secretfile` file always notifies and is always in the feed, whichever source made it
+(a call that ended in an error stays in the feed without a popup).
 
 The repository also carries a small worked example of a *second* MCP server on the same
 session — `tools/max_profile_mcp.py` serves one vault subtree read-only, with no storage of
