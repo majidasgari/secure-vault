@@ -12,6 +12,8 @@ deliberately tiny: Python, PySide6, `cryptography`, `argon2-cffi`, `markdown-it-
 
 > **The master password is never stored and there is no way to recover it.**
 
+Other language: [فارسی](README.fa.md).
+
 **Companions:** a read-only
 [Android client](https://github.com/majidasgari/secure-vault-android) (گنجینه) and a
 [Firefox add-on](https://github.com/majidasgari/secure-vault-firefox) use the same vault —
