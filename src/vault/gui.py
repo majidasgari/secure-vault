@@ -246,8 +246,19 @@ def run_self_test(
     checks["tree_has_notes"] = window.tree_model.rowCount() > 0
 
     checks["open_normal"] = bool(window.open_file("/notes/hello.md"))
-    checks["preview_enabled_normal"] = bool(window.editor.preview_enabled)
+    # The preview pane is off by default: a normal file *may* preview, but the pane appears only
+    # when the user asks for it (the View menu / the toolbar button), and that choice is kept for
+    # the next file instead of being reset by every open.
+    checks["preview_allowed_normal"] = bool(window.editor.preview_allowed)
+    checks["preview_hidden_by_default"] = window.editor.preview_enabled is False
     checks["normal_content"] = "alpha world" in window.editor.source.toPlainText()
+    window.editor.set_preview_enabled(True)
+    checks["preview_on_request"] = window.editor.preview_enabled is True
+    checks["preview_kept_for_next_file"] = bool(window.open_file("/notes/hello.md")) and (
+        window.editor.preview_enabled is True
+    )
+    window.editor.set_preview_enabled(False)
+    checks["preview_off_again"] = window.editor.preview_enabled is False
 
     checks["open_secret"] = bool(window.open_file("/notes/secret.md"))
     checks["preview_disabled_secret"] = window.editor.preview_enabled is False
@@ -337,6 +348,24 @@ def run_self_test(
     window.log_panel.refresh()
     checks["log_rows"] = window.log_panel.row_count()
     checks["log_grows"] = window.log_panel.row_count() > log_before
+
+    # Search sits before the access log (the everyday action first), and the arrangement the
+    # user sets — geometry, dock state, active tab, preview, split — is written to ui.json so
+    # the next start looks the way they left it instead of snapping back to a default.
+    checks["search_tab_first"] = (
+        window.right_tabs.indexOf(window.search_panel) == 0
+        and window.right_tabs.indexOf(window.log_panel) == 1
+    )
+    window.right_tabs.setCurrentIndex(window.right_tabs.indexOf(window.log_panel))
+    window.save_layout()
+    saved_layout = dict(controller.config.data.get("window") or {})
+    checks["layout_saved"] = all(
+        key in saved_layout for key in ("geometry", "state", "right_tab", "preview")
+    )
+    checks["layout_tab_saved"] = (
+        saved_layout.get("right_tab") == window.right_tabs.currentIndex()
+    )
+    window.right_tabs.setCurrentIndex(window.right_tabs.indexOf(window.search_panel))
 
     controller.set_language("en")
     window.retranslate()

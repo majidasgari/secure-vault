@@ -49,6 +49,10 @@
     editing: false
   };
 
+  //: The visual (Milkdown/Crepe) editor: its vendored module is ~4 MB, so it is imported the first
+  //: time someone asks for it and reused for every mount after that.
+  var visual = { on: false, handle: null, loading: null, blobs: {} };
+
   var statusBase = "";
 
   function $(sel, root) { return (root || document).querySelector(sel); }
@@ -974,6 +978,9 @@
 
   /* ----------------------------------------------------------- view panes */
   function showView(name) {
+    // Leaving the edit view tears the visual editor down: its DOM must not survive into the note
+    // view (and a locked vault keeps nothing on screen).
+    if (name !== "edit" && visual.on) { closeVisualEditor(); }
     ["welcome", "folder", "note", "edit", "search", "tag"].forEach(function (view) {
       var el = $("#view-" + view);
       if (el) { el.hidden = view !== name; }
@@ -1074,6 +1081,178 @@
       }).catch(function (err) {
         showToast(errorText(err), "error");
       });
+    });
+  }
+
+  /* -------------------------------------------------- visual editor (Milkdown) */
+  //: «ادیتور بصری»: a WYSIWYG markdown editor (vendored Milkdown/Crepe, see SPEC/10). It is opt-in
+  //: per file and offered for `normal` notes only — a secret's text never reaches this or any other
+  //: HTML path. The textarea stays the source of truth: every change in the editor is mirrored into
+  //: it, so Save, Cancel, the dirty guard, the raw view and the preview keep working unchanged.
+
+  var VISUAL_KEY = "vault_visual";
+  var VISUAL_MODULE = "/static/vendor/milkdown-editor.js";
+
+  function savedVisualPreference() {
+    try { return window.sessionStorage.getItem(VISUAL_KEY) === "1"; } catch (err) { return false; }
+  }
+
+  function rememberVisualPreference(on) {
+    try { window.sessionStorage.setItem(VISUAL_KEY, on ? "1" : "0"); } catch (err) { /* private mode */ }
+  }
+
+  function visualModule() {
+    if (!visual.loading) {
+      visual.loading = import(VISUAL_MODULE).catch(function (err) {
+        visual.loading = null;
+        throw err;
+      });
+    }
+    return visual.loading;
+  }
+
+  function visualAllowed() {
+    return !!(state.file && state.file.sensitivity === "normal" && !state.file.binary);
+  }
+
+  function visualLabels() {
+    // Every string the vendored editor shows comes from the same catalogue as the rest of the UI.
+    return {
+      placeholder: t("editor.placeholder"),
+      groupText: t("editor.md_group_text"), text: t("editor.md_text"),
+      h1: t("editor.md_h1"), h2: t("editor.md_h2"), h3: t("editor.md_h3"),
+      h4: t("editor.md_h4"), h5: t("editor.md_h5"), h6: t("editor.md_h6"),
+      quote: t("editor.md_quote"), divider: t("editor.md_divider"),
+      groupList: t("editor.md_group_list"), bulletList: t("editor.md_bullet_list"),
+      orderedList: t("editor.md_ordered_list"), taskList: t("editor.md_task_list"),
+      groupAdvanced: t("editor.md_group_advanced"), image: t("editor.md_image"),
+      codeBlock: t("editor.md_code_block"), table: t("editor.md_table"), math: t("editor.md_math"),
+      upload: t("editor.md_upload"), confirm: t("editor.md_confirm"),
+      caption: t("editor.md_caption"), url: t("editor.md_url"),
+      linkEdit: t("editor.md_link_edit"), linkRemove: t("editor.md_link_remove"),
+      linkConfirm: t("editor.md_link_confirm"), linkPlaceholder: t("editor.md_link_placeholder"),
+      previewToggle: t("editor.md_preview_toggle"), editCode: t("editor.md_edit_code"),
+      searchLanguage: t("editor.md_search_language"),
+      copyCode: t("web.copy_code"), noResult: t("editor.md_no_result"),
+      bold: t("editor.md_bold"), italic: t("editor.md_italic"),
+      strikethrough: t("editor.md_strikethrough"), code: t("editor.md_code"),
+      latex: t("editor.md_latex"), link: t("editor.md_link")
+    };
+  }
+
+  function vaultImagePath(src) {
+    // Markdown keeps the vault path; only the DOM gets a URL the browser can actually load.
+    var raw = stripWrappers(src || "");
+    if (!raw || /^data:/i.test(raw)) { return ""; }
+    if (raw.indexOf("vault:") === 0) { return collapseDots(raw.slice(6)); }
+    if (raw.charAt(0) === "/") { return collapseDots(raw); }
+    if (/^[a-z][a-z0-9+.-]*:/i.test(raw)) { return ""; }   // http(s)/blob: — leave those alone
+    var folder = state.file ? state.file.path.split("/").slice(0, -1).join("/") : "";
+    return collapseDots(folder + "/" + raw);
+  }
+
+  function visualImageURL(src) {
+    // Crepe's `proxyDomURL`. A cookie never authorises an /api/* request, so an
+    // `<img src="/api/blob?path=…">` would be a 401: the bytes are fetched with the token and
+    // turned into an object URL, exactly like the preview does.
+    var path = vaultImagePath(src);
+    if (!path) { return src; }
+    if (!visual.blobs[path]) {
+      visual.blobs[path] = fetchBlob(path, attachmentFallback(path)).then(function (blob) {
+        return blob ? URL.createObjectURL(blob) : null;
+      });
+    }
+    return visual.blobs[path].then(function (url) { return url || src; });
+  }
+
+  function visualUpload(file) {
+    // Whatever this resolves to ends up in the note, so it is the same `vault:` reference the
+    // toolbar's image button inserts.
+    return uploadImage(file).then(function (path) { return "vault:" + path; });
+  }
+
+  function visualChanged(markdown) {
+    var area = $("#editor");
+    if (area.value !== markdown) { area.value = markdown; }
+    state.dirty = true;
+    $("#dirty-indicator").hidden = false;
+    updatePreview();
+  }
+
+  function closeVisualEditor() {
+    var handle = visual.handle;
+    var root = $("#visual-editor");
+    var area = $("#editor");
+    visual.handle = null;
+    visual.on = false;
+    if (handle) {
+      try { handle.destroy(); } catch (err) { /* the pane is being torn down anyway */ }
+    }
+    if (root) {
+      root.textContent = "";
+      root.hidden = true;
+    }
+    if (area) { area.hidden = false; }
+    var toolbar = $(".format-toolbar");
+    if (toolbar) { toolbar.hidden = false; }
+    var button = $("#btn-visual");
+    if (button) { button.classList.remove("active"); button.setAttribute("aria-pressed", "false"); }
+  }
+
+  function openVisualEditor() {
+    if (visual.on || !visualAllowed()) { return Promise.resolve(false); }
+    var root = $("#visual-editor");
+    var area = $("#editor");
+    if (!root || !area) { return Promise.resolve(false); }
+    pushBusy();
+    return visualModule().then(function (mod) {
+      return mod.createVisualEditor({
+        root: root,
+        value: area.value,
+        dir: document.documentElement.dir === "ltr" ? "ltr" : "rtl",
+        labels: visualLabels(),
+        onChange: visualChanged,
+        upload: visualUpload,
+        resolveUrl: visualImageURL
+      });
+    }).then(function (handle) {
+      visual.handle = handle;
+      visual.on = true;
+      area.hidden = true;
+      root.hidden = false;
+      var toolbar = $(".format-toolbar");
+      if (toolbar) { toolbar.hidden = true; }   // Crepe brings its own toolbar
+      state.preview = false;                    // the visual editor *is* the preview
+      updatePreview();
+      var button = $("#btn-visual");
+      if (button) { button.classList.add("active"); button.setAttribute("aria-pressed", "true"); }
+      handle.focus();
+      return true;
+    }).catch(function (err) {
+      // The toast is the user-facing part; the console line is what makes this diagnosable.
+      if (window.console && console.error) { console.error("visual editor: mount failed", err); }
+      closeVisualEditor();
+      showToast(t("editor.visual_failed"), "error");
+      return false;
+    }).then(function (opened) {
+      popBusy();
+      return opened;
+    });
+  }
+
+  function toggleVisualEditor() {
+    if (visual.on) {
+      closeVisualEditor();
+      rememberVisualPreference(false);
+      return Promise.resolve(false);
+    }
+    if (!visualAllowed()) {
+      showToast(t("editor.visual_normal_only"), "warn");
+      return Promise.resolve(false);
+    }
+    return openVisualEditor().then(function (opened) {
+      rememberVisualPreference(opened);
+      return opened;
     });
   }
 
@@ -1273,7 +1452,7 @@
     renderBreadcrumbs($("#note-crumbs"), state.file.path, navigateFolder, { file: true });
     $("#note-title").textContent =
       (state.file.emoji ? state.file.emoji + " " : "") + state.file.name;
-    $("#note-title").setAttribute("dir", "auto");
+    $("#note-title").setAttribute("dir", blockDir(state.file.name || ""));
     var updated = formatDate(state.file.mtime);
     var created = formatDate(state.file.created || state.file.mtime);
     $("#note-meta").textContent =
@@ -1396,6 +1575,7 @@
   /* --------------------------------------------------------------- editor */
   function enterEditMode() {
     if (!state.file || state.file.sensitivity === "secretfile" || state.file.binary) { return; }
+    closeVisualEditor();          // every entry into the editor starts from the plain textarea
     state.editing = true;
     $("#editor").value = state.file.content;
     $("#editor-path").textContent = state.file.path;
@@ -1406,7 +1586,9 @@
     state.preview = false;
     $("#preview").hidden = true;
     showView("edit");
-    $("#editor").focus();
+    // The chosen mode is remembered for this tab, but never for a file that may not be rendered.
+    if (savedVisualPreference() && visualAllowed()) { toggleVisualEditor(); }
+    else { $("#editor").focus(); }
   }
 
   function cancelEdit() {
@@ -1666,6 +1848,15 @@
     return RTL_TEXT.test(String(text || ""));
   }
 
+  //: Max's rule for displayed content: a block with even one Persian/Arabic letter is RTL **and**
+  //: right-aligned, a block without one is LTR and left-aligned. `dir="auto"` cannot express that —
+  //: it follows the *first strong* character (so a Latin-first line inside a Persian note stayed
+  //: left-aligned) and it ignores the direction of descendants. The `dir` attribute is set here;
+  //: the alignment and marker side come from the stylesheet ([dir="rtl"]/[dir="ltr"] rules).
+  function blockDir(text) {
+    return hasRtlChars(text) ? "rtl" : "ltr";
+  }
+
   function renderMarkdown(source, notePath) {
     // Bodies exported from Joplin contain raw <img src="data:..."> HTML; escaping it showed the
     // markup as text. Turn those tags into markdown images first, then escape everything else.
@@ -1763,7 +1954,7 @@
       if (heading) {
         closeList(); closeQuote(); closeTable();
         var level = heading[1].length;
-        html.push("<h" + level + ' dir="auto">' + inlineMarkdown(heading[2], notePath) + "</h" + level + ">");
+        html.push("<h" + level + ' dir="' + blockDir(heading[2]) + '">' + inlineMarkdown(heading[2], notePath) + "</h" + level + ">");
         return;
       }
       var task = /^\s*[-*+]\s+\[([ xX])\]\s+(.*)$/.exec(line);
@@ -1771,7 +1962,7 @@
         closeQuote(); closeTable(); openList("ul");
         var done = task[1].toLowerCase() === "x";
         listRtl = listRtl || hasRtlChars(task[2]);
-        html.push('<li dir="auto" class="task' + (done ? " done" : "") +
+        html.push('<li dir="' + blockDir(task[2]) + '" class="task' + (done ? " done" : "") +
           '"><input type="checkbox" disabled' +
           (done ? " checked" : "") + "> " + inlineMarkdown(task[2], notePath) + "</li>");
         return;
@@ -1780,14 +1971,14 @@
         closeQuote(); closeTable(); openList("ul");
         var bullet = line.replace(/^\s*[-*+]\s+/, "");
         listRtl = listRtl || hasRtlChars(bullet);
-        html.push('<li dir="auto">' + inlineMarkdown(bullet, notePath) + "</li>");
+        html.push('<li dir="' + blockDir(bullet) + '">' + inlineMarkdown(bullet, notePath) + "</li>");
         return;
       }
       if (/^\s*\d+\.\s+/.test(line)) {
         closeQuote(); closeTable(); openList("ol");
         var numbered = line.replace(/^\s*\d+\.\s+/, "");
         listRtl = listRtl || hasRtlChars(numbered);
-        html.push('<li dir="auto">' + inlineMarkdown(numbered, notePath) + "</li>");
+        html.push('<li dir="' + blockDir(numbered) + '">' + inlineMarkdown(numbered, notePath) + "</li>");
         return;
       }
       //: escapeHtml ran over the whole source first, so a quote marker arrives as `&gt;` —
@@ -1802,7 +1993,7 @@
           inQuote = true;
         }
         quoteRtl = quoteRtl || hasRtlChars(quoted);
-        html.push('<p dir="auto">' + inlineMarkdown(quoted, notePath) + "</p>");
+        html.push('<p dir="' + blockDir(quoted) + '">' + inlineMarkdown(quoted, notePath) + "</p>");
         return;
       }
       if (/\|/.test(line) && /^\s*\|?.*\|/.test(line)) {
@@ -1817,13 +2008,13 @@
         }
         tableRtl = tableRtl || cells.some(hasRtlChars);
         html.push("<tr>" + cells.map(function (c) {
-          return '<td dir="auto">' + inlineMarkdown(c, notePath) + "</td>";
+          return '<td dir="' + blockDir(c) + '">' + inlineMarkdown(c, notePath) + "</td>";
         }).join("") + "</tr>");
         return;
       }
       closeList(); closeQuote(); closeTable();
       if (line.trim() === "") { return; }
-      html.push('<p dir="auto">' + inlineMarkdown(line, notePath) + "</p>");
+      html.push('<p dir="' + blockDir(line) + '">' + inlineMarkdown(line, notePath) + "</p>");
     });
     closeList(); closeQuote(); closeTable();
     if (inCode) { html.push(closeCodeBlock()); }
@@ -1951,7 +2142,11 @@
     }
     call("vault.set_sensitivity", { path: state.file.path, level: level }).then(function () {
       state.file.sensitivity = level;
-      if (level !== "normal") { state.preview = false; }
+      if (level !== "normal") {
+        state.preview = false;
+        // A secret's text must not stay in a rich-text editor (or its DOM): back to the textarea.
+        if (visual.on) { closeVisualEditor(); rememberVisualPreference(false); }
+      }
       renderNoteView();
       showToast(t("web.level_changed", { level: t("level." + level) }), "ok");
       loadIndex();
@@ -2374,6 +2569,7 @@
   }
 
   function handleLockEvent() {
+    closeVisualEditor();          // nothing the editor rendered may stay in the DOM after a lock
     state.session = state.session || {};
     state.session.locked = true;
     state.session.counts = null;
@@ -2724,8 +2920,10 @@
         if (state.file) { openVersions(state.file.path); }
       });
     }
+    $("#btn-visual").addEventListener("click", function () { toggleVisualEditor(); });
     $("#btn-preview").addEventListener("click", function () {
       if (!state.file || state.file.sensitivity !== "normal") { return; }
+      if (visual.on) { return; }   // the visual editor is already the live preview
       state.preview = !state.preview;
       updatePreview();
     });

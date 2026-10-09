@@ -110,8 +110,9 @@ served without a token because they contain no vault data.
 The single page mirrors the standalone mirror browser and adds the vault's levels:
 
 * **Dark by default** with the mirror palette, plus a light/dark toggle persisted in
-  `sessionStorage` (never vault data). Persian/RTL first, Vazirmatn, `dir="auto"` on
-  names and titles, LTR code blocks and plain-text viewer.
+  `sessionStorage` (never vault data). Persian/RTL first, Vazirmatn, `dir="auto"` on sidebar
+  names, explicit per-block `dir` on note content and the note title, LTR code blocks and
+  plain-text viewer.
 * **Sticky header** with one global search box (focused by `/` or `Ctrl+F`) and a
   status line: lock state · file count · agents · auto-lock countdown.
 * **Sidebar**: a collapsible folder tree from `/api/index` where every row shows the
@@ -136,16 +137,23 @@ The single page mirrors the standalone mirror browser and adds the vault's level
   monospace inside. The fence's own indentation is stripped like CommonMark does, so a block written
   inside a numbered step does not keep the list's eight spaces; a fence left open at the end of the
   note still closes its markup.
-* **Direction is decided per line, never inherited.** Every block the renderer emits carries its
-  own direction: headings and paragraphs `dir="auto"`, list items `dir="auto"`, table cells
-  `dir="auto"`, code `dir="ltr"` — so a Persian line is right-aligned inside an English note and a
-  Latin line stays left inside a Persian one. Containers cannot use `auto`: the browser ignores
-  text that sits inside a descendant carrying its own `dir` attribute, so a list whose items are all
-  `dir="auto"` used to resolve LTR and draw its bullets on the left, and a table put its first
-  column there too. `renderMarkdown` therefore decides the container itself — `<ul>`/`<ol>`,
-  `<table>` and `<blockquote>` get `dir="rtl"` when any of their own lines has a Persian/Arabic
-  letter, `dir="ltr"` otherwise — and `#note-body` / `#preview` follow the note's own language.
-  Blockquote lines (`> …`) render as real quotes.
+* **Direction is decided per block from that block's own text** (Max's rule, Oct 2026: «هر جایی …
+  حتی یک کاراکتر فارسی یا عربی بود کلا هم direction بشه RTL هم alignment بشه right to left»).
+  `renderMarkdown` puts an explicit `dir="rtl"`/`dir="ltr"` on **every** block it emits — headings,
+  paragraphs, list items (bullet, numbered and task), `td`/`th`, blockquote lines, plus the
+  containers `<ul>`/`<ol>`/`<table>`/`<blockquote>`, which take the direction of any line inside
+  them (that is what moves a bullet/number column and flips table column order). Code is always
+  `dir="ltr"`. `dir="auto"` is gone: it obeys the *first strong* character, so a line like
+  `Quality over quantity: 3 نتیجه` inside a Persian note stayed left-aligned, and it ignores the
+  direction of descendants. The alignment itself is CSS — `#note-body [dir="rtl"]` /
+  `#preview [dir="rtl"]` set `direction: rtl; text-align: right` (and the mirror for `ltr`), the
+  list padding swaps per direction, and `unicode-bidi: plaintext` must never be added to those
+  blocks (it would override `dir` again). `#note-body`/`#preview` themselves follow the note's own
+  language, and the note title is set the same way.
+  Verified by measurement, not by eye: `tools/ui_probe_display.js` (run through `tools/ui_probe.py`)
+  checks computed `direction` + `text-align` and that each block's first line is flush with the
+  matching edge of its own content box, and re-renders the same markup with `dir="auto"` as a
+  control that must fail.
 * Deleting a folder is recursive: the confirmation says so («… و همهٔ محتویات داخلش حذف شود؟»)
   and the call is `vault.file_ops {op: delete, recursive: true}`, which takes the folder,
   its subfolders, its notes and its secretfiles (and their blobs) out in one step. Deleting a

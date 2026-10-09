@@ -449,6 +449,9 @@ class VaultApplication(QObject):
             self.window.editor.direction_changed.connect(self._on_editor_direction)
             self.window.editor.note_changed.connect(self.set_file_note)
             self.window.editor.history_requested.connect(self.open_versions)
+            # The arrangement the user left behind (dock sizes/positions, window geometry, the
+            # preview and the active tab) is theirs: restore it before the window is shown.
+            self.window.restore_layout(self.config.window)
             mode = self.config.data.get("editor_direction")
             if isinstance(mode, str) and mode in ("auto", "rtl", "ltr"):
                 self.window.editor.set_direction_mode(mode)
@@ -1153,7 +1156,9 @@ class VaultApplication(QObject):
             if not self._confirm(level, api):
                 return False
             content = self.read(api)
-            viewer.open_viewer(self.window, api, content, tray=self.tray)
+            viewer.open_viewer(
+                self.window, api, content, tray=self.tray, controller=self
+            )
             self._log_secretfile(api)
         return True
 
@@ -1963,7 +1968,9 @@ class VaultApplication(QObject):
         if approved:
             try:
                 content = self.read(path)
-                viewer.open_viewer(self.window, path, content, tray=self.tray)
+                viewer.open_viewer(
+                    self.window, path, content, tray=self.tray, controller=self
+                )
                 self._log_secretfile(path)
             except VaultError as exc:
                 if self.window is not None:
@@ -2380,6 +2387,9 @@ class VaultApplication(QObject):
         """Stop timers, the server and the session."""
         self._auto_lock_timer.stop()
         self.cancel_fingerprint_scan()   # no scan may outlive the app: it would claim the sensor
+        # Last chance to remember the window arrangement the user set.
+        if self.window is not None:
+            self.window.save_layout()
         if self.server is not None:
             try:
                 self.server.stop()

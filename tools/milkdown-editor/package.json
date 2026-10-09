@@ -1,0 +1,26 @@
+{
+  "name": "secure-vault-milkdown-editor",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "description": "Build source for the vendored Milkdown (Crepe) editor used by the Secure Vault web UI.",
+  "scripts": {
+    "build": "vite build"
+  },
+  "dependencies": {
+    "@codemirror/lang-javascript": "^6.2.2",
+    "@codemirror/lang-json": "^6.0.1",
+    "@codemirror/lang-python": "^6.1.6",
+    "@milkdown/crepe": "7.22.2",
+    "@milkdown/kit": "7.22.2",
+    "@milkdown/prose": "7.22.2",
+    "@milkdown/utils": "7.22.2"
+  },
+  "devDependencies": {
+    "vite": "^7.3.6"
+  },
+  "overrides": {
+    "prosemirror-model": "1.25.11"
+  },
+  "//overrides": "prosemirror-model 1.25.12 rejects Milkdown's image-block attrs (a null caption) and drops every image — Milkdown issue #2480, still open for 7.22.2. Drop this pin once a fixed release exists."
+}

@@ -20,6 +20,7 @@ from __future__ import annotations
 import html
 import logging
 import re
+from html.parser import HTMLParser
 from typing import Any
 from urllib.parse import quote
 
@@ -60,7 +61,9 @@ _SCROLL_LOCK_MS = 120
 _MODE_KEYS = {"auto": "editor.mode_auto", "rtl": "editor.mode_rtl", "ltr": "editor.mode_ltr"}
 _DIRECTION_KEYS = {"rtl": "editor.direction_rtl", "ltr": "editor.direction_ltr"}
 
-_BLOCK_TAG = re.compile(r"<(p|li|td|th|h[1-6]|blockquote)(\s|>)")
+_DIRECTION_TAGS = ("p", "li", "td", "th", "dd", "dt", "blockquote", "ul", "ol", "table",
+                   "h1", "h2", "h3", "h4", "h5", "h6")
+_BLOCK_TAG = re.compile(r"<(" + "|".join(_DIRECTION_TAGS) + r")(\s|>)", re.IGNORECASE)
 _CODE_TAG = re.compile(r"<(code)(\s|>)")
 
 
@@ -68,11 +71,61 @@ _RTL_LETTERS = re.compile(r"[\u0590-\u05ff\u0600-\u06ff\u0750-\u077f\ufb50-\ufdf
 _LATIN_LETTERS = re.compile(r"[A-Za-z]")
 
 
+class _BlockDirections(HTMLParser):
+    """Direction of every block element, decided from that element's own text.
+
+    Max's rule for displayed content: even one Persian/Arabic letter makes the block RTL *and*
+    right-aligned, a block without one is LTR and left-aligned (the alignment comes from the
+    stylesheet, keyed on the ``dir`` attribute). Text inside ``pre``/``code`` never decides a
+    direction — code is always left to right — but a block that contains code still follows the
+    text around it. Container elements (``ul``/``ol``/``table``/``blockquote``) see the text of
+    their descendants, so one RTL item puts the markers of the whole list on the right.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.nodes: list[tuple[str, list[str]]] = []
+        self._open: list[tuple[str, list[str]]] = []
+        self._code = 0
+
+    def handle_starttag(self, tag: str, attrs: list) -> None:  # noqa: ARG002 - parser API
+        if tag in ("pre", "code"):
+            self._code += 1
+            return
+        if tag in _DIRECTION_TAGS:
+            node: tuple[str, list[str]] = (tag, [])
+            self._open.append(node)
+            self.nodes.append(node)
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag in ("pre", "code"):
+            self._code = max(0, self._code - 1)
+            return
+        for index in range(len(self._open) - 1, -1, -1):
+            if self._open[index][0] == tag:
+                node = self._open.pop(index)
+                for ancestor in self._open:      # ancestors see their descendants' text
+                    ancestor[1].append("".join(node[1]))
+                return
+
+    def handle_data(self, data: str) -> None:
+        if self._code:
+            return
+        for node in self._open:
+            node[1].append(data)
+
+    def directions(self) -> list[tuple[str, str]]:
+        """``[(tag, "rtl"|"ltr"), …]`` in document order (open-tag order)."""
+        return [(tag, "rtl" if _RTL_LETTERS.search("".join(text)) else "ltr")
+                for tag, text in self.nodes]
+
+
 def is_rtl_text(text: str) -> bool:
     """True when ``text`` contains at least one RTL letter (the user's rule).
 
-    Any Persian/Arabic character makes the document RTL; per-block ``dir="auto"`` still keeps
-    Latin blocks left-aligned inside it. Text with no letters at all follows the UI language.
+    Any Persian/Arabic character makes the document RTL; every block inside it carries its own
+    ``dir`` as well, so Latin blocks stay left-aligned. Text with no letters at all follows the UI
+    language.
     """
     rtl = len(_RTL_LETTERS.findall(text))
     latin = len(_LATIN_LETTERS.findall(text))
@@ -98,7 +151,8 @@ def preview_css(direction: str, palette: dict[str, str] | None = None) -> str:
     h1 {{ font-size: 1.65em; border-bottom: 1px solid {colors['border']}; padding-bottom: .2em; }}
     h2 {{ font-size: 1.35em; }}
     h3 {{ font-size: 1.15em; }}
-    p, li, td, th, blockquote {{ direction: auto; }}
+    [dir="rtl"] {{ direction: rtl; text-align: right; }}
+    [dir="ltr"] {{ direction: ltr; text-align: left; }}
     strong {{ color: {colors['text']}; font-weight: 700; }}
     em {{ color: {colors['quote']}; }}
     a {{ color: {colors['link']}; text-decoration: none; }}
@@ -120,6 +174,8 @@ def preview_css(direction: str, palette: dict[str, str] | None = None) -> str:
     }}
     hr {{ border: 0; border-top: 1px solid {colors['border']}; margin: 1.2em 0; }}
     ul, ol {{ padding-{ 'right' if direction == 'rtl' else 'left' }: 1.6em; }}
+    ul[dir="rtl"], ol[dir="rtl"] {{ padding-left: 0; padding-right: 1.6em; }}
+    ul[dir="ltr"], ol[dir="ltr"] {{ padding-right: 0; padding-left: 1.6em; }}
     li {{ margin: .18em 0; }}
     li.task-list-item {{ list-style: none; margin-{ 'right' if direction == 'rtl' else 'left' }: -1.2em; }}
     input[type=checkbox] {{ margin-{ 'left' if direction == 'rtl' else 'right' }: .45em; }}
@@ -130,13 +186,35 @@ def preview_css(direction: str, palette: dict[str, str] | None = None) -> str:
     """
 
 
+def _apply_block_directions(body: str) -> str:
+    """Give every block an explicit ``dir`` taken from that block's own text (Max's rule)."""
+    parser = _BlockDirections()
+    fallback = "rtl" if _RTL_LETTERS.search(body) else "ltr"
+    try:
+        parser.feed(body)
+        parser.close()
+        directions: Any = iter(parser.directions())
+    except Exception:  # noqa: BLE001 - never fail to show something
+        directions = iter(())
+
+    def annotate(match: re.Match) -> str:
+        try:
+            tag, direction = next(directions)
+        except StopIteration:
+            tag, direction = match.group(1), fallback
+        return f'<{tag} dir="{direction}"{match.group(2)}'
+
+    return _BLOCK_TAG.sub(annotate, body)
+
+
 def render_markdown(text: str) -> str:
     """Render ``text`` as safe HTML (raw HTML disabled), with per-block direction.
 
-    Every block element gets ``dir="auto"`` and ``pre``/``code`` get ``dir="ltr"`` so a
-    mixed Persian/Latin document renders correctly (SPEC/08 §A.5). The stylesheet follows the
-    application theme and gives markdown the colour coding the user liked in Kate
-    (headings, inline code, fenced code blocks, quotes, tables, links).
+    Every block element carries its own ``dir`` (``rtl`` when it holds even one Persian/Arabic
+    letter, else ``ltr``) and ``pre``/``code`` are always ``ltr``, so a mixed document renders
+    correctly (SPEC/08 §A.5). The stylesheet follows the application theme and turns that attribute
+    into alignment, and gives markdown the colour coding the user liked in Kate (headings, inline
+    code, fenced code blocks, quotes, tables, links).
     """
     try:
         from markdown_it import MarkdownIt
@@ -148,7 +226,7 @@ def render_markdown(text: str) -> str:
         body = md.render(text)
     except Exception:  # noqa: BLE001 - never fail to show something
         body = "<pre>" + html.escape(text) + "</pre>"
-    body = _BLOCK_TAG.sub(lambda m: f"<{m.group(1)} dir=\"auto\"{m.group(2)}", body)
+    body = _apply_block_directions(body)
     body = body.replace("<pre>", '<pre dir="ltr">')
     body = _CODE_TAG.sub(lambda m: f'<code dir="ltr"{m.group(2)}', body)
     direction = "rtl" if is_rtl_text(text) else "ltr"
@@ -193,7 +271,10 @@ class EditorPanel(QWidget):
         """Create an empty editor."""
         super().__init__(parent)
         self.current_path: str | None = None
-        self.preview_enabled = True
+        # The preview pane is OFF until the user asks for it (View menu / the toolbar button);
+        # `_preview_preference` is that wish, remembered across files and across restarts.
+        self.preview_enabled = False
+        self._preview_preference = False
         self.preview_allowed = True
         self.preview_kind = "text"
         self.web_port: int | None = None
@@ -208,6 +289,10 @@ class EditorPanel(QWidget):
         self._preview_poll: QTimer | None = None
         self._preview_checked = False
         self._split_applied = False
+        #: The user's own source/preview split, as ratios, plus whether a restored one still has
+        #: to be applied (the preview may be hidden at the moment the layout is restored).
+        self._split_ratio: list[float] | None = None
+        self._split_pending = False
         self._preview_load_ok: bool | None = None
 
         layout = QVBoxLayout(self)
@@ -268,7 +353,13 @@ class EditorPanel(QWidget):
         self.splitter.setChildrenCollapsible(False)
         self.splitter.setSizes([1, 1])
         layout.addWidget(self.splitter, 1)
+        # The preview pane is off by default, but it is hidden on the panel's first *show* rather
+        # than here: a QWebEngineView that is hidden before it was ever shown tears down inside Qt
+        # Quick's render control and crashes the process on exit (measured: 3 of 4 offscreen test
+        # runs with the hide in __init__, 0 of 4 with it in showEvent, where nothing flickers).
+        self._preview_visibility_applied = False
         self._setup_scroll_sync()
+        self.splitter.splitterMoved.connect(self._on_splitter_moved)
 
         self.status_label = QLabel(self)
         layout.addWidget(self.status_label)
@@ -336,8 +427,11 @@ class EditorPanel(QWidget):
             self._fallback_preview("load failed")
 
     def showEvent(self, event: Any) -> None:  # noqa: N802 - Qt API
-        """Give both panes half of the width the first time the panel is shown."""
+        """Show the panes and apply the preview's own visibility (off by default)."""
         super().showEvent(event)
+        if not self._preview_visibility_applied:
+            self._preview_visibility_applied = True
+            self.preview.setVisible(self.preview_enabled)
         self._balance_split()
 
     def resizeEvent(self, event: Any) -> None:  # noqa: N802 - Qt API
@@ -353,6 +447,42 @@ class EditorPanel(QWidget):
         self._split_applied = True
         half = max(self.splitter.width() or self.width(), 400) // 2
         QTimer.singleShot(0, lambda: self.splitter.setSizes([half, half]))
+
+    # -------------------------------------------------------------- split layout
+    def _on_splitter_moved(self, *_args: Any) -> None:
+        """Remember the split the user just dragged, as ratios (width-independent)."""
+        sizes = [int(value) for value in self.splitter.sizes()]
+        total = sum(sizes)
+        if len(sizes) == 2 and total > 0 and min(sizes) > 0:
+            self._split_ratio = [sizes[0] / total, sizes[1] / total]
+            self._split_pending = False
+
+    def split_ratio(self) -> list[float] | None:
+        """Return the user's source/preview split as ratios (None when never changed)."""
+        return list(self._split_ratio) if self._split_ratio else None
+
+    def apply_split_ratio(self, ratios: Any) -> bool:
+        """Restore a saved split; it is applied when the preview next becomes visible."""
+        values: list[float] = []
+        if isinstance(ratios, (list, tuple)) and len(ratios) == 2:
+            try:
+                values = [float(value) for value in ratios]
+            except (TypeError, ValueError):
+                values = []
+        if len(values) != 2 or min(values) <= 0 or max(values) >= 1:
+            return False
+        self._split_ratio = values
+        self._split_pending = True
+        return True
+
+    def _apply_saved_split(self) -> None:
+        """Give the panes the user's own split (a saved one wins over the 50/50 default)."""
+        if not self._split_pending or not self._split_ratio:
+            return
+        self._split_pending = False
+        self._split_applied = True
+        total = max(self.splitter.width(), self.width(), 400)
+        self.splitter.setSizes([max(1, int(total * value)) for value in self._split_ratio])
 
     def _render_preview(self) -> None:
         """Render the source into the preview (only when preview is enabled)."""
@@ -527,10 +657,15 @@ class EditorPanel(QWidget):
 
     # ------------------------------------------------------------------ content
     def set_content(self, path: str, text: str, *, preview_enabled: bool) -> None:
-        """Load ``text`` for ``path``; the preview is disabled for secret levels."""
+        """Load ``text`` for ``path``.
+
+        ``preview_enabled`` is the *permission* for this level of the file: False for
+        ``secret``/``secretfile``. Whether the pane is actually shown is the user's own
+        choice (:meth:`preview_wanted`), which is off until they turn it on.
+        """
         self.current_path = path
-        self.preview_enabled = bool(preview_enabled)
         self.preview_allowed = bool(preview_enabled)
+        self.preview_enabled = self.preview_allowed and self._preview_preference
         self._loading = True
         try:
             self.source.setPlainText(text)
@@ -543,6 +678,7 @@ class EditorPanel(QWidget):
             _LOG.warning("bidi pass failed while loading %s: %s", path, exc)
         if self.preview_enabled:
             self.preview.setVisible(True)
+            self._apply_saved_split()
             self._render_preview()
         else:
             self._clear_preview()
@@ -584,15 +720,27 @@ class EditorPanel(QWidget):
         self._clear_preview()
         self._refresh_actions()
 
-    def set_preview_enabled(self, enabled: bool) -> None:
-        """Toggle the preview pane (used by the View menu).
+    def preview_wanted(self) -> bool:
+        """Return the user's own preview choice (off until they turn it on).
 
-        ``preview_allowed`` is False for ``secret``/``secretfile`` files: the View menu must
-        never be able to hand secret text to the preview widget.
+        It is remembered across files and across restarts, so the pane stays the way the user
+        left it instead of popping open with every note.
         """
+        return bool(self._preview_preference)
+
+    def set_preview_enabled(self, enabled: bool) -> None:
+        """Toggle the preview pane (the View menu and the toolbar button).
+
+        The choice is remembered for the next file as well. ``preview_allowed`` is False for
+        ``secret``/``secretfile`` files: the View menu must never be able to hand secret text
+        to the preview widget, so a toggle on such a file changes nothing.
+        """
+        if self.preview_allowed:
+            self._preview_preference = bool(enabled)
         self.preview_enabled = bool(enabled) and self.preview_allowed
         self.preview.setVisible(self.preview_enabled)
         if self.preview_enabled:
+            self._apply_saved_split()
             self._render_preview()
         else:
             self._clear_preview()

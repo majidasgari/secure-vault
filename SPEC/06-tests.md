@@ -143,8 +143,11 @@ one representative widget retranslates on `set_language` (offscreen).
    is missing)
 import the package · build the app with `--self-test` against a scratch vault: create → unlock →
 main window constructed → tree has the expected folders → open a note in the editor →
-`editor.preview_enabled is True` for `normal` and **False** after the file becomes `secret`
-(and the confirmation hook is stubbed to approve) → the native viewer path for a `secretfile`
+`editor.preview_allowed is True` for `normal` with the preview pane **off** by default (and
+turned on only on request), and both false after the file becomes `secret`
+(and the confirmation hook is stubbed to approve) → the right dock lists search before the
+access log → the saved arrangement (geometry, dock state, active tab, preview, split) is
+restored onto the window → the native viewer path for a `secretfile`
 (`viewer.last_text` equals the content, and no `QWebEngineView` was created for it) →
 `search_panel` returns results for all three kinds (semantic via `StubProvider`) →
 `log_panel.row_count()` grows after an action → `i18n.set_language("en")` changes a known label

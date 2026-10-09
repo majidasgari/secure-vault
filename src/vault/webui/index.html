@@ -143,6 +143,8 @@
               <option value="secret" data-i18n="level.secret"></option>
               <option value="secretfile" data-i18n="level.secretfile"></option>
             </select>
+            <button id="btn-visual" type="button" data-i18n="editor.visual"
+                    data-i18n-title="editor.visual_title" aria-pressed="false"></button>
             <button id="btn-preview" type="button" data-i18n="web.preview"></button>
             <button id="btn-cancel" type="button" data-i18n="web.cancel"></button>
             <button id="btn-save" type="button" class="primary" data-i18n="web.save"></button>
@@ -150,6 +152,7 @@
           <div id="dirty-indicator" class="dirty" hidden data-i18n="editor.unsaved_title"></div>
           <div class="edit-split">
             <textarea id="editor" spellcheck="false" dir="auto" data-i18n-placeholder="editor.placeholder"></textarea>
+            <div id="visual-editor" class="visual-editor" hidden></div>
             <div id="preview" class="preview" dir="auto" hidden></div>
           </div>
         </div>

@@ -1,0 +1,80 @@
+/* Secure Vault theme for the vendored Crepe editor.
+ *
+ * Injected by `entry.js` after the two upstream sheets (common + frame), so everything here wins
+ * over Crepe's own palette. The point is that the editor is not a foreign widget: it borrows the
+ * SPA's variables, so it follows the app's dark/light theme and its Vazirmatn/RTL layout.
+ */
+
+#visual-editor .milkdown {
+  --crepe-color-background: var(--panel);
+  --crepe-color-on-background: var(--text);
+  --crepe-color-surface: var(--panel2);
+  --crepe-color-surface-low: var(--panel);
+  --crepe-color-on-surface: var(--text);
+  --crepe-color-on-surface-variant: var(--muted);
+  --crepe-color-outline: var(--border);
+  --crepe-color-primary: var(--accent);
+  --crepe-color-secondary: var(--panel2);
+  --crepe-color-on-secondary: var(--text);
+  --crepe-color-inverse: var(--text);
+  --crepe-color-on-inverse: var(--bg);
+  --crepe-color-inline-code: var(--accent);
+  --crepe-color-error: var(--danger);
+  --crepe-color-hover: var(--panel2);
+  --crepe-color-selected: var(--note);
+  --crepe-color-inline-area: var(--panel2);
+
+  --crepe-font-default: inherit;
+  --crepe-font-title: inherit;
+  --crepe-font-code: ui-monospace, "Vazirmatn", monospace;
+  --crepe-base-font-size: 1rem;
+  --crepe-shadow-1: 0 1px 2px rgba(0, 0, 0, 0.3);
+  --crepe-shadow-2: 0 2px 8px rgba(0, 0, 0, 0.35);
+
+  height: 100%;
+  min-height: 0;
+  overflow: auto;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  background: var(--panel);
+}
+
+#visual-editor .milkdown .ProseMirror {
+  /* the upstream 60px/120px gutter is meant for a full-page editor; this is a pane */
+  padding: 20px 24px 120px;
+  min-height: 100%;
+  font-family: inherit;
+  line-height: 1.9;
+}
+
+/* ---------------------------------------------------------------- direction
+ * Same rule as the preview and the desktop editor: a block with even one Persian/Arabic letter is
+ * RTL and right-aligned, everything else is LTR, and code stays LTR. `entry.js` puts the `dir`
+ * attribute on the node itself (a ProseMirror node decoration), these rules only act on it.
+ * Never `unicode-bidi: plaintext` — it would ignore `dir` and follow the first strong character.
+ */
+#visual-editor .ProseMirror [dir="rtl"] { direction: rtl; text-align: right; }
+#visual-editor .ProseMirror [dir="ltr"] { direction: ltr; text-align: left; }
+
+#visual-editor .ProseMirror ul[dir="rtl"],
+#visual-editor .ProseMirror ol[dir="rtl"] { padding-left: 0; padding-right: 1.4em; }
+#visual-editor .ProseMirror ul[dir="ltr"],
+#visual-editor .ProseMirror ol[dir="ltr"] { padding-right: 0; padding-left: 1.4em; }
+
+#visual-editor .ProseMirror th[dir="rtl"], #visual-editor .ProseMirror td[dir="rtl"] { text-align: right; }
+#visual-editor .ProseMirror th[dir="ltr"], #visual-editor .ProseMirror td[dir="ltr"] { text-align: left; }
+
+#visual-editor .ProseMirror pre,
+#visual-editor .ProseMirror pre *,
+#visual-editor .ProseMirror code {
+  direction: ltr;
+  text-align: left;
+  unicode-bidi: isolate;
+}
+
+/* Crepe draws the block handle and the slash menu in a floating layer on <body>; keep those LTR so
+ * an RTL document does not flip their internal layout. */
+.milkdown-slash-menu[data-show="false"] { display: none; }
+
+/* The image block's own "upload / confirm" bar sits above the block: keep it readable in the pane. */
+#visual-editor .milkdown-image-block > .image-wrapper { max-width: 100%; }

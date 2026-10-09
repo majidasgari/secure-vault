@@ -10,3 +10,9 @@ docs/reports/*.md
 *.tmp
 .DS_Store
 *.egg-info/
+
+# The vendored visual editor (tools/build_milkdown.sh): the npm/bun dependencies and the vite
+# output stay out of git — the compiled single-file bundle is committed to
+# src/vault/webui/vendor/milkdown-editor.js, which is what the SPA actually serves.
+tools/milkdown-editor/node_modules/
+tools/milkdown-editor/dist/

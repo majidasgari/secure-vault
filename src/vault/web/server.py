@@ -34,6 +34,8 @@ _STATIC_TYPES = {
     "app.js": "application/javascript; charset=utf-8",
     "styles.css": "text/css; charset=utf-8",
     "icons.svg": "image/svg+xml",
+    # The vendored visual editor (SPEC/10): one ES module, built by tools/build_milkdown.sh.
+    "vendor/milkdown-editor.js": "application/javascript; charset=utf-8",
 }
 
 FONT_FILENAME = "Vazirmatn-Regular.ttf"

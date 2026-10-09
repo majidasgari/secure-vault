@@ -185,8 +185,25 @@ input[type="checkbox"] { min-height: auto; width: 18px; height: 18px; }
 .edit-split { display: flex; gap: 8px; align-items: stretch; }
 .edit-split #editor { flex: 1; }
 .edit-split #preview { flex: 1; max-height: 72vh; }
+/* The visual editor replaces the textarea in the same slot; its own look comes from the vendored
+   Milkdown theme (injected by /static/vendor/milkdown-editor.js), not from here. */
+.visual-editor { flex: 1; min-width: 0; min-height: 320px; display: flex; }
+.visual-editor[hidden] { display: none; }
+#btn-visual.active { border-color: var(--accent); color: var(--accent); }
 #preview { background: var(--note); border: 1px solid var(--border); border-radius: var(--radius); padding: 14px; overflow: auto; }
 #preview img, #note-body img { max-width: 100%; }
+/* Content direction follows each block's own text (Max's rule): a block with even one Persian/
+   Arabic letter is RTL *and* right-aligned, a block without one is LTR and left-aligned.
+   renderMarkdown writes the `dir` attribute on every block; these rules turn it into alignment and
+   move the list markers. `unicode-bidi: plaintext` must never be added here — it would override
+   `dir` and take the direction from the first strong character again. */
+#preview [dir="rtl"], #note-body [dir="rtl"], #note-title[dir="rtl"] { direction: rtl; text-align: right; }
+#preview [dir="ltr"], #note-body [dir="ltr"], #note-title[dir="ltr"] { direction: ltr; text-align: left; }
+#preview ul[dir="rtl"], #note-body ul[dir="rtl"],
+#preview ol[dir="rtl"], #note-body ol[dir="rtl"] { padding-left: 0; padding-right: 1.5em; }
+#preview ul[dir="ltr"], #note-body ul[dir="ltr"],
+#preview ol[dir="ltr"], #note-body ol[dir="ltr"] { padding-right: 0; padding-left: 1.5em; }
+#preview li.task, #note-body li.task { list-style: none; }
 #preview pre, #note-body pre, .modal pre.plain {
   background: var(--code); border: 1px solid var(--border); border-radius: 8px;
   padding: 12px; overflow: auto; direction: ltr; text-align: left;
@@ -476,6 +493,7 @@ input[type="checkbox"] { min-height: auto; width: 18px; height: 18px; }
   .view-pane { max-width: 100%; }
   .edit-split { flex-direction: column; }
   #editor { min-height: 46vh; }
+  .visual-editor { min-height: 46vh; }
   .format-btn { min-width: 38px; min-height: 38px; }
 }
 
@@ -566,6 +584,7 @@ input[type="checkbox"] { min-height: auto; width: 18px; height: 18px; }
 #view-edit { flex: 1 1 auto; min-height: 0; }
 #view-edit .edit-split { flex: 1 1 auto; min-height: 0; }
 #view-edit #editor { height: 100%; min-height: 0; resize: none; }
+#view-edit .visual-editor { height: 100%; min-height: 0; }
 #view-edit #preview { max-height: none; height: 100%; }
 #view-note, #view-folder, #view-search, #view-tag { flex: 1 1 auto; min-height: 0; }
 

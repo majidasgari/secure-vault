@@ -87,10 +87,63 @@ class UiSmokeTest(unittest.TestCase):
         self.assertGreater(self.checks["tree_rows"], 0)
 
     def test_normal_file_preview_enabled(self) -> None:
-        """A normal file opens in the editor with the preview enabled."""
+        """A normal file opens in the editor; the preview pane is off until it is asked for."""
         self.assertTrue(self.checks["open_normal"])
-        self.assertTrue(self.checks["preview_enabled_normal"])
+        self.assertTrue(self.checks["preview_allowed_normal"])
+        self.assertTrue(self.checks["preview_hidden_by_default"])
         self.assertTrue(self.checks["normal_content"])
+        # Turning it on shows it and the choice is kept for the next file.
+        self.assertTrue(self.checks["preview_on_request"])
+        self.assertTrue(self.checks["preview_kept_for_next_file"])
+        self.assertTrue(self.checks["preview_off_again"])
+
+    def test_search_tab_precedes_access_log(self) -> None:
+        """The right dock lists search before the access log."""
+        self.assertTrue(self.checks["search_tab_first"])
+
+    def test_layout_persists_and_restores(self) -> None:
+        """The arrangement the user sets survives a restart (save → change → restore)."""
+        window = self.result.window
+        controller = self.result.controller
+        original = window.layout_state()
+        tabs = window.right_tabs
+        log_index = tabs.indexOf(window.log_panel)
+
+        # 1. Arrange it: a size of its own, the access-log tab, the preview on.
+        window.resize(900, 640)
+        tabs.setCurrentIndex(log_index)
+        window.editor.set_preview_enabled(True)
+        window.save_layout()
+        saved = dict(controller.config.data.get("window") or {})
+        self.assertTrue(saved.get("geometry"), "no window geometry was saved")
+        self.assertTrue(saved.get("state"), "no dock state was saved")
+        self.assertEqual(saved.get("right_tab"), log_index)
+        self.assertTrue(saved.get("preview"))
+        self.assertTrue(saved.get("right_dock"))
+        arranged_size = (window.width(), window.height())
+
+        # 2. Change everything the user can change, then restore the saved arrangement.
+        window.resize(640, 480)
+        self.assertNotEqual(
+            (window.width(), window.height()),
+            arranged_size,
+            "the window did not actually change",
+        )
+        tabs.setCurrentIndex(tabs.indexOf(window.search_panel))
+        window.editor.set_preview_enabled(False)
+        window.right_dock.setVisible(False)
+        self.assertTrue(window.restore_layout(saved))
+        self.assertEqual(window.right_tabs.currentIndex(), log_index)
+        # The position is the window manager's business; the size is ours.
+        self.assertEqual((window.width(), window.height()), arranged_size)
+        self.assertTrue(window.editor.preview_enabled)
+        # ``isHidden()`` and not ``isVisible()``: the shared window is hidden to the tray at the
+        # end of the self-test, which makes every child invisible without anyone closing it.
+        self.assertFalse(window.right_dock.isHidden())
+
+        # 3. Leave the shared window the way the rest of the class expects to find it.
+        window.restore_layout(original)
+        window.editor.set_preview_enabled(False)
 
     def test_secret_file_preview_disabled(self) -> None:
         """A secret file opens after confirmation with the preview disabled."""
@@ -253,11 +306,18 @@ class EditorBidiTest(unittest.TestCase):
             block = block.next()
 
     def test_preview_dir_attributes(self) -> None:
-        """The preview HTML marks blocks auto and code LTR."""
+        """The preview HTML marks every block from its own text and keeps code LTR."""
         from vault.ui.editor import render_markdown
 
-        rendered = render_markdown("متن فارسی\n\n```\ncode\n```")
-        self.assertIn('dir="auto"', rendered)
+        rendered = render_markdown(
+            "متن فارسی\n\nplain english\n\n| گزینه |\n| --- |\n| RotatE |\n\n```\ncode\n```"
+        )
+        self.assertNotIn('dir="auto"', rendered)
+        self.assertIn('<p dir="rtl">متن فارسی</p>', rendered)
+        self.assertIn('<p dir="ltr">plain english</p>', rendered)
+        self.assertIn('<table dir="rtl">', rendered)
+        self.assertIn('<td dir="ltr">RotatE</td>', rendered)
+        self.assertIn('[dir="rtl"] { direction: rtl; text-align: right; }', rendered)
         self.assertIn('<pre dir="ltr">', rendered)
         self.assertIn('dir="ltr"', rendered)
 
@@ -792,6 +852,48 @@ class SecretViewerOtpTest(unittest.TestCase):
             self.assertTrue(recorded["live"])
             self.assertNotIn("secret", recorded)
             self.assertNotIn("GEZDGNBVGY3TQOJQ", str(recorded))
+        finally:
+            dialog.close()
+
+    def test_secret_viewer_editing_and_saving(self) -> None:
+        """SecretViewer is editable, tracks dirty state and saves back."""
+        from vault.ui import viewer
+
+        saved_path = None
+        saved_text = None
+
+        def on_save(path: str, text: str) -> None:
+            nonlocal saved_path, saved_text
+            saved_path = path
+            saved_text = text
+
+        dialog = viewer.SecretViewer(
+            None, "/secrets/creds.md", "password: old_pass", on_save=on_save
+        )
+        try:
+            self.assertFalse(dialog.edit.isReadOnly())
+            self.assertFalse(dialog._dirty)
+            self.assertFalse(dialog.save_button.isEnabled())
+
+            dialog.edit.setPlainText("password: new_pass\nusername: maxv")
+            self.assertTrue(dialog._dirty)
+            self.assertTrue(dialog.save_button.isEnabled())
+            self.assertIn("*", dialog.windowTitle())
+
+            # Live parsing should update the username and password copy buttons
+            self.assertTrue(dialog.copy_username_button.isVisibleTo(dialog))
+            self.assertTrue(dialog.copy_password_button.isVisibleTo(dialog))
+            self.assertEqual(dialog.password, "new_pass")
+            self.assertEqual(dialog.username, "maxv")
+
+            # Save
+            self.assertTrue(dialog.save())
+            self.assertEqual(saved_path, "/secrets/creds.md")
+            self.assertEqual(saved_text, "password: new_pass\nusername: maxv")
+            self.assertFalse(dialog._dirty)
+            self.assertFalse(dialog.save_button.isEnabled())
+            self.assertNotIn("*", dialog.windowTitle())
+            self.assertEqual(viewer.last_text, "password: new_pass\nusername: maxv")
         finally:
             dialog.close()
 

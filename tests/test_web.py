@@ -872,38 +872,43 @@ class MarkdownCodeBlockTest(unittest.TestCase):
 
 
 class MarkdownDirectionTest(unittest.TestCase):
-    """Per-line direction: a Persian line is RTL, a Latin line is LTR, containers follow content.
+    """Per-block direction: any Persian/Arabic letter makes the block RTL *and* right-aligned.
 
-    The container direction cannot come from ``dir="auto"``: the browser ignores text that sits
-    inside a descendant carrying its own dir attribute, so a list whose items are all `dir="auto"`
-    resolved LTR and drew its bullets on the left (Max reported it as «بعضی مواقع چیزهایی که باید
-    RTL باشند، نیستند»). The renderer therefore decides the container itself.
+    Max's rule (Sep 2026): «هر جایی اعم از enum ها یا سلولهای جدول یا شمارهگذاریها حتی یک کاراکتر
+    فارسی یا عربی بود کلا هم direction بشه RTL هم alignment بشه right to left». So every block —
+    paragraph, heading, list item, table cell, quote — carries its own explicit ``dir`` decided from
+    its own text; a block without a single RTL letter is LTR and left-aligned. ``dir="auto"`` cannot
+    express this: it follows the *first strong* character (a Latin-first line inside a Persian note
+    stayed left-aligned) and it ignores the direction of descendants. The alignment itself comes
+    from the stylesheet's ``[dir="rtl"]``/``[dir="ltr"]`` rules; here the markup is asserted.
     """
 
     def test_persian_list_is_rtl_english_list_is_ltr(self) -> None:
-        """Bullets follow the content, and each item keeps its own per-line direction."""
+        """Bullets follow the content, and each item carries its own direction."""
         persian, english = render_markdown(
-            "- مستنداتش همه استاندارد و تی‌م‌زند (TASK_SPEC, AGENTS.md)\n- نحوه‌ی حرف زدنش\n",
+            "- مستنداتش همه استاندارد و تیمزند (TASK_SPEC, AGENTS.md)\n- نحوهی حرف زدنش\n",
             "- file entries and English first item\n- attachments\n",
         )
         self.assertIn('<ul dir="rtl">', persian)
-        self.assertIn('<li dir="auto">', persian)
+        self.assertIn('<li dir="rtl">مستنداتش', persian)
         self.assertIn('<ul dir="ltr">', english)
+        self.assertIn('<li dir="ltr">file entries', english)
         self.assertNotIn('<ul dir="rtl">', english)
 
     def test_mixed_list_keeps_the_persian_item_rtl(self) -> None:
-        """One Persian line is enough for a right-hand marker; the Latin item stays auto."""
+        """One Persian line is enough for a right-hand marker; the Latin item keeps its own LTR."""
         (html,) = render_markdown("- file entries first\n- مستنداتش فارسی است\n")
         self.assertIn('<ul dir="rtl">', html)
-        self.assertIn('<li dir="auto">file entries first</li>', html)
+        self.assertIn('<li dir="ltr">file entries first</li>', html)
+        self.assertIn('<li dir="rtl">مستنداتش فارسی است</li>', html)
 
     def test_numbered_and_task_items_carry_dir(self) -> None:
         """Ordered lists and task lists are per-line too."""
         numbered, tasks = render_markdown("1. یک\n2. دو\n", "- [x] انجام شد\n- [ ] باقی\n")
         self.assertIn('<ol dir="rtl">', numbered)
-        self.assertIn('<li dir="auto">یک</li>', numbered)
+        self.assertIn('<li dir="rtl">یک</li>', numbered)
         self.assertIn('<ul dir="rtl">', tasks)
-        self.assertIn('<li dir="auto" class="task done">', tasks)
+        self.assertIn('<li dir="rtl" class="task done">', tasks)
 
     def test_table_direction_follows_its_cells(self) -> None:
         """A Persian table starts its first column on the right; an English one on the left."""
@@ -912,8 +917,17 @@ class MarkdownDirectionTest(unittest.TestCase):
             "| first | second |\n| --- | --- |\n| alpha | beta |\n",
         )
         self.assertIn('<table dir="rtl"><tbody>', persian)
-        self.assertIn('<td dir="auto">ستون اول</td>', persian)
+        self.assertIn('<td dir="rtl">ستون اول</td>', persian)
         self.assertIn('<table dir="ltr"><tbody>', english)
+
+    def test_english_cell_inside_a_persian_table_stays_ltr(self) -> None:
+        """The cell's own text wins: an English model name is LTR *inside* an RTL table."""
+        (html,) = render_markdown(
+            "| گزینه | مدلها |\n| --- | --- |\n| فعلی | RotatE + ComplEx |\n"
+        )
+        self.assertIn('<table dir="rtl"><tbody>', html)
+        self.assertIn('<td dir="rtl">گزینه</td>', html)
+        self.assertIn('<td dir="ltr">RotatE + ComplEx</td>', html)
 
     def test_quote_direction_follows_its_lines(self) -> None:
         """The quote's border side follows its own content, not the note body."""
@@ -921,12 +935,26 @@ class MarkdownDirectionTest(unittest.TestCase):
         self.assertIn('<blockquote dir="rtl">', persian)
         self.assertIn('<blockquote dir="ltr">', english)
 
-    def test_paragraphs_and_headings_stay_auto(self) -> None:
-        """Mixed content per line is the browser's job — those blocks keep dir=auto."""
-        (html,) = render_markdown("# عنوان\n\nمتن انگلیسی mixed with فارسی\n")
-        self.assertIn('<h1 dir="auto">عنوان</h1>', html)
-        self.assertIn('<p dir="auto">', html)
-        self.assertNotIn('dir="rtl">عنوان', html)
+    def test_paragraphs_and_headings_follow_their_own_text(self) -> None:
+        """A Latin-first mixed line is RTL — the case ``dir="auto"`` got wrong."""
+        html, english_only = render_markdown(
+            "# عنوان\n\nمتن انگلیسی mixed with فارسی\n\nQuality over quantity: 3 نتایج\n",
+            "# English heading\n\nplain english paragraph\n",
+        )
+        self.assertIn('<h1 dir="rtl">عنوان</h1>', html)
+        self.assertIn('<p dir="rtl">متن انگلیسی mixed with فارسی</p>', html)
+        self.assertIn('<p dir="rtl">Quality over quantity: 3 نتایج</p>', html)
+        self.assertIn('<h1 dir="ltr">English heading</h1>', english_only)
+        self.assertIn('<p dir="ltr">plain english paragraph</p>', english_only)
+
+    def test_no_block_is_left_to_the_browser(self) -> None:
+        """``dir="auto"`` must not come back: it is what the rule replaced."""
+        (html,) = render_markdown(
+            "# عنوان\n\n- یک\n- two\n\n> نقل\n\n| a |\n| --- |\n| ب |\n\n```\ncode\n```\n"
+        )
+        self.assertNotIn('dir="auto"', html)
+        self.assertIn('<code dir="ltr"', html)
+
 
 
 class NetworkFreeTest(unittest.TestCase):

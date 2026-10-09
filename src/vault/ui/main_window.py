@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import QByteArray, Qt
 from PySide6.QtGui import QAction, QGuiApplication, QKeySequence
 from PySide6.QtWidgets import (
     QDockWidget,
@@ -23,6 +23,16 @@ from .log_panel import LogPanel
 from .search_panel import SearchPanel
 
 _LEVELS = ("normal", "secret", "secretfile")
+
+
+def _unhex(value: Any) -> bytes | None:
+    """Decode a hex string written by :meth:`MainWindow.layout_state` (None when unusable)."""
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        return bytes.fromhex(value)
+    except ValueError:
+        return None
 
 
 class MainWindow(QMainWindow):
@@ -66,8 +76,10 @@ class MainWindow(QMainWindow):
         self.log_panel = LogPanel(controller.dispatch_ui, self.right_tabs)
         self.search_panel = SearchPanel(controller.dispatch_ui, self.right_tabs)
         self.search_panel.result_activated.connect(self.open_file)
-        self.right_tabs.addTab(self.log_panel, "")
+        # Search comes first: it is the everyday action, while the access log is a diagnostic
+        # view. That also makes search the dock's default tab.
         self.right_tabs.addTab(self.search_panel, "")
+        self.right_tabs.addTab(self.log_panel, "")
         self.right_dock = QDockWidget(self)
         self.right_dock.setObjectName("right-dock")
         self.right_dock.setWidget(self.right_tabs)
@@ -183,9 +195,13 @@ class MainWindow(QMainWindow):
         add(view_menu, "right_dock", None,
             lambda checked: self.right_dock.setVisible(checked), checkable=True)
         self.actions["right_dock"].setChecked(True)
+        # Closing a dock with its own ✕ must leave the menu check telling the truth.
+        self.browser_dock.visibilityChanged.connect(lambda _visible: self._sync_dock_actions())
+        self.right_dock.visibilityChanged.connect(lambda _visible: self._sync_dock_actions())
         add(view_menu, "preview", None,
             lambda checked: self.editor.set_preview_enabled(checked), checkable=True)
-        self.actions["preview"].setChecked(True)
+        # The preview is off unless the user asked for it; the check follows the restored wish.
+        self.actions["preview"].setChecked(self.editor.preview_wanted())
         # The editor toolbar has its own Preview button; keep the menu check in step with it.
         self.editor.preview_changed.connect(self._on_preview_changed)
 
@@ -202,6 +218,15 @@ class MainWindow(QMainWindow):
         self._menus["help"] = help_menu
         add(help_menu, "about", None, self.controller.about)
         add(help_menu, "open_log", None, self.controller.open_log_file)
+
+    def _sync_dock_actions(self) -> None:
+        """Keep the View menu checks in step with the docks' own shown/hidden state.
+
+        Read from ``isHidden()``, never from ``isVisible()``: hiding the whole window (to the
+        tray, or on lock) makes every dock invisible without the user having closed anything.
+        """
+        self.actions["browser_dock"].setChecked(not self.browser_dock.isHidden())
+        self.actions["right_dock"].setChecked(not self.right_dock.isHidden())
 
     def _on_preview_changed(self, enabled: bool) -> None:
         """Mirror the editor's Preview button state onto the View menu check."""
@@ -385,7 +410,77 @@ class MainWindow(QMainWindow):
         if choice == QMessageBox.Yes:
             self.controller.delete_path(path)
 
+    # ------------------------------------------------------------------ layout
+    def layout_state(self) -> dict[str, Any]:
+        """Return the arrangement the user has set (geometry, docks, split, preview, tab).
+
+        Everything the user can rearrange is captured here, so the next start looks the way
+        they left it instead of snapping back to a built-in default.
+        """
+        state: dict[str, Any] = {
+            "preview": self.editor.preview_wanted(),
+            "right_tab": int(self.right_tabs.currentIndex()),
+            # The docks' *own* shown/hidden flag: `isHidden()` is False while the whole window
+            # is hidden to the tray, which is when this is usually written.
+            "browser_dock": not self.browser_dock.isHidden(),
+            "right_dock": not self.right_dock.isHidden(),
+        }
+        ratio = self.editor.split_ratio()
+        if ratio:
+            state["editor_split"] = ratio
+        try:
+            state["geometry"] = bytes(self.saveGeometry().data()).hex()
+            state["state"] = bytes(self.saveState().data()).hex()
+        except Exception:  # noqa: BLE001 - a missing geometry is not worth a failure
+            pass
+        return state
+
+    def save_layout(self) -> None:
+        """Persist the arrangement into ``ui.json`` (best effort, never raises)."""
+        try:
+            config = getattr(self.controller, "config", None)
+            if config is None:
+                return
+            config.window = self.layout_state()
+            config.save()
+        except Exception:  # noqa: BLE001 - persistence is best effort
+            pass
+
+    def restore_layout(self, saved: Any) -> bool:
+        """Apply a saved arrangement; return True when anything could be restored."""
+        if not isinstance(saved, dict):
+            return False
+        restored = False
+        geometry = _unhex(saved.get("geometry"))
+        if geometry:
+            restored = bool(self.restoreGeometry(QByteArray(geometry))) or restored
+        dock_state = _unhex(saved.get("state"))
+        if dock_state and self.restoreState(QByteArray(dock_state)):
+            restored = True
+        # ``restoreState`` restores positions and sizes but not whether a dock is closed, so the
+        # two flags are applied here (and the View menu is re-synced from the real state).
+        for key, dock in (("browser_dock", self.browser_dock), ("right_dock", self.right_dock)):
+            visible = saved.get(key)
+            if isinstance(visible, bool) and visible != (not dock.isHidden()):
+                dock.setVisible(visible)
+                restored = True
+        self._sync_dock_actions()
+        tab = saved.get("right_tab")
+        if isinstance(tab, int) and 0 <= tab < self.right_tabs.count():
+            self.right_tabs.setCurrentIndex(tab)
+            restored = True
+        # The preview choice and the split belong to the arrangement too.
+        self.editor.set_preview_enabled(bool(saved.get("preview", False)))
+        if self.editor.apply_split_ratio(saved.get("editor_split")):
+            restored = True
+        return restored
+
     # ------------------------------------------------------------------ close
+    def hideEvent(self, event: Any) -> None:  # noqa: N802 - Qt API
+        """Remember the arrangement whenever the window goes away (tray, lock, minimise)."""
+        self.save_layout()
+        super().hideEvent(event)
+
     def set_quitting(self, quitting: bool) -> None:
         """Mark that the app is quitting (so close is not a hide-to-tray)."""
         self._quitting = bool(quitting)

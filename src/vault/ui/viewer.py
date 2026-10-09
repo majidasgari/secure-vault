@@ -21,13 +21,14 @@ from __future__ import annotations
 from typing import Any
 
 from PySide6.QtCore import Qt, QTimer
-from PySide6.QtGui import QFont
+from PySide6.QtGui import QFont, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QApplication,
     QDialog,
     QDialogButtonBox,
     QHBoxLayout,
     QLabel,
+    QMessageBox,
     QPlainTextEdit,
     QProgressBar,
     QPushButton,
@@ -58,18 +59,28 @@ web_views_created = 0
 
 
 class SecretViewer(QDialog):
-    """Read-only native viewer for a single secret file."""
+    """Native plain-text viewer and editor for a single secret file."""
 
     def __init__(
-        self, parent: Any, path: str, text: str, *, tray: Any = None
+        self,
+        parent: Any,
+        path: str,
+        text: str,
+        *,
+        tray: Any = None,
+        controller: Any = None,
+        on_save: Any = None,
     ) -> None:
         """Build the viewer for ``path`` showing ``text``."""
         super().__init__(parent)
         self.path = path
         self.text = text
         self._tray = tray
+        self._controller = controller or getattr(parent, "controller", None)
+        self._on_save = on_save
+        self._dirty = False
         self.setModal(False)
-        self.resize(680, 460)
+        self.resize(680, 500)
 
         layout = QVBoxLayout(self)
         self.path_label = QLabel(path, self)
@@ -143,11 +154,22 @@ class SecretViewer(QDialog):
         layout.addWidget(self.otp_box)
 
         self.edit = QPlainTextEdit(self)
-        self.edit.setReadOnly(True)
+        self.edit.setReadOnly(False)
         self.edit.setPlainText(text)
+        edit_font = QFont(self.edit.font())
+        edit_font.setFamilies(list(_MONOSPACE))
+        self.edit.setFont(edit_font)
+        self.edit.textChanged.connect(self._on_text_changed)
         layout.addWidget(self.edit, 1)
 
+        self._save_shortcut = QShortcut(QKeySequence.Save, self)
+        self._save_shortcut.activated.connect(self.save)
+
         self.buttons = QDialogButtonBox(self)
+        self.save_button = QPushButton(i18n.tr("viewer.save"), self)
+        self.save_button.clicked.connect(self.save)
+        self.save_button.setEnabled(False)
+        self.buttons.addButton(self.save_button, QDialogButtonBox.ActionRole)
         self.copy_button = QPushButton(i18n.tr("viewer.copy"), self)
         self.copy_button.clicked.connect(self.copy_all)
         self.buttons.addButton(self.copy_button, QDialogButtonBox.ActionRole)
@@ -244,6 +266,86 @@ class SecretViewer(QDialog):
             tray=self._tray,
         )
 
+    # ------------------------------------------------------------------- editing
+    def _on_text_changed(self) -> None:
+        """Track dirty state and live-refresh credential fields as text is edited."""
+        dirty = self.edit.toPlainText() != self.text
+        if dirty != self._dirty:
+            self._dirty = dirty
+            self._update_title()
+        self._refresh_parsed()
+
+    def _update_title(self) -> None:
+        """Update window title to reflect file path and dirty state."""
+        base = i18n.tr("viewer.title")
+        title = f"* {base} — {self.path}" if self._dirty else f"{base} — {self.path}"
+        self.setWindowTitle(title)
+        if hasattr(self, "save_button"):
+            self.save_button.setEnabled(self._dirty)
+
+    def _refresh_parsed(self) -> None:
+        """Re-parse the body (either saved or while typing) to update copy/OTP actions."""
+        current_text = self.edit.toPlainText() if hasattr(self, "edit") else (self.text or "")
+        parsed = credentials.parse_body(current_text)
+        self.username = str(parsed.get("username") or "")
+        self.password = str(parsed.get("password") or "")
+        if hasattr(self, "copy_username_button"):
+            self.copy_username_button.setVisible(bool(self.username))
+        if hasattr(self, "copy_password_button"):
+            self.copy_password_button.setVisible(bool(self.password))
+        if hasattr(self, "field_actions"):
+            self.field_actions.setVisible(bool(self.username or self.password))
+
+        self._otp_value = totp.otp_value_from_body(current_text)
+        fresh_otp = (
+            totp.value_to_code(self._otp_value) if self._otp_value else None
+        )
+        self.otp = fresh_otp
+        if hasattr(self, "otp_box"):
+            self.otp_box.setVisible(self.otp is not None)
+            self._render_otp()
+        if hasattr(self, "_timer"):
+            if self.otp is not None and self.otp.live:
+                if not self._timer.isActive():
+                    self._timer.start()
+            else:
+                self._timer.stop()
+
+    def save(self) -> bool:
+        """Save edited content back to the vault."""
+        global last_text, last_otp, last_actions
+        new_text = self.edit.toPlainText()
+        if self._controller is not None:
+            try:
+                self._controller.save_file(self.path, new_text)
+            except Exception as exc:  # noqa: BLE001
+                QMessageBox.warning(self, i18n.tr("editor.save_failed"), str(exc))
+                return False
+        elif self._on_save is not None:
+            try:
+                self._on_save(self.path, new_text)
+            except Exception as exc:  # noqa: BLE001
+                QMessageBox.warning(self, i18n.tr("editor.save_failed"), str(exc))
+                return False
+
+        self.text = new_text
+        last_text = new_text
+        self._dirty = False
+        self._update_title()
+        self._refresh_parsed()
+        last_otp = self.otp.to_dict() if self.otp is not None else None
+        last_actions = {
+            "username": bool(self.username),
+            "password": bool(self.password),
+            "otp": self.otp is not None,
+        }
+        notifications.notify(
+            i18n.tr("notification.saved"),
+            i18n.tr("viewer.saved", path=self.path),
+            tray=self._tray,
+        )
+        return True
+
     # ------------------------------------------------------------------- events
     def showEvent(self, event: Any) -> None:
         """Restart the countdown whenever the viewer comes back on screen."""
@@ -257,9 +359,28 @@ class SecretViewer(QDialog):
         super().hideEvent(event)
 
     def closeEvent(self, event: Any) -> None:
-        """Stop the countdown when the viewer closes."""
+        """Ask before closing with unsaved edits; stop countdown."""
+        if self._dirty:
+            choice = QMessageBox.question(
+                self,
+                i18n.tr("editor.unsaved_title"),
+                i18n.tr("editor.unsaved_text"),
+                QMessageBox.Save | QMessageBox.Discard | QMessageBox.Cancel,
+                QMessageBox.Save,
+            )
+            if choice == QMessageBox.Save:
+                if not self.save():
+                    event.ignore()
+                    return
+            elif choice == QMessageBox.Cancel:
+                event.ignore()
+                return
         self._timer.stop()
         super().closeEvent(event)
+
+    def reject(self) -> None:
+        """Esc or dialog cancel triggers close with the unsaved guard."""
+        self.close()
 
     # ------------------------------------------------------------------ buttons
     def _on_clicked(self, button: Any) -> None:
@@ -269,7 +390,9 @@ class SecretViewer(QDialog):
 
     def retranslate(self) -> None:
         """Re-apply translated strings."""
-        self.setWindowTitle(i18n.tr("viewer.title"))
+        self._update_title()
+        if hasattr(self, "save_button"):
+            self.save_button.setText(i18n.tr("viewer.save"))
         self.copy_button.setText(i18n.tr("viewer.copy"))
         self.copy_username_button.setText(i18n.tr("viewer.copy_username"))
         self.copy_password_button.setText(i18n.tr("viewer.copy_password"))
@@ -279,7 +402,8 @@ class SecretViewer(QDialog):
 
     def copy_all(self) -> None:
         """Copy the whole content to the clipboard and notify."""
-        QApplication.clipboard().setText(self.text)
+        content = self.edit.toPlainText() if hasattr(self, "edit") else self.text
+        QApplication.clipboard().setText(content)
         notifications.notify(
             i18n.tr("notification.copied"),
             i18n.tr("viewer.copied_body", path=self.path),
@@ -287,12 +411,22 @@ class SecretViewer(QDialog):
         )
 
 
-def open_viewer(parent: Any, path: str, text: str, *, tray: Any = None) -> SecretViewer:
+def open_viewer(
+    parent: Any,
+    path: str,
+    text: str,
+    *,
+    tray: Any = None,
+    controller: Any = None,
+    on_save: Any = None,
+) -> SecretViewer:
     """Open (non-modally) the native viewer and remember the last content/OTP/actions."""
     global last_text, last_path, last_otp, last_actions
     last_text = text
     last_path = path
-    dialog = SecretViewer(parent, path, text, tray=tray)
+    dialog = SecretViewer(
+        parent, path, text, tray=tray, controller=controller, on_save=on_save
+    )
     last_otp = dialog.otp.to_dict() if dialog.otp is not None else None
     # Booleans only — never the values, so a self-test can assert the buttons without a secret.
     last_actions = {

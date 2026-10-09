@@ -42,6 +42,11 @@ class UiImportTest(unittest.TestCase):
         self.tmp = Path(tempfile.mkdtemp(prefix="sv-ui-import-"))
         self.home = self.tmp / "vault"
         self.mirror = self.tmp / "mirror"
+        # A test that builds the real application must never write the *user's* ui.json: the
+        # settings dialog, the language switch and the saved window arrangement all land in the
+        # config dir (and `last_vault_home` decides which vault the next launch opens).
+        self._config_home = os.environ.get("XDG_CONFIG_HOME")
+        os.environ["XDG_CONFIG_HOME"] = str(self.tmp / "config")
         shutil.copytree(FIXTURE, self.mirror)
         VaultSession.create(self.home, PASSWORD).close()
         self.qapp = QApplication.instance() or QApplication([])
@@ -66,6 +71,10 @@ class UiImportTest(unittest.TestCase):
             self.session.close()
         except Exception:  # noqa: BLE001 - best effort
             pass
+        if self._config_home is None:
+            os.environ.pop("XDG_CONFIG_HOME", None)
+        else:
+            os.environ["XDG_CONFIG_HOME"] = self._config_home
         shutil.rmtree(self.tmp, ignore_errors=True)
 
     def test_settings_round_trip_the_importer_path(self) -> None:

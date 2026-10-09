@@ -9,7 +9,7 @@ reviewer would check by hand:
   * a 'secret' file never enables the markdown preview (no web engine),
   * a 'secretfile' file is shown ONLY in the native plain-text viewer, never in the editor,
   * opening a confidential file without confirmation does nothing,
-  * the editor content for a normal file is fine, and the preview is created then,
+  * the editor content for a normal file is fine; the preview is allowed but off by default,
   * i18n: language switch flips every label and the layout direction, catalogues match,
   * no user-visible literal strings in the UI modules,
   * locking from the controller returns to the unlock screen and locks the session.
@@ -34,6 +34,9 @@ from vault.ui.app import VaultApplication
 PW = "p3-verify-passphrase"
 tmp = Path(tempfile.mkdtemp(prefix="sv-p3-"))
 home = tmp / "home"
+# This script builds the real application, whose language switch and saved window arrangement are
+# persisted in ui.json: keep them in the scratch dir instead of the user's config.
+os.environ["XDG_CONFIG_HOME"] = str(tmp / "config")
 session = VaultSession.create(home, PW)
 session.write_file("/notes/normal.md", b"# normal title\nnormal-body-marker")
 session.write_file("/notes/secret.md", b"secret-body-marker")
@@ -59,9 +62,10 @@ def check(name, fn):
 
 def t01_normal_file_preview_ok():
     assert app.open_path("/notes/normal.md") is True
-    assert window.editor.preview_enabled is True, "normal file must have the preview enabled"
+    assert window.editor.preview_allowed is True, "a normal file must allow the preview"
+    assert window.editor.preview_enabled is False, "the preview pane must be off by default"
     assert "normal-body-marker" in window.editor.source.toPlainText(), "normal content not loaded in the editor"
-check("01 normal file -> editor + preview", t01_normal_file_preview_ok)
+check("01 normal file -> editor, preview allowed but hidden by default", t01_normal_file_preview_ok)
 
 def t02_secret_needs_confirmation():
     seen = []
