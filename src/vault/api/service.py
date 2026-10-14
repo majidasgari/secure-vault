@@ -158,6 +158,11 @@ def _api_path(logical: str) -> str:
     return "/" if logical == "/" else "/" + logical
 
 
+def _text_or_empty(value: Any) -> str:
+    """Return ``value`` when it is a string, else ``""`` (client data is never trusted blindly)."""
+    return value if isinstance(value, str) else ""
+
+
 def _iso(ts: int) -> str:
     """Return an ISO-8601 UTC timestamp for a millisecond epoch value."""
     return datetime.fromtimestamp(int(ts) / 1000.0, tz=timezone.utc).isoformat()
@@ -670,6 +675,28 @@ class Service:
             path, host=host if isinstance(host, str) else None, session_id=session_id
         )
 
+    def _h_browser_save_check(self, params: dict, role: str, session_id: str) -> dict:
+        """Say what saving this credential would mean (new / changed / same) — write nothing."""
+        return self._require_browser().save_check(
+            _text_or_empty(params.get("host")),
+            username=_text_or_empty(params.get("username")),
+            password=_text_or_empty(params.get("password")),
+            url=_text_or_empty(params.get("url")),
+            title=_text_or_empty(params.get("title")),
+        )
+
+    def _h_browser_save(self, params: dict, role: str, session_id: str) -> dict:
+        """Store one credential the add-on watched the user type (the audited write)."""
+        return self._require_browser().save(
+            _text_or_empty(params.get("host")),
+            username=_text_or_empty(params.get("username")),
+            password=_text_or_empty(params.get("password")),
+            url=_text_or_empty(params.get("url")),
+            title=_text_or_empty(params.get("title")),
+            path=_text_or_empty(params.get("path")),
+            session_id=session_id,
+        )
+
     # ------------------------------------------------------------ handlers: search
     @staticmethod
     def _prefix(params: dict) -> str | None:
@@ -836,6 +863,9 @@ class Service:
             current = settings.setdefault("browser", {})
             if "enabled" in browser:
                 current["enabled"] = bool(browser["enabled"])
+            # Whether the add-on may offer to *save* a credential it watched the user type.
+            if "save_enabled" in browser:
+                current["save_enabled"] = bool(browser["save_enabled"])
         sync = params.get("sync")
         if isinstance(sync, dict):
             current = settings.setdefault("sync", {})
@@ -1096,10 +1126,14 @@ class Service:
         "vault.all_tags": (_h_all_tags, _BOTH),
         "vault.files_by_tag": (_h_files_by_tag, _BOTH),
         # Browser autofill: reachable only with the browser token (role ``browser``), never by
-        # the web UI or an agent — see ``api/browser.py`` for what each one may return.
+        # the web UI or an agent — see ``api/browser.py`` for what each one may return. The two
+        # ``browser_save*`` entries are the bridge's whole write surface: a verdict without a
+        # write, and a write confined to one credential under the credential root.
         "vault.browser_status": (_h_browser_status, ROLE_BROWSER),
         "vault.browser_match": (_h_browser_match, ROLE_BROWSER),
         "vault.browser_reveal": (_h_browser_reveal, ROLE_BROWSER),
+        "vault.browser_save_check": (_h_browser_save_check, ROLE_BROWSER),
+        "vault.browser_save": (_h_browser_save, ROLE_BROWSER),
     }
 
 

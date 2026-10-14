@@ -283,16 +283,26 @@ already-running instance instead.
 The vault can hand a login form the user name and password of an entry under `/رمزها`, the way
 a password-manager add-on does — but only to a browser holding a **narrow, separate token**:
 `/api/autofill/*` is the entire surface that token opens (`vault.browser_status`,
-`vault.browser_match`, `vault.browser_reveal`), it can never call `read_file` or `write_file`,
-every path it may name has to live under the credential root, an entry is only handed over to
-**its own host**, and every reveal writes one access-log row with `source=browser` (plus an
-activity event, so the tray shows it). Matching answers metadata only — never a password.
+`vault.browser_match`, `vault.browser_reveal`, `vault.browser_save_check`,
+`vault.browser_save`), it can never call `read_file` or `write_file`, every path it may name has to
+live under the credential root, an entry is only handed over to **its own host**, and every reveal
+writes one access-log row with `source=browser` (plus an activity event, so the tray shows it).
+Matching answers metadata only — never a password.
+
+The same bridge is what lets the add-on offer to **save** a password the user typed by hand after a
+successful sign-in: `save-check` compares it (the password goes in, only the verdict comes back —
+`new` / `changed` / `same`, so a sign-in with the stored password writes nothing), and `save` either
+rewrites the one `گذرواژه:` line of that host's entry or creates a new `secretfile` in the browser
+category. The vault picks the destination, never the add-on; the write is refused off loopback, past
+a per-minute cap, for a value a credential body cannot hold, and when
+**Settings → Web UI → Offer to save passwords from the browser** is switched off.
 
 The client is the Firefox add-on in
 **[secure-vault-firefox](https://github.com/majidasgari/secure-vault-firefox)**: it puts an
 icon inside the fields, shows the entries for the page's host when you click it, fills them
 only on your click (into a closed shadow DOM, so the page's own scripts cannot click for you),
-reads one-time codes in its popup, and adds nothing automatic. The switch is in the desktop
+reads one-time codes in its popup, offers the save bar after a successful sign-in, and adds
+nothing automatic. The switch is in the desktop
 app: **Settings → Web UI → browser autofill**. `docs/BROWSER-AUTOFILL.md` is the contract of
 the bridge.
 

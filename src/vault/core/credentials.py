@@ -69,6 +69,17 @@ _SECOND_LEVELS = frozenset(
     }
 )
 
+#: The category a login saved *from the browser* lands in. It already exists in the treasure
+#: (the old browser export lives there) and its shape is ``<سایت>/<سایت>.md`` — so an entry the
+#: add-on writes is indistinguishable from the ones the importer produced.
+BROWSER_CATEGORY = "مرورگر — ورودهای ذخیره‌شده"
+
+#: Characters a file name may never contain (they would build a path, not a name).
+_UNSAFE_NAME = re.compile(r"[/\\:*?\"<>|\x00-\x1f]")
+
+#: Control characters that would break the line-based credential body.
+_UNSAFE_VALUE = re.compile(r"[\x00-\x08\x0a-\x1f\x7f]")
+
 
 def _clean(value: str) -> str:
     """Return ``value`` stripped, or ``""`` when it is one of the empty markers."""
@@ -247,6 +258,94 @@ def parse_body(text: str, *, fallback_title: str = "", fallback_site: str = "") 
     }
 
 
+# ---------------------------------------------------------------------------- writing
+def safe_name(value: str, *, fallback: str = "", limit: int = 80) -> str:
+    """Return ``value`` as a file/folder name (safe, non-empty when a fallback is given).
+
+    The add-on never supplies a path — only the host, the user name and the page title — so the
+    vault builds every name itself. This is the one place that turns a page-supplied string into
+    part of a path, hence the strict character set and the length cap.
+    """
+    text = _UNSAFE_NAME.sub(" ", _clean(value))
+    text = text.replace("..", " ")
+    text = re.sub(r"\s+", " ", text).strip(" .")
+    if len(text) > limit:
+        text = text[:limit].rstrip(" .")
+    return text or _clean(fallback)
+
+
+def storable(value: str) -> bool:
+    """Return True when ``value`` can live inside a line-based credential body."""
+    return not _UNSAFE_VALUE.search(value or "")
+
+
+def render_body(
+    *,
+    title: str,
+    site: str = "",
+    category: str = "",
+    username: str = "",
+    password: str = "",
+    url: str = "",
+    otp: str = "",
+) -> str:
+    """Render one credential body exactly in the shape ``tools/keepass-migration`` writes."""
+    head = _clean(title) or _clean(site) or "ورود"
+    lines = [f"# {head}", ""]
+    meta = []
+    if site:
+        meta.append(f"{SITE_LABELS[0]}: {site}")
+    if category:
+        meta.append(f"{CATEGORY_LABELS[0]}: {category}")
+    if meta:
+        lines += [" | ".join(meta), ""]
+    lines.append(f"{USERNAME_LABELS[0]}: {_clean(username) or '—'}")
+    lines.append(f"{PASSWORD_LABELS[0]}: {password}" if password else f"{PASSWORD_LABELS[0]}: —")
+    if url:
+        lines.append(f"{URL_LABELS[0]}: {url}")
+    if otp:
+        lines.append(f"{OTP_LABELS[0]}: {otp}")
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def set_field(text: str, labels: tuple[str, ...], value: str) -> str:
+    """Return ``text`` with the ``label: value`` line of ``labels`` replaced by ``value``.
+
+    Everything else stays byte-for-byte as it was: the heading, the meta line, the other fields
+    and the ``##`` notes section. Updating a password must never destroy what the entry's owner
+    wrote into that file — the password line is the *only* thing a browser-saved update touches.
+    A missing line is inserted after the meta line (or after the heading when there is none).
+    """
+    wanted = {label.lower() for label in labels}
+    out: list[str] = []
+    in_notes = False
+    replaced = False
+    anchor: int | None = None
+    for raw in (text or "").splitlines():
+        line = raw.strip()
+        if line.startswith(SECTION_MARKERS):
+            in_notes = True
+        if not in_notes and line and not line.startswith("#") and ":" in line:
+            key = line.split(":", 1)[0].strip()
+            if not replaced and key.lower() in wanted:
+                out.append(f"{key}: {value}")
+                replaced = True
+                continue
+            if anchor is None:
+                anchor = len(out)          # right after the first field line (the meta line)
+        out.append(raw)
+    if not replaced:
+        if anchor is None:
+            anchor = 0
+            for index, raw in enumerate(out):
+                if raw.strip().startswith("#"):
+                    anchor = index + 1
+            while anchor < len(out) and not out[anchor].strip():
+                anchor += 1
+        out.insert(anchor, f"{labels[0]}: {value}")
+    return "\n".join(out).rstrip() + "\n"
+
+
 @dataclass(frozen=True)
 class CredentialEntry:
     """One credential file, metadata only — never a password."""
@@ -417,6 +516,7 @@ def _now_ms() -> int:
 
 
 __all__ = [
+    "BROWSER_CATEGORY",
     "CREDENTIAL_ROOT",
     "CredentialEntry",
     "CredentialIndex",
@@ -424,4 +524,8 @@ __all__ = [
     "normalize_host",
     "parse_body",
     "registrable_domain",
+    "render_body",
+    "safe_name",
+    "set_field",
+    "storable",
 ]

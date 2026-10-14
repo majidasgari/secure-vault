@@ -319,6 +319,8 @@
   "settings.auto_lock": "Auto-lock (minutes, 0 = off)",
   "settings.browser_autofill": "Fill credentials in the browser",
   "settings.browser_autofill_hint": "A Firefox add-on fills user names and passwords from the credential folder; every reveal is recorded in the access log.",
+  "settings.browser_save": "Offer to save passwords from the browser",
+  "settings.browser_save_hint": "After a successful login the add-on offers to store the new or changed password in the credential folder; every save is recorded in the access log.",
   "settings.default_sensitivity": "Default sensitivity",
   "settings.fingerprint_device": "Device",
   "settings.fingerprint_device_line": "{device} · fingers: {fingers} · used {uses} times",

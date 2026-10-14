@@ -319,6 +319,8 @@
   "settings.auto_lock": "قفل خودکار (دقیقه، ۰ = خاموش)",
   "settings.browser_autofill": "تکمیل خودکار رمزها در مرورگر",
   "settings.browser_autofill_hint": "افزونهٔ فایرفاکس نام کاربری و گذرواژه را از پوشهٔ رمزها پر می‌کند؛ هر بار نمایش یک سطر در «لاگ دسترسی» ثبت می‌شود.",
+  "settings.browser_save": "پیشنهاد ذخیرهٔ گذرواژه از مرورگر",
+  "settings.browser_save_hint": "پس از یک ورود موفق، افزونه پیشنهاد می‌کند گذرواژهٔ تازه یا تغییرکرده در پوشهٔ رمزها ذخیره شود. هر ذخیره یک سطر در «لاگ دسترسی» ثبت می‌کند.",
   "settings.default_sensitivity": "سطح حساسیت پیش‌فرض",
   "settings.fingerprint_device": "دستگاه",
   "settings.fingerprint_device_line": "{device} · اثر انگشت‌ها: {fingers} · {uses} بار استفاده",

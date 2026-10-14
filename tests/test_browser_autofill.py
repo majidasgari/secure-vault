@@ -17,6 +17,7 @@ from __future__ import annotations
 import http.client
 import json
 import re
+import socket
 import unittest
 from pathlib import Path
 
@@ -25,6 +26,8 @@ from vault.api.browser import BrowserBridge
 from vault.api.service import Service
 from vault.core import credentials as creds
 from vault.core import semantics
+from vault.core.credentials import BROWSER_CATEGORY, CREDENTIAL_ROOT
+from vault.core.security import BROWSER_CREATABLE_LEVELS, SOURCE_BROWSER, Policy
 from vault.core.session import VaultSession
 from vault.errors import BadRequest, PermissionDenied, VaultLocked
 from vault.web.server import WebServer
@@ -395,6 +398,205 @@ class BridgeTest(unittest.TestCase):
         )
         self.assertEqual([e for e in self.activity if e.get("outcome") == "allow"], [])
 
+    # -------------------------------------------------------------------- saving
+    def test_save_check_reports_same_changed_and_new(self) -> None:
+        """The verdict is the whole point: an unchanged password must write nothing."""
+        same = self.bridge.save_check(
+            "github.com", username="max@example.com", password="github-pass-1"
+        )
+        self.assertEqual(same["state"], "same")
+        self.assertEqual(same["path"], self.path)
+        changed = self.bridge.save_check(
+            "github.com", username="max@example.com", password="something-else"
+        )
+        self.assertEqual(changed["state"], "changed")
+        self.assertEqual(changed["path"], self.path)
+        fresh = self.bridge.save_check(
+            "newsite.example", username="someone@newsite.example", password="pw"
+        )
+        self.assertEqual(fresh["state"], "new")
+        self.assertEqual(
+            fresh["path"],
+            f"/{creds.CREDENTIAL_ROOT}/{creds.BROWSER_CATEGORY}/newsite.example/newsite.example.md",
+        )
+
+    def test_a_same_verdict_writes_nothing_at_all(self) -> None:
+        """A successful sign-in with the stored password leaves no trace in the vault."""
+        before = self.session.read_file(self.path, source="ui")
+        rows_before = len(self.logs())
+        verdict = self.bridge.save(
+            "github.com", username="max@example.com", password="github-pass-1"
+        )
+        self.assertEqual(verdict["state"], "same")
+        self.assertFalse(verdict["saved"])
+        fresh = self.logs()[: len(self.logs()) - rows_before]
+        self.assertEqual([row["tool"] for row in fresh], [], "a `same` verdict must not write")
+        self.assertEqual(self.session.read_file(self.path, source="ui"), before)
+
+    def test_a_changed_password_rewrites_only_that_one_line(self) -> None:
+        """The update keeps the heading, the meta line, the OTP and the notes section."""
+        verdict = self.bridge.save(
+            "github.com", username="max@example.com", password="github-pass-2"
+        )
+        self.assertEqual(verdict["state"], "updated")
+        self.assertTrue(verdict["saved"])
+        self.assertEqual(verdict["path"], self.path)
+        body = self.session.read_file(self.path, source="ui").decode("utf-8")
+        self.assertIn("گذرواژه: github-pass-2", body)
+        self.assertNotIn("github-pass-1", body)
+        for kept in ("# GitHub", "سایت: github.com | دسته: برنامه‌نویسی", "نام کاربری: max@example.com"):
+            with self.subTest(kept=kept):
+                self.assertIn(kept, body)
+        self.assertIn("کد یکبارمصرف (otp): JBSWY3DPEHPK3PXP", body)
+        self.assertIn("## یادداشت", body)
+        self.assertIn("این یادداشت است، نه فیلد.", body)
+        self.assertIn("password: do-not-parse", body)          # the notes' own text is data
+        row = self.session.index.require_file(self.path.lstrip("/"))
+        self.assertEqual(row["sensitivity"], "secretfile")
+
+    def test_a_new_credential_is_created_like_the_treasure_writes_them(self) -> None:
+        """A brand-new login lands as a `secretfile` in the browser category, with notes."""
+        verdict = self.bridge.save(
+            "mail.example",
+            username="someone@mail.example",
+            password="fresh-pass",
+            url="https://mail.example/login",
+            title="Mail Example",
+        )
+        self.assertEqual(verdict["state"], "created")
+        self.assertTrue(verdict["saved"])
+        expected = f"/{creds.CREDENTIAL_ROOT}/{creds.BROWSER_CATEGORY}/mail.example/mail.example.md"
+        self.assertEqual(verdict["path"], expected)
+        row = self.session.index.require_file(expected.lstrip("/"))
+        self.assertEqual(row["sensitivity"], "secretfile")
+        body = self.session.read_file(expected, source="ui").decode("utf-8")
+        for line in (
+            "# Mail Example",
+            f"سایت: mail.example | دسته: {creds.BROWSER_CATEGORY}",
+            "نام کاربری: someone@mail.example",
+            "گذرواژه: fresh-pass",
+            "آدرس: https://mail.example/login",
+        ):
+            with self.subTest(line=line):
+                self.assertIn(line, body)
+        self.assertTrue(self.session.file_note(expected))
+        self.assertTrue(
+            self.session.store.get_folder_note(
+                f"{creds.CREDENTIAL_ROOT}/{creds.BROWSER_CATEGORY}/mail.example"
+            )
+        )
+        # …and the vault's own matching now offers it for that host.
+        entries = self.bridge.entries(force=True)
+        self.assertTrue(any(entry.path == expected for entry in entries))
+
+    def test_a_second_account_gets_its_own_file(self) -> None:
+        """Two user names for one host are two entries, named the way the category already is."""
+        first = self.bridge.save("mail.example", username="a@mail.example", password="pw-a")
+        second = self.bridge.save("mail.example", username="b@mail.example", password="pw-b")
+        self.assertNotEqual(first["path"], second["path"])
+        self.assertEqual(
+            second["path"],
+            f"/{creds.CREDENTIAL_ROOT}/{creds.BROWSER_CATEGORY}/mail.example/mail.example (2).md",
+        )
+
+    def test_save_refuses_a_path_that_is_not_this_host_s(self) -> None:
+        """The add-on may name an entry, but only one that really belongs to the page's host."""
+        with self.assertRaises(PermissionDenied) as ctx:
+            self.bridge.save(
+                "evil.example",
+                username="max@example.com",
+                password="pw",
+                path=self.path,
+            )
+        self.assertEqual(ctx.exception.message, "path_not_for_host")
+        with self.assertRaises(PermissionDenied):
+            self.bridge.save(
+                "github.com", username="max@example.com", password="pw", path="/notes/plain.md"
+            )
+
+    def test_save_refuses_a_value_a_credential_body_cannot_hold(self) -> None:
+        """A newline in a password would silently split the label line, so it is refused."""
+        with self.assertRaises(BadRequest) as ctx:
+            self.bridge.save("mail.example", username="a", password="one\ntwo")
+        self.assertEqual(ctx.exception.message, "unstorable_value")
+        with self.assertRaises(BadRequest):
+            self.bridge.save("mail.example", username="a" * 300, password="pw")
+        with self.assertRaises(BadRequest):
+            self.bridge.save("mail.example", username="a", password="")
+        with self.assertRaises(BadRequest):
+            self.bridge.save("", username="a", password="pw")
+
+    def test_saving_can_be_switched_off_without_touching_filling(self) -> None:
+        """``save_enabled`` off refuses the two save calls and leaves match/reveal alone."""
+        settings = self.session.meta.settings
+        settings.setdefault("browser", {})["save_enabled"] = False
+        self.session.meta.save()
+        with self.assertRaises(PermissionDenied) as ctx:
+            self.bridge.save_check("github.com", username="max@example.com", password="x")
+        self.assertEqual(ctx.exception.message, "browser_save_disabled")
+        with self.assertRaises(PermissionDenied):
+            self.bridge.save("github.com", username="max@example.com", password="x")
+        self.assertEqual(self.bridge.reveal(self.path, host="github.com")["password"], "github-pass-1")
+        self.assertFalse(self.bridge.status()["save_enabled"])
+
+    def test_a_locked_vault_refuses_a_save(self) -> None:
+        """Nothing may be written while locked (the add-on offers to unlock instead)."""
+        self.session.lock()
+        with self.assertRaises(VaultLocked):
+            self.bridge.save("mail.example", username="a", password="pw")
+        with self.assertRaises(VaultLocked):
+            self.bridge.save_check("mail.example", username="a", password="pw")
+
+    def test_the_save_limit_stops_a_runaway_caller(self) -> None:
+        """A page cannot write into the credential folder over and over in one minute."""
+        bridge = BrowserBridge(self.service, runtime_dir=self.session._runtime, save_limit=2)
+        self.service.attach_browser(bridge)
+        bridge.save("one.example", username="a", password="pw")
+        bridge.save("two.example", username="a", password="pw")
+        with self.assertRaises(PermissionDenied) as ctx:
+            bridge.save("three.example", username="a", password="pw")
+        self.assertEqual(ctx.exception.message, "too_many_saves")
+        self.assertEqual(bridge.saves_last_minute(), 2)
+
+    def test_a_save_is_audited_once_and_writes_no_read_rows(self) -> None:
+        """The dispatch row is the whole audit trail; the internal compare reads stay silent."""
+        self.activity.clear()
+        result = self.service.dispatch(
+            "vault.browser_save",
+            {"host": "github.com", "username": "max@example.com", "password": "github-pass-9"},
+            role="browser",
+            session_id="brw-9",
+            source="browser",
+        )
+        self.assertEqual(result["state"], "updated")
+        rows = [row for row in self.logs() if row["tool"] == "vault.browser_save"]
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["source"], "browser")
+        self.assertEqual(rows[0]["role"], "browser")
+        self.assertEqual(rows[0]["outcome"], "allow")
+        self.assertNotIn("read_file", [row["tool"] for row in self.logs()][:3])
+        writes = [event for event in self.activity if event.get("kind") == "write"]
+        self.assertTrue(writes)
+        self.assertTrue(all(event["source"] == SOURCE_BROWSER for event in writes))
+
+
+class BrowserPolicyTest(unittest.TestCase):
+    """The one permission the read-only bridge gained, and everything it must not gain."""
+
+    def test_the_bridge_may_create_a_credential_and_nothing_else(self) -> None:
+        """`normal → secretfile` only: no `secret`, no raising an existing file, no lowering."""
+        self.assertTrue(Policy.can_raise("normal", "secretfile", SOURCE_BROWSER))
+        for pair in (("normal", "secret"), ("normal", "normal"), ("secretfile", "secretfile")):
+            with self.subTest(pair=pair):
+                self.assertFalse(Policy.can_raise(pair[0], pair[1], SOURCE_BROWSER))
+        with self.assertRaises(BadRequest):
+            Policy.can_lower("secretfile", "normal", SOURCE_BROWSER)
+
+    def test_the_bridge_levels_are_the_credential_level(self) -> None:
+        """The level a browser-saved credential is born at is the treasure's own."""
+        self.assertEqual(BROWSER_CREATABLE_LEVELS, ("secretfile",))
+        self.assertEqual(Policy.can_read_content("secretfile", SOURCE_BROWSER), True)
+
 
 class AutofillHttpTest(unittest.TestCase):
     """The loopback HTTP surface and the two-token separation."""
@@ -578,6 +780,191 @@ class AutofillHttpTest(unittest.TestCase):
         )
         self.assertEqual(status, 423)
         self.assertEqual(payload["error"]["code"], "VAULT_LOCKED")
+
+    def test_save_check_and_save_over_http(self) -> None:
+        """The whole save round trip works over the bridge and lands in the credential folder."""
+        status, payload = self.request(
+            "POST",
+            "/api/autofill/save-check",
+            token=self.browser_token,
+            body={
+                "host": "github.com",
+                "username": "max@example.com",
+                "password": "github-pass-1",
+            },
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["result"]["state"], "same")
+
+        status, payload = self.request(
+            "POST",
+            "/api/autofill/save-check",
+            token=self.browser_token,
+            body={
+                "host": "github.com",
+                "username": "max@example.com",
+                "password": "a-new-one",
+            },
+        )
+        self.assertEqual(payload["result"]["state"], "changed")
+        self.assertEqual(payload["result"]["path"], self.path)
+        self.assertNotIn('"password"', json.dumps(payload["result"], ensure_ascii=False))
+
+        status, payload = self.request(
+            "POST",
+            "/api/autofill/save",
+            token=self.browser_token,
+            body={
+                "host": "github.com",
+                "username": "max@example.com",
+                "password": "a-new-one",
+                "path": self.path,
+            },
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["result"]["state"], "updated")
+        self.assertTrue(payload["result"]["saved"])
+        stored = self.session.read_file(self.path, source="ui").decode("utf-8")
+        self.assertIn("گذرواژه: a-new-one", stored)
+
+        status, payload = self.request(
+            "POST",
+            "/api/autofill/save",
+            token=self.browser_token,
+            body={
+                "host": "fresh.example",
+                "username": "someone@fresh.example",
+                "password": "pw",
+                "title": "Fresh",
+                "unknown_field": "ignored",
+            },
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(payload["result"]["state"], "created")
+        self.assertEqual(
+            payload["result"]["path"],
+            f"/{CREDENTIAL_ROOT}/{BROWSER_CATEGORY}/fresh.example/fresh.example.md",
+        )
+        rows = [
+            row
+            for row in self.session.access_log(limit=100)
+            if row["tool"].startswith("vault.browser_save")
+        ]
+        self.assertEqual(len(rows), 4)                 # two checks, two saves
+        self.assertTrue(all(row["source"] == "browser" for row in rows))
+        self.assertTrue(all(row["outcome"] == "allow" for row in rows))
+
+    def test_the_web_token_cannot_save(self) -> None:
+        """Saving needs the browser token: the vault's own token is refused on the same route."""
+        status, payload = self.request(
+            "POST",
+            "/api/autofill/save",
+            token=self.web_token,
+            body={"host": "github.com", "username": "max@example.com", "password": "x"},
+        )
+        self.assertEqual(status, 401)
+        self.assertNotIn(
+            "گذرواژه: x", self.session.read_file(self.path, source="ui").decode("utf-8")
+        )
+
+    def test_an_oversized_or_broken_save_payload_is_a_bad_request(self) -> None:
+        """A page cannot push an unbounded value (or a non-string) into the vault."""
+        for body in (
+            {"host": "github.com", "username": "max@example.com", "password": "x" * 900},
+            {"host": "github.com", "username": "m" * 900, "password": "x"},
+            {"host": "github.com", "username": "max@example.com"},
+            {"username": "max@example.com", "password": "x"},
+            {"host": "github.com", "username": "max@example.com", "password": "one\ntwo"},
+        ):
+            with self.subTest(body={key: str(value)[:20] for key, value in body.items()}):
+                status, payload = self.request(
+                    "POST", "/api/autofill/save", token=self.browser_token, body=body
+                )
+                self.assertEqual(status, 400)
+                self.assertEqual(payload["error"]["code"], "BAD_REQUEST")
+        rows = [
+            row
+            for row in self.session.access_log(limit=100)
+            if row["tool"] == "vault.browser_save"
+        ]
+        self.assertEqual([row["outcome"] for row in rows], ["error"] * 5)
+
+
+class SaveLoopbackTest(unittest.TestCase):
+    """A save has to come from this machine, even for a client holding the browser token.
+
+    The other autofill calls are fine from anywhere the listener is reachable (they only read, and
+    every one is audited); saving writes, so ``web/server.py`` refuses it off loopback.
+    """
+
+    def setUp(self) -> None:
+        self.session = tmp_vault()
+        self.service = Service(self.session)
+        # Bound beyond loopback on purpose: this is the configuration the guard exists for.
+        self.server = WebServer(
+            self.service, host="0.0.0.0", port=0, runtime_dir=self.session._runtime, keepalive=1.0
+        )
+        self.server.start()
+        self.browser_token = self.server.browser.token
+
+    def tearDown(self) -> None:
+        self.server.stop()
+        self.session.close()
+
+    @staticmethod
+    def lan_address() -> str:
+        """Return a non-loopback address of this machine (``""`` when there is none)."""
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        except OSError:  # pragma: no cover - no IPv4 at all
+            return ""
+        try:
+            # Nothing is sent: a UDP connect only asks the routing table which source to use.
+            sock.connect(("192.0.2.1", 9))
+            address = str(sock.getsockname()[0])
+        except OSError:
+            return ""
+        finally:
+            sock.close()
+        return "" if not address or address.startswith("127.") else address
+
+    def test_a_remote_client_cannot_save_but_may_still_read(self) -> None:
+        """403 on the save route, 200 on the read routes — from the same non-loopback client."""
+        address = self.lan_address()
+        if not address:
+            self.skipTest("this machine has no non-loopback IPv4 address to connect from")
+        connection = http.client.HTTPConnection(address, self.server.port, timeout=5.0)
+        try:
+            body = json.dumps(
+                {"host": "github.com", "username": "a", "password": "pw"}
+            ).encode("utf-8")
+            connection.request(
+                "POST",
+                "/api/autofill/save",
+                body=body,
+                headers={"X-Vault-Token": self.browser_token, "Content-Type": "application/json"},
+            )
+            response = connection.getresponse()
+            payload = json.loads(response.read().decode("utf-8") or "{}")
+            self.assertEqual(response.status, 403)
+            self.assertEqual(payload["error"]["message"], "loopback_only")
+            connection.close()
+            connection = http.client.HTTPConnection(address, self.server.port, timeout=5.0)
+            connection.request(
+                "GET", "/api/autofill/status", headers={"X-Vault-Token": self.browser_token}
+            )
+            response = connection.getresponse()
+            payload = json.loads(response.read().decode("utf-8") or "{}")
+            self.assertEqual(response.status, 200)
+            self.assertTrue(payload["result"]["enabled"])
+        finally:
+            connection.close()
+        denied = [
+            row
+            for row in self.session.access_log(limit=50)
+            if row["tool"] == "/api/autofill/save" and row["outcome"] == "deny"
+        ]
+        self.assertTrue(denied, "the refusal must be in the access log")
 
 
 class WriterDriftTest(unittest.TestCase):

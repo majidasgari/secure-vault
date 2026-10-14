@@ -21,10 +21,15 @@ SOURCE_MCP = "mcp"
 SOURCE_IMPORTER = "importer"
 SOURCES: tuple[str, str, str] = (SOURCE_UI, SOURCE_MCP, SOURCE_IMPORTER)
 #: The browser-autofill bridge. Deliberately *not* part of :data:`SOURCES`: it is a read-only
-#: consumer, so ``can_raise``/``can_lower`` must keep refusing it (they reject any source that is
-#: not in ``SOURCES``). What it may reach is bounded by the ``browser`` role's method table and
-#: by the credential-root containment check in ``api/browser.py``, not by this flag alone.
+#: consumer of credentials, and ``can_lower`` keeps refusing it outright. ``can_raise`` allows it
+#: exactly one transition — creating a *new* file at :data:`BROWSER_CREATABLE_LEVELS` — which is
+#: what "save this password in the vault" needs; a credential must be born at the credential
+#: level, never as a searchable ``normal`` file. What it may reach is bounded by the ``browser``
+#: role's method table and by the credential-root containment check in ``api/browser.py``.
 SOURCE_BROWSER = "browser"
+
+#: The levels the browser bridge may create a file at (see :meth:`Policy.can_raise`).
+BROWSER_CREATABLE_LEVELS: tuple[str, ...] = ("secretfile",)
 
 
 def _require_level(level: str) -> str:
@@ -91,9 +96,15 @@ class Policy:
 
     @staticmethod
     def can_raise(from_level: str, to_level: str, source: str) -> bool:
-        """Raising sensitivity is allowed for UI/MCP/importer when the rank increases."""
+        """Raising sensitivity is allowed for UI/MCP/importer when the rank increases.
+
+        The browser bridge may only *create* a file at :data:`BROWSER_CREATABLE_LEVELS` — never
+        raise an existing file's level, never reach ``secret``, never lower anything.
+        """
         _require_level(from_level)
         _require_level(to_level)
+        if source == SOURCE_BROWSER:
+            return rank(to_level) > rank(from_level) and to_level in BROWSER_CREATABLE_LEVELS
         if source not in SOURCES:
             raise BadRequest("unknown_source", details={"source": source})
         return rank(to_level) > rank(from_level)

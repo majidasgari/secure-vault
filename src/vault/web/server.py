@@ -20,7 +20,7 @@ from urllib.parse import parse_qs, urlsplit
 
 from ..api.browser import BrowserBridge
 from ..config import app_paths
-from ..util import now_ms
+from ..util import is_loopback, now_ms
 from .api import Response, WebAPI, json_response
 from .auth import LoginThrottle, TokenAuth, cookie_header
 from .events import EventBus, Subscription
@@ -258,6 +258,29 @@ class _Handler(BaseHTTPRequestHandler):
             return
         if method == "POST" and path == "/api/autofill/reveal":
             self._send(api.autofill_reveal(self._read_json()))
+            return
+        if method == "POST" and path in ("/api/autofill/save-check", "/api/autofill/save"):
+            # Saving is the one call that writes, so it also has to come from this machine: the
+            # browser token is already required, and this keeps a *remote* holder of it out of
+            # the credential folder even when the listener is bound beyond loopback.
+            if not is_loopback(str(self.client_address[0])):
+                api.log_bad_browser_token(path, code="FORBIDDEN")
+                self._send_json(
+                    403,
+                    {
+                        "ok": False,
+                        "error": {
+                            "code": "FORBIDDEN",
+                            "message": "loopback_only",
+                            "details": {},
+                        },
+                    },
+                )
+                return
+            if path.endswith("save-check"):
+                self._send(api.autofill_save_check(self._read_json()))
+            else:
+                self._send(api.autofill_save(self._read_json()))
             return
         self._send_json(404, {"error": {"code": "NOT_FOUND", "message": "not_found"}})
 

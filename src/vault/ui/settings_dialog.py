@@ -495,6 +495,15 @@ class SettingsDialog(QDialog):
         self.browser_autofill = QCheckBox(page)
         self.browser_autofill.setChecked(bool(browser.get("enabled", True)))
         form.addRow(self._label("settings.browser_autofill"), self.browser_autofill)
+        # Saving is a second switch, not a sub-option of filling: it is the only path by which
+        # anything the browser saw can *write* into the credential folder.
+        self.browser_save = QCheckBox(page)
+        self.browser_save.setChecked(bool(browser.get("save_enabled", True)))
+        form.addRow(self._label("settings.browser_save"), self.browser_save)
+        self.browser_save_hint = QLabel(page)
+        self.browser_save_hint.setWordWrap(True)
+        self.browser_save_hint.setEnabled(False)
+        form.addRow(self.browser_save_hint)
         self.browser_hint = QLabel(page)
         self.browser_hint.setWordWrap(True)
         self.browser_hint.setEnabled(False)
@@ -876,7 +885,10 @@ class SettingsDialog(QDialog):
                 "allow_lan": bool(self.web_lan.isChecked()),
                 "open_browser_on_start": bool(self.web_open.isChecked()),
             },
-            "browser": {"enabled": bool(self.browser_autofill.isChecked())},
+            "browser": {
+                "enabled": bool(self.browser_autofill.isChecked()),
+                "save_enabled": bool(self.browser_save.isChecked()),
+            },
         }
         try:
             self._controller.set_settings(payload)
@@ -900,6 +912,7 @@ class SettingsDialog(QDialog):
         self.tabs.setTabText(3, i18n.tr("settings.tab_importer"))
         self.tabs.setTabText(4, i18n.tr("settings.tab_web"))
         self.browser_hint.setText(i18n.tr("settings.browser_autofill_hint"))
+        self.browser_save_hint.setText(i18n.tr("settings.browser_save_hint"))
         self.tabs.setTabText(5, i18n.tr("settings.tab_fingerprint"))
         self.tabs.setTabText(6, i18n.tr("settings.tab_sync"))
         self.tabs.setTabText(7, i18n.tr("settings.tab_log"))

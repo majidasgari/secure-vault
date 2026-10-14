@@ -175,10 +175,10 @@ class WebAPI:
         """Record a denied request that carried no/wrong token."""
         self._log(tool, outcome="deny", code="UNAUTHORIZED")
 
-    def log_bad_browser_token(self, tool: str) -> None:
+    def log_bad_browser_token(self, tool: str, *, code: str = "UNAUTHORIZED") -> None:
         """Record a denied ``/api/autofill/*`` request that carried no/wrong browser token."""
         self._log(
-            tool, outcome="deny", code="UNAUTHORIZED", role="browser", source="browser"
+            tool, outcome="deny", code=code, role="browser", source="browser"
         )
 
     def _approval_required(self, params: dict) -> tuple[str, str] | None:
@@ -500,6 +500,34 @@ class WebAPI:
                 if isinstance(value, str) and value:
                     params[key] = value
         return self._autofill_call("vault.browser_reveal", params)
+
+    def autofill_save_check(self, payload: Any) -> Response:
+        """Report what saving this credential would mean — new, changed or already stored."""
+        return self._autofill_call(
+            "vault.browser_save_check", self._autofill_credential(payload)
+        )
+
+    def autofill_save(self, payload: Any) -> Response:
+        """Store one credential the add-on watched the user type into the credential folder."""
+        return self._autofill_call(
+            "vault.browser_save", self._autofill_credential(payload, with_path=True)
+        )
+
+    @staticmethod
+    def _autofill_credential(payload: Any, *, with_path: bool = False) -> dict[str, Any]:
+        """Whitelist the fields of a save payload (unknown keys are dropped, not passed on).
+
+        Only the credential itself crosses this boundary — never a destination the add-on chose.
+        An optional ``path`` is a *hint* the bridge re-validates against the page's own host.
+        """
+        keys = ("host", "url", "username", "password", "title")
+        params: dict[str, Any] = {}
+        if isinstance(payload, dict):
+            for key in keys + (("path",) if with_path else ()):
+                value = payload.get(key)
+                if isinstance(value, str) and value:
+                    params[key] = value
+        return params
 
     def _autofill_call(self, method: str, params: dict[str, Any]) -> Response:
         """Dispatch one browser-role call and shape its errors like the rest of the API.
