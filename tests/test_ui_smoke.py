@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import unittest
+from typing import Any
 from unittest import mock
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -100,6 +101,24 @@ class UiSmokeTest(unittest.TestCase):
     def test_search_tab_precedes_access_log(self) -> None:
         """The right dock lists search before the access log."""
         self.assertTrue(self.checks["search_tab_first"])
+
+    def test_tree_menu_offers_rename_and_delete(self) -> None:
+        """The folder tree reaches rename/delete, like the file list already did."""
+        from vault.ui import i18n
+
+        window = self.result.window
+        menu = window.tree_menu("/تحقیقات")
+        labels = [action.text() for action in menu.actions() if action.text()]
+        for key in ("menu.open", "menu.rename", "menu.delete_folder", "menu.copy_path"):
+            self.assertIn(i18n.tr(key), labels, f"{key} missing from the tree menu")
+
+        calls: list[tuple[str, str]] = []
+        window._rename = lambda path: calls.append(("rename", path))
+        window._delete = lambda path, **kw: calls.append(("delete", path))
+        for action in menu.actions():
+            if action.text() in (i18n.tr("menu.rename"), i18n.tr("menu.delete_folder")):
+                action.trigger()
+        self.assertEqual(calls, [("rename", "/تحقیقات"), ("delete", "/تحقیقات")])
 
     def test_layout_persists_and_restores(self) -> None:
         """The arrangement the user sets survives a restart (save → change → restore)."""
@@ -707,6 +726,99 @@ class QuickUnlockAutoScanTest(unittest.TestCase):
         screen = self.controller.show_unlock()
         self.assertFalse(self.controller.auto_scan_armed())
         self.assertTrue(screen.fingerprint_button.isHidden())
+
+
+@unittest.skipUnless(HAVE_QT, "PySide6 is not installed")
+class SecretRequestRoutingTest(unittest.TestCase):
+    """Who answers a secret request: a browser approval, or the native viewer (agents only)."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        """One offscreen QApplication and the fa catalogue."""
+        from PySide6.QtWidgets import QApplication
+
+        from vault.ui import i18n
+
+        cls.app = QApplication.instance() or QApplication(["sv-secret-request"])
+        i18n.set_language("fa")
+
+    def _controller(self) -> Any:
+        """A stub with the three collaborators `_resolve_request` uses."""
+        class _Stub:
+            window = None
+            tray = None
+
+            def __init__(self) -> None:
+                self.calls: list[tuple[str, Any]] = []
+
+            def read(self, path: str) -> str:
+                self.calls.append(("read", path))
+                return "body"
+
+            def dispatch_ui(self, method: str, params: dict) -> dict:
+                self.calls.append((method, params))
+                return {}
+
+            def _log_secretfile(self, path: str) -> None:
+                self.calls.append(("ui.read_secretfile", path))
+
+        return _Stub()
+
+    def test_a_web_request_is_approved_without_opening_the_viewer(self) -> None:
+        """The browser asked: approve it and let that browser read the text itself."""
+        from vault.ui import app as ui_app
+
+        controller = self._controller()
+        with mock.patch.object(ui_app.viewer, "open_viewer") as opener:
+            ui_app.VaultApplication._resolve_request(
+                controller, {"request_id": "r1", "path": "/x.md", "origin": "web"}, True
+            )
+        self.assertFalse(opener.called, "the native viewer must not open for a web request")
+        self.assertEqual(
+            controller.calls,
+            [("vault.resolve_open_secret", {"request_id": "r1", "approved": True})],
+        )
+
+    def test_a_web_denial_is_recorded_without_reading(self) -> None:
+        """Denying also never touches the content."""
+        from vault.ui import app as ui_app
+
+        controller = self._controller()
+        with mock.patch.object(ui_app.viewer, "open_viewer") as opener:
+            ui_app.VaultApplication._resolve_request(
+                controller, {"request_id": "r2", "path": "/x.md", "origin": "web"}, False
+            )
+        self.assertFalse(opener.called)
+        self.assertEqual([c[0] for c in controller.calls], ["vault.resolve_open_secret"])
+
+    def test_an_agent_request_still_opens_the_viewer(self) -> None:
+        """An agent's request keeps the desktop as the only place its content appears."""
+        from vault.ui import app as ui_app
+
+        controller = self._controller()
+        with mock.patch.object(ui_app.viewer, "open_viewer") as opener:
+            ui_app.VaultApplication._resolve_request(
+                controller, {"request_id": "r3", "path": "/x.md", "origin": "native"}, True
+            )
+        self.assertTrue(opener.called)
+        self.assertIn(("read", "/x.md"), controller.calls)
+        self.assertIn(("ui.read_secretfile", "/x.md"), controller.calls)
+
+    def test_the_dialog_wording_follows_the_transport(self) -> None:
+        """The web dialog offers «نمایش در رابط وب»; the agent one keeps the native wording."""
+        from vault.ui.app import SecretRequestDialog
+
+        web = SecretRequestDialog(None, {"path": "/x.md", "origin": "web"}, lambda *a: None)
+        agent = SecretRequestDialog(None, {"path": "/x.md"}, lambda *a: None)
+        try:
+            self.assertTrue(web.from_web)
+            self.assertFalse(agent.from_web)
+            self.assertIn("/x.md", web.message.text())
+            self.assertNotIn("⟦", web.message.text() + web.show_button.text())
+            self.assertNotEqual(web.show_button.text(), agent.show_button.text())
+        finally:
+            web.deleteLater()
+            agent.deleteLater()
 
 
 @unittest.skipUnless(HAVE_QT, "PySide6 is not installed")

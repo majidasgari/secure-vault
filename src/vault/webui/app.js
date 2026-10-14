@@ -434,8 +434,8 @@
     li.appendChild(label);
     li.appendChild(count);
     //: The tree is the only place a top-level folder (a child of `/`) is listed without the
-    //: centre pane, so it needs the same row action the notebook list has.
-    li.appendChild(rowDeleteButton(node));
+    //: centre pane, so it needs the same row actions the notebook list has.
+    li.appendChild(rowActions(node));
     li.addEventListener("click", function (ev) {
       if (ev.target === caret) {
         caret.textContent = caret.textContent === "▸" ? "▾" : "▸";
@@ -582,9 +582,10 @@
         path.dir = "auto";
         path.textContent = entry.logical_path || entry.path || "";
         li.appendChild(path);
-        li.appendChild(rowDeleteButton(entry));
+        li.appendChild(rowActions(entry));
         li.title = t("menu.open");
         li.addEventListener("click", function () { navigateNote(entry.logical_path || entry.path); });
+        bindRowMenu(li, entry);
         list.appendChild(li);
       });
       showView("tag");
@@ -746,6 +747,48 @@
     return button;
   }
 
+  function rowRenameButton(entry) {
+    var label = t("menu.rename");
+    var button = document.createElement("button");
+    button.type = "button";
+    button.className = "row-action";
+    button.textContent = "✏️";
+    button.title = label;
+    button.setAttribute("aria-label", label + ": " + (entry.name || entry.path));
+    button.addEventListener("click", function (ev) {
+      ev.stopPropagation();
+      ev.preventDefault();
+      renameEntry(entry);
+    });
+    return button;
+  }
+
+  //: One action cell per row, in every listing a row can appear in: rename beside delete, and
+  //: the same menu on right-click. A listing that offers only one of the two is the bug Max hit.
+  function rowActions(entry) {
+    var ref = entryRef(entry);
+    var box = document.createElement("div");
+    box.className = "row-actions";
+    box.appendChild(rowRenameButton(ref));
+    box.appendChild(rowDeleteButton(ref));
+    return box;
+  }
+
+  //: Every listing hands its rows to the same actions, and not every listing spells an entry the
+  //: same way: a folder listing has ``path``/``name``, a search or tag hit has ``logical_path``
+  //: and no name. Normalise once here so rename/delete cannot work in one list and silently do
+  //: nothing in another.
+  function entryRef(entry) {
+    var path = entry.path || entry.logical_path || "";
+    return {
+      path: path,
+      name: entry.name || String(path).split("/").pop(),
+      is_dir: !!entry.is_dir,
+      sensitivity: entry.sensitivity || "normal",
+      tags: entry.tags || []
+    };
+  }
+
   //: Same action row for every listing a row can appear in (folder tree, notebook list). The click
   //: row navigates; the menu is where the row's own actions live, so a row needs no visible chrome.
   function bindRowMenu(li, entry) {
@@ -777,7 +820,7 @@
       li.appendChild(icon);
       li.appendChild(name);
       li.appendChild(count);
-      li.appendChild(rowDeleteButton(entry));
+      li.appendChild(rowActions(entry));
       li.addEventListener("click", function () { navigateFolder(entry.path); });
       bindRowMenu(li, entry);
       notebooks.appendChild(li);
@@ -809,7 +852,7 @@
         noteSpan.textContent = "📝 " + entry.note;
         li.appendChild(noteSpan);
       }
-      li.appendChild(rowDeleteButton(entry));
+      li.appendChild(rowActions(entry));
       li.addEventListener("click", function () { navigateNote(entry.path); });
       notes.appendChild(li);
     });
@@ -1365,15 +1408,10 @@
 
   function openFile(entry) {
     if (state.dirty && !window.confirm(t("editor.unsaved_text"))) { return; }
-    // A secretfile is never rendered in the browser: ask the desktop app to show it in
-    // its native viewer. A secret file may be opened here after confirmation.
-    if (entry.sensitivity === "secretfile") {
-      requestNative(entry.path);
-      return;
-    }
-    if (entry.sensitivity === "secret") {
-      openPlainViewer(entry.path);
-      return;
+    // Neither secret level is ever rendered in this page by us: the desktop app asks, and the
+    // text it approves comes back into the plain-text modal (see `requestSecretDisplay`).
+    if (entry.sensitivity === "secretfile" || entry.sensitivity === "secret") {
+      return requestSecretDisplay(entry.path);
     }
     if (isBinaryPath(entry.path)) {
       showBinary(entry);
@@ -1383,12 +1421,8 @@
       showNoteResult(result);
     }).catch(function (err) {
       if (err.code === "PERMISSION_DENIED" && err.details && err.details.requires_approval) {
-        if (err.details.sensitivity === "secretfile") {
-          requestNative(err.details.path || entry.path);
-        } else {
-          openPlainViewer(err.details.path || entry.path);
-        }
-        return;
+        // A deep link (`#/note/<path>`) carries no level, so the answer is what tells us.
+        return requestSecretDisplay(err.details.path || entry.path);
       }
       showToast(errorText(err), "error");
     });
@@ -1534,23 +1568,105 @@
     $("#level-select").hidden = false;
   }
 
-  function requestNative(path) {
-    // Hand a secretfile to the desktop app: the native viewer owns the content and the
-    // browser never receives it. The agent-request flow is reused, with this tab as source.
-    call("vault.request_open_secret", { path: path }).then(function (result) {
-      if (result && result.handler === false) {
-        showToast(t("web.secret_needs_app"), "warn");
-      } else {
-        showToast(t("web.secret_sent_to_app"), "ok");
+  /* ------------------------------------------------------------ secret levels */
+  //: The text of a secret level never renders as markdown and never reaches this page without
+  //: the main app's permission. The click asks the desktop app — its own dialog is the gate —
+  //: and this tab waits for the answer: approved copies the text into the plain-text modal,
+  //: denied (or no answer) says so. When no desktop app is attached (a standalone web server)
+  //: this tab is the only place that can ask, so it puts the same question itself.
+  var SECRET_POLL_MS = 900;
+  var SECRET_WAIT_MS = 90000;
+  var secretWaiters = {};
+
+  function requestSecretDisplay(path) {
+    return call("vault.request_open_secret", { path: path }).then(function (result) {
+      var requestId = result && result.request_id;
+      if (!requestId) { return; }
+      if (result.handler === false) {
+        openApprovalModal(path, requestId);
+        return;
       }
-    }).catch(function (err) { showToast(errorText(err), "error"); });
+      showToast(t("web.secret_sent_to_app"), "ok");
+      waitForSecretDisplay(requestId, path);
+    }).catch(function (err) {
+      if (err.code === "PERMISSION_DENIED") {
+        showToast(t("web.secret_denied"), "warn");
+        return;
+      }
+      showToast(errorText(err), "error");
+    });
   }
 
-  function openPlainViewer(path) {
-    if (!window.confirm(t("web.secretfile_confirm"))) { return; }
-    call("vault.read_secret", { path: path }).then(function (result) {
-      showPlainModal(result.path, result.content);
-    }).catch(function (err) { showToast(errorText(err), "error"); });
+  function waitForSecretDisplay(requestId, path) {
+    if (secretWaiters[requestId] !== undefined) { return; }
+    var started = Date.now();
+    secretWaiters[requestId] = window.setInterval(function () {
+      call("vault.secret_status", { request_id: requestId }).then(function (result) {
+        var status = result && result.status;
+        if (!status || status === "pending") {
+          if (Date.now() - started > SECRET_WAIT_MS) {
+            stopSecretWait(requestId);
+            showToast(t("web.secret_timeout"), "warn");
+          }
+          return;
+        }
+        stopSecretWait(requestId);
+        if (status === "shown") { readSecretInto(result.path || path); }
+        else { showToast(t("web.secret_denied"), "warn"); }
+      }).catch(function () { /* a lost poll is simply retried on the next tick */ });
+    }, SECRET_POLL_MS);
+  }
+
+  function stopSecretWait(requestId) {
+    var timer = secretWaiters[requestId];
+    if (timer !== undefined) { window.clearInterval(timer); }
+    delete secretWaiters[requestId];
+  }
+
+  function stopSecretWaits() {
+    Object.keys(secretWaiters).forEach(stopSecretWait);
+  }
+
+  function readSecretInto(path) {
+    return call("vault.read_secret", { path: path }).then(function (result) {
+      showPlainModal(result.path || path, result.content);
+    }).catch(function (err) {
+      if (err.code === "PERMISSION_DENIED" && err.details && err.details.requires_approval) {
+        showToast(t("web.secret_requires_approval"), "warn");
+        return;
+      }
+      showToast(errorText(err), "error");
+    });
+  }
+
+  function openApprovalModal(path, requestId) {
+    var modal = buildModal(t("request.title"));
+    var message = document.createElement("p");
+    message.dir = "auto";
+    message.textContent = t("request.message", { path: path || "" });
+    modal.body.appendChild(message);
+    var show = document.createElement("button");
+    show.type = "button";
+    show.className = "primary";
+    show.textContent = t("request.show");
+    show.addEventListener("click", function () {
+      closeModal(modal.root);
+      // Resolve first: the approval is what releases this path's text for the browser.
+      call("vault.resolve_open_secret", { request_id: requestId, approved: true })
+        .then(function () { return readSecretInto(path); })
+        .catch(function (err) { showToast(errorText(err), "error"); });
+    });
+    var deny = document.createElement("button");
+    deny.type = "button";
+    deny.textContent = t("request.deny");
+    deny.addEventListener("click", function () {
+      closeModal(modal.root);
+      call("vault.resolve_open_secret", { request_id: requestId, approved: false })
+        .catch(function (err) { showToast(errorText(err), "error"); });
+    });
+    modal.actions.appendChild(show);
+    modal.actions.appendChild(deny);
+    openModal(modal.root);
   }
 
   function showPlainModal(path, content) {
@@ -2169,7 +2285,9 @@
     return askNewFolder();
   }
 
-  function renameEntry(entry) {
+  function renameEntry(rawEntry) {
+    var entry = entryRef(rawEntry);
+    if (!entry.path) { return; }
     askName({
       title: t("dialog.rename"),
       placeholder: t("dialog.rename_prompt"),
@@ -2181,7 +2299,20 @@
       var dst = (parent ? parent : "") + "/" + name;
       return call("vault.file_ops", { op: "move", src: entry.path, dst: dst }).then(function () {
         showToast(t("web.renamed"), "ok");
-        return Promise.all([loadIndex(), loadFolder(state.cwd)]);
+        return Promise.all([loadIndex(), loadFolder(state.cwd)]).then(function () {
+          // The open note followed its own rename — in the header *and* in the URL, or a reload
+          // would ask for the path that no longer exists.
+          if (state.file && state.file.path === entry.path) {
+            state.file.path = dst;
+            state.file.name = name;
+            if (window.location.hash.indexOf("#/note/") === 0) {
+              try {
+                history.replaceState(null, "", "#/note" + dst);
+              } catch (e) { /* ignore */ }
+            }
+            renderNoteView();
+          }
+        });
       });
     }).catch(function (err) { showToast(errorText(err), "error"); });
   }
@@ -2268,10 +2399,8 @@
       return;
     }
     item(t("menu.open"), function () { navigateNote(entry.path); });
-    if (entry.sensitivity === "secretfile") {
-      item(t("menu.open_native"), function () { requestNative(entry.path); });
-    } else if (entry.sensitivity === "secret") {
-      item(t("menu.open_native"), function () { openPlainViewer(entry.path); });
+    if (entry.sensitivity === "secretfile" || entry.sensitivity === "secret") {
+      item(t("menu.open_native"), function () { requestSecretDisplay(entry.path); });
     }
     item(t("menu.emoji"), function () { editEmoji(entry); });
     item(t("menu.rename"), function () { renameEntry(entry); });
@@ -2326,13 +2455,20 @@
     list.textContent = "";
     results.forEach(function (hit) {
       var li = document.createElement("li");
+      //: The path and its row actions share one line; the snippet wraps under it (`.results li`
+      //: is a column). Without this head the action cell would sit on a line of its own.
+      var head = document.createElement("div");
+      head.className = "result-head";
       var title = document.createElement("span");
       var path = hit.logical_path || hit.path || "";
+      title.className = "result-path";
       title.dir = "auto";
       title.textContent = path;
       var emoji = emojiSpan(hit);
-      if (emoji) { li.appendChild(emoji); }
-      li.appendChild(title);
+      if (emoji) { head.appendChild(emoji); }
+      head.appendChild(title);
+      head.appendChild(rowActions(hit));
+      li.appendChild(head);
       if (hit.snippet) {
         var snippet = document.createElement("span");
         snippet.className = "snippet";
@@ -2341,6 +2477,7 @@
         li.appendChild(snippet);
       }
       li.addEventListener("click", function () { navigateNote("/" + path.replace(/^\//, "")); });
+      bindRowMenu(li, hit);
       list.appendChild(li);
     });
   }
@@ -2570,6 +2707,7 @@
 
   function handleLockEvent() {
     closeVisualEditor();          // nothing the editor rendered may stay in the DOM after a lock
+    stopSecretWaits();            // an unanswered secret request dies with the session
     state.session = state.session || {};
     state.session.locked = true;
     state.session.counts = null;
@@ -2591,33 +2729,9 @@
   }
 
   function showSecretRequest(event) {
-    var modal = buildModal(t("request.title"));
-    var message = document.createElement("p");
-    message.dir = "auto";
-    message.textContent = t("request.message", { path: event.path || "" });
-    modal.body.appendChild(message);
-    var show = document.createElement("button");
-    show.type = "button";
-    show.className = "primary";
-    show.textContent = t("request.show");
-    show.addEventListener("click", function () {
-      call("vault.read_secret", { path: event.path }).then(function (result) {
-        showPlainModal(result.path, result.content);
-        return call("vault.resolve_open_secret", { request_id: event.request_id, approved: true });
-      }).catch(function (err) { showToast(errorText(err), "error"); });
-      closeModal(modal.root);
-    });
-    var deny = document.createElement("button");
-    deny.type = "button";
-    deny.textContent = t("request.deny");
-    deny.addEventListener("click", function () {
-      call("vault.resolve_open_secret", { request_id: event.request_id, approved: false })
-        .catch(function (err) { showToast(errorText(err), "error"); });
-      closeModal(modal.root);
-    });
-    modal.actions.appendChild(show);
-    modal.actions.appendChild(deny);
-    openModal(modal.root);
+    // An agent asked for a file and no desktop app is attached (that is the only case this
+    // event reaches a browser), so this tab puts the question and shows the answer locally.
+    openApprovalModal(event.path, event.request_id);
   }
 
   /* -------------------------------------------------------------- modals */
@@ -2876,6 +2990,13 @@
     $("#btn-save").addEventListener("click", saveFile);
     $("#btn-cancel").addEventListener("click", cancelEdit);
     $("#btn-note-edit-top").addEventListener("click", enterEditMode);
+    var renameTop = $("#btn-note-rename-top");
+    if (renameTop) {
+      renameTop.addEventListener("click", function () {
+        if (!state.file) { return; }
+        renameEntry({ path: state.file.path, name: state.file.name, is_dir: false });
+      });
+    }
     var deleteTop = $("#btn-note-delete-top");
     if (deleteTop) {
       deleteTop.addEventListener("click", function () {

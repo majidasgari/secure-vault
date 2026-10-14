@@ -14,6 +14,8 @@ from __future__ import annotations
 from ..errors import BadRequest
 
 LEVELS: tuple[str, str, str] = ("normal", "secret", "secretfile")
+#: The two gated levels: their content never reaches a plain ``read_file`` (SPEC/09 §B).
+SECRET_LEVELS: tuple[str, str] = ("secret", "secretfile")
 LEVEL_RANK: dict[str, int] = {"normal": 0, "secret": 1, "secretfile": 2}
 
 SOURCE_UI = "ui"
@@ -84,14 +86,15 @@ class Policy:
         """Whether ``source`` may ask the desktop UI to display a file.
 
         MCP may request ``normal`` and ``secretfile`` (never ``secret``). The UI role may
-        request ``secretfile`` so the browser can hand a ``secretfile`` off to the native
-        viewer instead of ever putting its content in an HTML page.
+        request **both** gated levels: that is how the browser hands a ``secret``/
+        ``secretfile`` to the desktop app instead of ever putting its content in an HTML page
+        (the approval it comes back with is what releases the text; SPEC/09 §B).
         """
         _require_level(level)
         if source == SOURCE_MCP:
             return level != "secret"
         if source == SOURCE_UI:
-            return level == "secretfile"
+            return level in SECRET_LEVELS
         return False
 
     @staticmethod
@@ -133,6 +136,7 @@ class Policy:
 
 __all__ = [
     "LEVELS",
+    "SECRET_LEVELS",
     "LEVEL_RANK",
     "SOURCE_UI",
     "SOURCE_MCP",

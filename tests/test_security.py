@@ -23,8 +23,9 @@ _CAN_READ = {
 
 _CAN_REQUEST = {
     "normal": {SOURCE_UI: False, SOURCE_MCP: True, SOURCE_IMPORTER: False},
-    "secret": {SOURCE_UI: False, SOURCE_MCP: False, SOURCE_IMPORTER: False},
-    # The web UI (role ``ui``) may hand a secretfile to the desktop native viewer.
+    # The web UI (role ``ui``) may hand *either* gated level to the desktop app: its permission
+    # dialog is what releases the text the browser then shows (SPEC/09 §B).
+    "secret": {SOURCE_UI: True, SOURCE_MCP: False, SOURCE_IMPORTER: False},
     "secretfile": {SOURCE_UI: True, SOURCE_MCP: True, SOURCE_IMPORTER: False},
 }
 
@@ -61,7 +62,7 @@ class PolicyMatrixTest(unittest.TestCase):
                 )
 
     def test_can_request_open_secret_matrix(self) -> None:
-        """MCP may request normal/secretfile; other sources never."""
+        """MCP may request normal/secretfile; the UI the two gated levels; nobody else."""
         for level in LEVELS:
             for source in _ALL_SOURCES:
                 self.assertEqual(

@@ -251,6 +251,8 @@ input[type="checkbox"] { min-height: auto; width: 18px; height: 18px; }
 .tab { display: flex; flex-direction: column; gap: 8px; flex: 1; min-height: 0; }
 .results { overflow: auto; flex: 1; }
 .results li { flex-direction: column; align-items: flex-start; }
+.result-head { display: flex; align-items: center; gap: 8px; width: 100%; }
+.result-path { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .results .snippet { color: var(--muted); font-size: 0.85rem; }
 
 .activity-banner {
@@ -607,14 +609,17 @@ input[type="checkbox"] { min-height: auto; width: 18px; height: 18px; }
 .notes-list li:not(.note-row), #tag-results li { display: flex; align-items: center; gap: 8px; }
 .notes-list li:hover, #tag-results li:hover { background: var(--panel2); }
 
-/* row-level actions (delete) stay quiet until hovered */
+/* row-level actions (rename + delete) stay quiet until hovered */
+.row-actions {
+  display: inline-flex; align-items: center; gap: 2px;
+  flex: 0 0 auto; margin-inline-start: auto;
+}
 .row-action {
   flex: 0 0 auto; min-height: 30px; min-width: 30px; padding: 0 6px;
   font-size: 0.9rem; line-height: 1; background: transparent; border-color: transparent;
   opacity: 0.45; transition: opacity 0.15s ease, border-color 0.15s ease;
 }
-/* A tree row is wide and its count sits next to the name, so the action belongs at the far edge. */
-.tree-row .row-action { margin-inline-start: auto; }
+/* A tree row is wide and its count sits next to the name, so the cell belongs at the far edge. */
 .tree-row:hover .row-action, .note-row:hover .row-action, .notebook:hover .row-action,
 .row-action:focus-visible { opacity: 1; }
 .row-action:hover { opacity: 1; border-color: var(--danger); background: var(--panel2); }

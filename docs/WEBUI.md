@@ -76,9 +76,9 @@ logged, echoed or stored.
   `Service.dispatch(…, role="ui", session_id="web-<n>", source="web")`.
   `vault.unlock` and `vault.lock` are **not** reachable through `/api/call`. A plain
   `vault.read_file` on a `secret`/`secretfile` path is refused with
-  `PERMISSION_DENIED` + `details.requires_approval: true`; after the SPA's confirm
-  step it calls the UI-only `vault.read_secret` (same access-log rows as the desktop
-  viewer). See §6.
+  `PERMISSION_DENIED` + `details.requires_approval: true`, and `vault.read_secret` answers the
+  same way until that path has been approved (the SPA asks, the desktop app answers, the tab
+  polls `vault.secret_status`). See §6.
 * `GET /api/index` — `{"tree": […], "tags": [{name, count}], "counts": {…}}` in one
   round-trip for the sidebar (parity with the mirror browser).
 * `GET /api/search?q=&tag=&limit=` — one-box search over title, tags and (normal)
@@ -159,9 +159,10 @@ The single page mirrors the standalone mirror browser and adds the vault's level
   its subfolders, its notes and its secretfiles (and their blobs) out in one step. Deleting a
   folder that still has children without `recursive` is refused, and `/` itself is never
   deletable.
-* Secret/secretfile files never reach the markdown renderer: a plain read is refused
-  and the content is shown only in the plain-text modal (or opened natively by the
-  desktop UI), exactly as before.
+* Secret/secretfile files never reach the markdown renderer: a plain read is refused, the
+  **desktop app's dialog** approves that one path (the tab asks with `request_open_secret` and
+  waits on `secret_status`), and the text then opens in the plain-text modal — the native viewer
+  is *not* opened for a web request.
 
 ## 3b. The tray shell starts the web UI automatically
 
@@ -309,10 +310,16 @@ The browser follows the same sensitivity rules as the desktop UI:
 
 * `normal` — editable, live markdown preview.
 * `secret` / `secretfile` — a plain `vault.read_file` is refused with
-  `requires_approval`; after the confirmation the SPA reads them through
-  `vault.read_secret` and shows them only in the plain-text modal (`textContent`,
-  monospace, Copy button). No markdown preview is ever rendered for these levels and
-  `GET /api/blob` / `GET /api/raw` refuse them with 403.
+  `requires_approval`, and `vault.read_secret` answers the same until that path has been
+  approved. The SPA asks with `vault.request_open_secret`, the **desktop app** puts the
+  question (its dialog is the gate), and the answer comes back to the tab, which polls
+  `vault.secret_status` and then reads the text — shown only in the plain-text modal
+  (`textContent`, monospace, Copy button). No markdown preview is ever rendered for these
+  levels and `GET /api/blob` / `GET /api/raw` refuse them with 403. The approval releases
+  that one path for a couple of minutes (dropped on lock) and is what lets the tab read it.
+  With no desktop app attached at all (a standalone web server) the tab puts the same
+  question itself, so the page stays usable; an agent's request keeps opening the native
+  viewer on the desktop instead.
 * On lock, the SPA clears the editor, tree, results and log from the DOM and shows
   the login screen again; nothing vault-related is written to `localStorage` or the
   URL. The access token lives in memory + `sessionStorage` only.

@@ -53,6 +53,7 @@ QUIET_METHODS = frozenset(
         "vault.access_log_count",
         "vault.ping",
         "vault.recent",
+        "vault.secret_status",
         "vault.i18n",
         "vault.emoji_palette",
         "vault.sync_status",
@@ -734,12 +735,16 @@ class Service:
     def _h_request_open_secret(self, params: dict, role: str, session_id: str) -> dict:
         logical = normalize_vault_path(self._text(self._require(params, "path"), param="path"))
         source = ROLE_MCP if role == ROLE_MCP else ROLE_UI
+        # The transport that asked decides what an approval does: a browser reads the text back
+        # into the web UI, an agent's approval opens the native viewer on the user's desktop.
+        origin = "web" if str(session_id or "").startswith("web-") else "native"
         result = self.session.request_open_secret(
-            logical, source=source, session=session_id
+            logical, source=source, session=session_id, origin=origin
         )
         # ``handler`` is False when no desktop app is attached (headless web/daemon), so the
         # browser can say "open the app" instead of silently doing nothing.
         result["handler"] = self.session.on_secret_request is not None
+        result["origin"] = origin
         result["note"] = (
             "The user is asked to display it on their desktop; the content is never "
             "returned to the agent."
@@ -752,6 +757,12 @@ class Service:
         )
         approved = bool(params.get("approved", False))
         return self.session.resolve_open_secret(request_id, approved=approved)
+
+    def _h_secret_status(self, params: dict, role: str, session_id: str) -> dict:
+        request_id = self._text(
+            self._require(params, "request_id"), param="request_id"
+        )
+        return self.session.secret_request_status(request_id)
 
     def _h_pending_requests(self, params: dict, role: str, session_id: str) -> dict:
         return {"requests": self.session.pending_requests()}
@@ -1105,6 +1116,7 @@ class Service:
         "vault.search_semantic": (_h_search_semantic, _BOTH),
         "vault.request_open_secret": (_h_request_open_secret, _BOTH),
         "vault.resolve_open_secret": (_h_resolve_open_secret, _UI_ONLY),
+        "vault.secret_status": (_h_secret_status, _UI_ONLY),
         "vault.pending_requests": (_h_pending_requests, _UI_ONLY),
         "vault.read_secret": (_h_read_secret, _UI_ONLY),
         "vault.access_log": (_h_access_log, _BOTH),

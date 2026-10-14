@@ -189,12 +189,18 @@ class SecretRequestDialog(QDialog):
         self._on_decision = on_decision
         self.setModal(False)
         path = "/" + str(request.get("path", "")).lstrip("/")
+        #: A request that came from the browser is answered into that browser (its own view
+        #: shows the text); an agent's request opens the native viewer here. Only the wording
+        #: differs — the gate is the same dialog.
+        self.from_web = str(request.get("origin") or "") == "web"
 
         layout = QVBoxLayout(self)
-        self.message = QLabel(i18n.tr("request.message", path=path), self)
+        message_key = "request.message_web" if self.from_web else "request.message"
+        self.message = QLabel(i18n.tr(message_key, path=path), self)
         self.message.setWordWrap(True)
         layout.addWidget(self.message)
-        self.show_button = QPushButton(i18n.tr("request.show_copy"), self)
+        button_key = "request.show_web" if self.from_web else "request.show_copy"
+        self.show_button = QPushButton(i18n.tr(button_key), self)
         self.show_button.clicked.connect(lambda: self._decide(True))
         self.deny_button = QPushButton(i18n.tr("request.deny"), self)
         self.deny_button.clicked.connect(lambda: self._decide(False))
@@ -1955,17 +1961,30 @@ class VaultApplication(QObject):
         """Show the non-modal secret-request dialog."""
         dialog = SecretRequestDialog(self.window, request, self._resolve_request)
         self._secret_dialogs.append(dialog)
+        path = "/" + str(request.get("path", "")).lstrip("/")
+        from_web = str(request.get("origin") or "") == "web"
         notifications.notify(
-            i18n.tr("notification.secret_request"),
-            "/" + str(request.get("path", "")).lstrip("/"),
+            i18n.tr(
+                "notification.secret_request_web"
+                if from_web
+                else "notification.secret_request"
+            ),
+            path,
             tray=self.tray,
         )
         dialog.show()
 
     def _resolve_request(self, request: dict, approved: bool) -> None:
-        """Open the native viewer (when approved) and resolve the request."""
+        """Answer one secret request: show it natively, or hand the approval to the browser.
+
+        An agent's request (the tray shell is the only place its content may appear) opens the
+        native viewer. A request that came from the web UI does **not**: approving it releases
+        the text for that one path and the browser renders it in its own plain-text view, so
+        nothing pops up over the page the user is already reading.
+        """
         path = "/" + str(request.get("path", "")).lstrip("/")
-        if approved:
+        from_web = str(request.get("origin") or "") == "web"
+        if approved and not from_web:
             try:
                 content = self.read(path)
                 viewer.open_viewer(

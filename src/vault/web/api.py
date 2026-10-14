@@ -28,6 +28,7 @@ from ..errors import (
     VaultError,
     VaultLocked,
 )
+from ..core.security import SECRET_LEVELS as GATED_LEVELS
 from ..util import is_loopback, normalize_vault_path
 from .auth import LoginThrottle, TokenAuth, cookie_header
 from .events import EventBus
@@ -40,8 +41,8 @@ LOG = logging.getLogger(__name__)
 #: ``secret``/``secretfile`` path is answered with ``requires_approval`` (SPEC/09 §5).
 FORBIDDEN_METHODS = frozenset({"vault.unlock", "vault.lock"})
 
-#: Levels whose content is gated behind the explicit approval flow.
-SECRET_LEVELS = frozenset({"secret", "secretfile"})
+#: Levels whose content is gated behind the explicit approval flow (one source: core.security).
+SECRET_LEVELS = frozenset(GATED_LEVELS)
 
 #: Methods whose success invalidates the browser's cached listing.
 MUTATING_METHODS = frozenset(
@@ -203,14 +204,30 @@ class WebAPI:
             return logical, level
         return None
 
-    def _requires_approval(self, logical: str, level: str) -> Response:
-        """Answer a gated ``read_file`` with ``requires_approval`` (one deny row)."""
-        self._log(
-            "read_file", outcome="deny", target=logical, code="PERMISSION_DENIED"
-        )
+    def _secret_read_required(self, params: dict) -> tuple[str, str] | None:
+        """Return ``(logical_path, level)`` when ``vault.read_secret`` has no approval yet.
+
+        The gate is what makes the desktop dialog real: a browser gets the text of a secret
+        level only while an explicit approval is live for that path (SPEC/09 §B). Approved =
+        the desktop app answered the SPA's request, or the SPA's own modal (no desktop
+        attached) answered it.
+        """
+        found = self._approval_required(params)
+        if found is None:
+            return None
+        logical, level = found
+        if self.session.secret_display_granted(logical):
+            return None
+        return logical, level
+
+    def _requires_approval(
+        self, logical: str, level: str, *, tool: str = "read_file"
+    ) -> Response:
+        """Answer a gated read with ``requires_approval`` (one deny row)."""
+        self._log(tool, outcome="deny", target=logical, code="PERMISSION_DENIED")
         self.events.publish(
             "log",
-            {"tool": "vault.read_file", "outcome": "deny", "code": "PERMISSION_DENIED"},
+            {"tool": f"vault.{tool}", "outcome": "deny", "code": "PERMISSION_DENIED"},
         )
         return json_response(
             200,
@@ -247,6 +264,13 @@ class WebAPI:
             approval = self._approval_required(params)
             if approval is not None:
                 return self._requires_approval(*approval)
+        elif method == "vault.read_secret":
+            # Reading the text itself needs a live approval for that path (SPEC/09 §B), so the
+            # SPA must ask first — through the desktop dialog, or its own modal when no desktop
+            # app is attached.
+            blocked = self._secret_read_required(params)
+            if blocked is not None:
+                return self._requires_approval(*blocked, tool="read_secret")
         try:
             result = self.service.dispatch(
                 method, params, role="ui", session_id=self.session_id(), source="web"

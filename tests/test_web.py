@@ -489,7 +489,7 @@ class I18nTest(_WebTestCase):
 
 
 class SecretApprovalTest(_WebTestCase):
-    """The web secret gate (SPEC/09 §5)."""
+    """The web secret gate (SPEC/09 §5/§B): approval first, text second."""
 
     def setUp(self) -> None:
         super().setUp()
@@ -499,9 +499,20 @@ class SecretApprovalTest(_WebTestCase):
             "vault.write_file",
             {"path": "/secrets/hidden.md", "content": "secret body", "sensitivity": "secret"},
         )
+        self.call(
+            "vault.write_file",
+            {"path": "/secrets/card.md", "content": "card body", "sensitivity": "secretfile"},
+        )
+
+    def _request(self, path: str) -> str:
+        """Ask for ``path`` through the web API and return the request id."""
+        status, data = self.call("vault.request_open_secret", {"path": path})
+        self.assertEqual(status, 200, data)
+        self.assertTrue(data["ok"], data)
+        return str(data["result"]["request_id"])
 
     def test_read_file_secret_requires_approval(self) -> None:
-        """A plain read of a secret file is gated, then read_secret succeeds."""
+        """A plain read of a secret file is gated and never carries the body."""
         status, data = self.call("vault.read_file", {"path": "/secrets/hidden.md"})
         self.assertEqual(status, 200)
         self.assertFalse(data["ok"])
@@ -509,15 +520,94 @@ class SecretApprovalTest(_WebTestCase):
         self.assertTrue(data["error"]["details"]["requires_approval"])
         self.assertNotIn("secret body", json.dumps(data))
 
-        status, data = self.call("vault.read_secret", {"path": "/secrets/hidden.md"})
-        self.assertTrue(data["ok"])
-        self.assertEqual(data["result"]["content"], "secret body")
-
         rows = self.session.access_log(limit=100)
         pairs = {(row["tool"], row["outcome"]) for row in rows}
-        # The log records the tool name the call arrived under ("read_file" for the agent role).
+        # The log records the tool name the call arrived under.
         self.assertIn(("read_file", "deny"), pairs)
-        self.assertIn(("vault.read_secret", "allow"), pairs)
+
+    def test_read_secret_without_an_approval_is_refused(self) -> None:
+        """``vault.read_secret`` on its own is not a way in: it needs a live approval."""
+        status, data = self.call("vault.read_secret", {"path": "/secrets/hidden.md"})
+        self.assertEqual(status, 200)
+        self.assertFalse(data["ok"])
+        self.assertEqual(data["error"]["code"], "PERMISSION_DENIED")
+        self.assertTrue(data["error"]["details"]["requires_approval"])
+        self.assertNotIn("secret body", json.dumps(data))
+        rows = self.session.access_log(limit=100)
+        self.assertIn(("read_secret", "deny"), {(r["tool"], r["outcome"]) for r in rows})
+
+    def test_approved_request_releases_the_text(self) -> None:
+        """The whole browser flow: ask → (the app answers) → read the text."""
+        request_id = self._request("/secrets/card.md")
+        status, data = self.call("vault.secret_status", {"request_id": request_id})
+        self.assertEqual(data["result"]["status"], "pending")
+
+        status, data = self.call(
+            "vault.resolve_open_secret", {"request_id": request_id, "approved": True}
+        )
+        self.assertTrue(data["ok"], data)
+
+        status, data = self.call("vault.secret_status", {"request_id": request_id})
+        self.assertEqual(data["result"]["status"], "shown")
+
+        status, data = self.call("vault.read_secret", {"path": "/secrets/card.md"})
+        self.assertTrue(data["ok"], data)
+        self.assertEqual(data["result"]["content"], "card body")
+        rows = self.session.access_log(limit=100)
+        self.assertIn(("vault.read_secret", "allow"), {(r["tool"], r["outcome"]) for r in rows})
+
+    def test_a_denied_request_never_releases_the_text(self) -> None:
+        """Denying the dialog leaves the path closed."""
+        request_id = self._request("/secrets/card.md")
+        self.call(
+            "vault.resolve_open_secret", {"request_id": request_id, "approved": False}
+        )
+        status, data = self.call("vault.secret_status", {"request_id": request_id})
+        self.assertEqual(data["result"]["status"], "denied")
+        status, data = self.call("vault.read_secret", {"path": "/secrets/card.md"})
+        self.assertFalse(data["ok"])
+        self.assertTrue(data["error"]["details"]["requires_approval"])
+
+    def test_an_approval_is_a_window_not_a_permission(self) -> None:
+        """The release expires after its window, and a lock drops it immediately."""
+        # An approval minted with an already-past expiry is not a way in.
+        request_id = self._request("/secrets/card.md")
+        self.session.SECRET_GRANT_TTL_MS = -1000
+        self.call(
+            "vault.resolve_open_secret", {"request_id": request_id, "approved": True}
+        )
+        status, data = self.call("vault.read_secret", {"path": "/secrets/card.md"})
+        self.assertFalse(data["ok"])
+        self.assertTrue(data["error"]["details"]["requires_approval"])
+
+        # A live approval releases the text, and locking forgets it.
+        self.session.SECRET_GRANT_TTL_MS = 120_000
+        request_id = self._request("/secrets/card.md")
+        self.call(
+            "vault.resolve_open_secret", {"request_id": request_id, "approved": True}
+        )
+        status, data = self.call("vault.read_secret", {"path": "/secrets/card.md"})
+        self.assertTrue(data["ok"], data)
+
+        self.session.lock()
+        self.session.unlock(DEFAULT_PASSWORD)
+        status, data = self.call("vault.read_secret", {"path": "/secrets/card.md"})
+        self.assertFalse(data["ok"])
+        self.assertTrue(data["error"]["details"]["requires_approval"])
+
+    def test_the_waiting_poll_is_quiet(self) -> None:
+        """``vault.secret_status`` writes no access-log row — a per-second poll must not bury it."""
+        request_id = self._request("/secrets/card.md")
+        before = len(self.session.access_log(limit=500))
+        for _ in range(3):
+            self.call("vault.secret_status", {"request_id": request_id})
+        self.assertEqual(len(self.session.access_log(limit=500)), before)
+
+    def test_the_request_names_its_transport(self) -> None:
+        """A request made from the browser is marked ``web``, so the app knows who answers."""
+        status, data = self.call("vault.request_open_secret", {"path": "/secrets/card.md"})
+        self.assertEqual(data["result"]["origin"], "web")
+        self.assertTrue(data["result"]["handler"] is False)
 
     def test_normal_read_is_not_gated(self) -> None:
         """A normal file still reads through vault.read_file."""
@@ -744,16 +834,16 @@ class FolderDeleteSpaTest(unittest.TestCase):
                     return self.js[start : offset + 1]
         raise AssertionError(f"unbalanced braces in {name}")
 
-    def test_folder_tree_rows_have_the_delete_action(self) -> None:
-        """A tree row — the only listing of a folder under ``/`` — carries 🗑."""
+    def test_folder_tree_rows_have_the_row_actions(self) -> None:
+        """A tree row — the only listing of a folder under ``/`` — carries rename + delete."""
         body = self._function("buildTreeRow")
-        self.assertIn("rowDeleteButton(node)", body)
+        self.assertIn("rowActions(node)", body)
         self.assertIn("bindRowMenu(li, node)", body)
 
-    def test_notebook_rows_have_the_delete_action(self) -> None:
-        """The centre folder list keeps its own 🗑 plus the row menu."""
+    def test_notebook_rows_have_the_row_actions(self) -> None:
+        """The centre folder list keeps its own actions plus the row menu."""
         body = self._function("renderFolderView")
-        self.assertIn("rowDeleteButton(entry)", body)
+        self.assertIn("rowActions(entry)", body)
         self.assertIn("bindRowMenu(li, entry)", body)
 
     def test_folder_delete_is_labelled_and_recursive(self) -> None:
@@ -767,6 +857,126 @@ class FolderDeleteSpaTest(unittest.TestCase):
         body = self._function("showContextMenu")
         self.assertIn('item(t("menu.delete_folder")', body)
         self.assertLess(body.index("if (entry.is_dir)"), body.index('t("menu.tags")'))
+
+
+def _spa_function(js: str, name: str) -> str:
+    """Return the source of ``function <name>(…) { … }`` by brace matching."""
+    start = js.index(f"function {name}(")
+    index = js.index("{", start)
+    depth = 0
+    for offset in range(index, len(js)):
+        if js[offset] == "{":
+            depth += 1
+        elif js[offset] == "}":
+            depth -= 1
+            if depth == 0:
+                return js[start : offset + 1]
+    raise AssertionError(f"unbalanced braces in {name}")
+
+
+class SecretFlowSpaTest(unittest.TestCase):
+    """The SPA's secret flow: the desktop app approves, the text lands in a plain-text modal."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        """Read the SPA sources once."""
+        cls.js = (WEBUI_DIR / "app.js").read_text(encoding="utf-8")
+        cls.html = (WEBUI_DIR / "index.html").read_text(encoding="utf-8")
+
+    def test_a_click_asks_the_desktop_app(self) -> None:
+        """Opening a secret level asks the app; the browser never reads it on its own."""
+        body = _spa_function(self.js, "requestSecretDisplay")
+        self.assertIn('call("vault.request_open_secret"', body)
+        self.assertIn("result.handler === false", body)
+
+    def test_the_tab_waits_for_the_answer(self) -> None:
+        """The wait polls the quiet status method and reads only on ``shown``."""
+        body = _spa_function(self.js, "waitForSecretDisplay")
+        self.assertIn('call("vault.secret_status"', body)
+        self.assertIn('status === "shown"', body)
+        self.assertIn("readSecretInto(", body)
+
+    def test_both_secret_levels_take_the_same_route(self) -> None:
+        """`secret` and `secretfile` share one path in the file list."""
+        body = _spa_function(self.js, "openFile")
+        self.assertIn(
+            'entry.sensitivity === "secretfile" || entry.sensitivity === "secret"', body
+        )
+        self.assertIn("return requestSecretDisplay(entry.path)", body)
+
+    def test_the_approval_comes_before_the_read(self) -> None:
+        """In the no-desktop fallback the resolution must precede the read (it is the release)."""
+        body = _spa_function(self.js, "openApprovalModal")
+        self.assertLess(
+            body.index("vault.resolve_open_secret"), body.index("readSecretInto(")
+        )
+
+    def test_the_text_is_shown_as_plain_text(self) -> None:
+        """Whatever the approval releases is rendered as text with a copy button — never markdown."""
+        body = _spa_function(self.js, "showPlainModal")
+        self.assertIn("textContent", body)
+        self.assertIn('setAttribute("dir", "ltr")', body)
+        self.assertIn('t("viewer.copy")', body)
+
+    def test_the_old_native_handoff_is_gone(self) -> None:
+        """The desktop viewer is no longer opened from the web UI."""
+        self.assertNotIn("requestNative", self.js)
+        self.assertNotIn("openPlainViewer", self.js)
+
+    def test_the_context_menu_uses_the_same_route(self) -> None:
+        """Right-clicking a secret row goes through the same request, not the old viewer."""
+        body = _spa_function(self.js, "showContextMenu")
+        self.assertIn("requestSecretDisplay(entry.path)", body)
+        self.assertNotIn("requestNative", body)
+
+
+class RowActionsSpaTest(unittest.TestCase):
+    """Every listing offers rename *and* delete — the pair Max asked for, in every list."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        """Read the SPA sources once."""
+        cls.js = (WEBUI_DIR / "app.js").read_text(encoding="utf-8")
+        cls.html = (WEBUI_DIR / "index.html").read_text(encoding="utf-8")
+
+    def test_every_listing_renders_the_action_cell(self) -> None:
+        """Folder tree, notebook list, note list, tag listing and search hits alike."""
+        for builder in ("buildTreeRow", "renderFolderView", "renderSearchResults", "loadTag"):
+            body = _spa_function(self.js, builder)
+            self.assertIn("rowActions(", body, f"{builder} has no row actions")
+
+    def test_the_action_cell_carries_both_buttons(self) -> None:
+        """One cell, two buttons: rename and delete."""
+        body = _spa_function(self.js, "rowActions")
+        self.assertIn("rowRenameButton(ref)", body)
+        self.assertIn("rowDeleteButton(ref)", body)
+
+    def test_rename_uses_the_shared_modal_and_a_move(self) -> None:
+        """Rename is a real move through the shared name dialog (no browser prompt)."""
+        body = _spa_function(self.js, "renameEntry")
+        self.assertIn("askName(", body)
+        self.assertIn('op: "move"', body)
+        self.assertNotIn("window.prompt", body)
+
+    def test_a_hit_without_a_name_is_normalised(self) -> None:
+        """Search/tag hits carry ``logical_path`` only, so the cell normalises it once."""
+        body = _spa_function(self.js, "entryRef")
+        self.assertIn("entry.path || entry.logical_path", body)
+        self.assertIn("entry.name || String(path).split", body)
+
+    def test_the_note_head_offers_rename_beside_delete(self) -> None:
+        """The open note's own action row has both, like the desktop list menu."""
+        self.assertIn('id="btn-note-rename-top"', self.html)
+        self.assertIn('id="btn-note-delete-top"', self.html)
+        self.assertIn('$("#btn-note-rename-top")', self.js)
+
+    def test_the_click_row_and_the_menu_are_both_wired(self) -> None:
+        """A row navigates on click and offers its actions on right-click."""
+        body = _spa_function(self.js, "bindRowMenu")
+        self.assertIn("showContextMenu(", body)
+        menu = _spa_function(self.js, "showContextMenu")
+        self.assertIn('t("menu.rename")', menu)
+        self.assertIn('t("menu.delete")', menu)
 
 
 NODE_RENDER = r'''

@@ -38,6 +38,7 @@ from .index import Index
 from .meta import META_FILENAME, VaultMeta
 from .security import (
     LEVELS,
+    SECRET_LEVELS,
     SOURCE_MCP,
     SOURCE_UI,
     Policy,
@@ -87,6 +88,10 @@ class VaultSession:
         self._semantic_auto_provider: semantics.EmbeddingProvider | None = None
         self._semantic_resolved = False
         self._pending: dict[str, dict[str, Any]] = {}
+        #: Requests already answered, keyed by id — the web UI polls the one it is waiting on.
+        self._resolved: dict[str, dict[str, Any]] = {}
+        #: Paths an explicit approval released for display, with their expiry (ms). Cleared on lock.
+        self._grants: dict[str, int] = {}
         #: S3 sync manager (lock + mirror); created on unlock and when S3 is configured.
         self._sync_manager: Any | None = None
         #: Optional injected S3 client (tests/self-test); wins over boto3.
@@ -405,6 +410,10 @@ class VaultSession:
         if self._master_key is not None:
             wipe(self._master_key)
             self._master_key = None
+        # Nothing approved (and nothing asked for) while unlocked may outlive the lock.
+        self._pending.clear()
+        self._resolved.clear()
+        self._grants.clear()
         if self._fs is not None:
             self._fs.master_key = None
             self._fs = None
@@ -1670,18 +1679,35 @@ class VaultSession:
         return results
 
     # ------------------------------------------------------- secrets / UI handoff
+    #: How long an approved display stays readable (ms). The web UI reads the text right after
+    #: the user approves, and a reload or a second look must not ask again.
+    SECRET_GRANT_TTL_MS: int = 120_000
+    #: How many answered requests stay queryable (the web UI polls the one it is waiting on).
+    SECRET_HISTORY: int = 32
+
     def request_open_secret(
-        self, path: str, *, source: str = SOURCE_MCP, session: str | None = None
+        self,
+        path: str,
+        *,
+        source: str = SOURCE_MCP,
+        session: str | None = None,
+        origin: str = "",
     ) -> dict[str, Any]:
-        """Ask the UI to display a ``secretfile``; the agent never receives content.
+        """Ask the UI to display a ``secret``/``secretfile``; the caller never gets content.
+
+        ``origin`` names the transport that asked (``"web"`` for the browser). The desktop app
+        shows its permission dialog either way; what differs is what an approval does — the
+        browser reads the text back into the web UI, while an agent's approval opens the native
+        viewer (`VaultApplication._resolve_request`).
 
         Raises:
-            PermissionDenied: for any level other than ``secretfile``.
+            PermissionDenied: for any level other than a secret one, or for a source that may
+                not ask (see :meth:`Policy.can_request_open_secret`).
         """
         logical = normalize_vault_path(path)
         self._require_unlocked()
         row = self._require_index().require_file(logical)
-        if row["sensitivity"] != "secretfile" or not Policy.can_request_open_secret(
+        if row["sensitivity"] not in SECRET_LEVELS or not Policy.can_request_open_secret(
             row["sensitivity"], source
         ):
             self._emit_activity(
@@ -1697,6 +1723,9 @@ class VaultSession:
             "path": logical,
             "status": "pending",
             "created_at": now_ms(),
+            "source": source,
+            "session": session,
+            "origin": origin,
         }
         self._pending[request_id] = request
         if self.on_secret_request is not None:
@@ -1706,6 +1735,8 @@ class VaultSession:
                     request["status"] = outcome
             except Exception:  # noqa: BLE001 - UI callbacks must not break the agent path
                 pass
+            if request["status"] != "pending":
+                self._remember_request(request)
         self._log(
             source=source, tool="request_open_secret", target_path=logical,
             outcome="allow", session=session,
@@ -1713,16 +1744,72 @@ class VaultSession:
         return {"request_id": request_id, "status": request["status"]}
 
     def resolve_open_secret(self, request_id: str, *, approved: bool) -> dict[str, Any]:
-        """Resolve a pending secret-open request as ``shown`` or ``denied``."""
+        """Resolve a pending secret-open request as ``shown`` or ``denied``.
+
+        An approval also releases that one path for :data:`SECRET_GRANT_TTL_MS`: it is what lets
+        the web UI read the text it just asked for, and it is the only way a browser ever gets
+        it (`vault.read_secret` is refused without it).
+        """
         request = self._pending.pop(request_id, None)
         if request is None:
             raise NotFound("request_not_found", details={"request_id": request_id})
         request["status"] = "shown" if approved else "denied"
+        request["resolved_at"] = now_ms()
+        if approved:
+            self._grant_secret_display(str(request.get("path") or ""))
+        self._remember_request(request)
         return request
 
     def pending_requests(self) -> list[dict[str, Any]]:
         """Return the pending secret-open requests."""
         return list(self._pending.values())
+
+    def secret_request_status(self, request_id: str) -> dict[str, Any]:
+        """Return ``pending``/``shown``/``denied`` for one request (``unknown`` otherwise).
+
+        The web UI polls this while it waits for the desktop app's answer. Content never passes
+        through it, and it is a quiet call (no access-log row) — a poll every second would
+        otherwise bury the log.
+        """
+        pending = self._pending.get(request_id)
+        if pending is not None:
+            return {
+                "request_id": request_id,
+                "status": "pending",
+                "path": pending.get("path"),
+            }
+        resolved = self._resolved.get(request_id)
+        if resolved is not None:
+            return {
+                "request_id": request_id,
+                "status": resolved.get("status"),
+                "path": resolved.get("path"),
+            }
+        return {"request_id": request_id, "status": "unknown", "path": None}
+
+    # ------------------------------------------------- secret display approvals
+    def _grant_secret_display(self, path: str) -> None:
+        """Release one path for the short window after an explicit approval."""
+        if not path:
+            return
+        self._grants[normalize_vault_path(path)] = now_ms() + self.SECRET_GRANT_TTL_MS
+
+    def secret_display_granted(self, path: str) -> bool:
+        """Return True while ``path`` may be read on the strength of an approval."""
+        logical = normalize_vault_path(path)
+        expiry = self._grants.get(logical)
+        if expiry is None:
+            return False
+        if expiry < now_ms():
+            self._grants.pop(logical, None)
+            return False
+        return True
+
+    def _remember_request(self, request: dict[str, Any]) -> None:
+        """Keep the most recent answered requests queryable, oldest first."""
+        self._resolved[str(request.get("request_id"))] = request
+        while len(self._resolved) > self.SECRET_HISTORY:
+            self._resolved.pop(next(iter(self._resolved)))
 
     # ------------------------------------------------------------------------ log
     def access_log(self, **kw: Any) -> list[dict[str, Any]]:

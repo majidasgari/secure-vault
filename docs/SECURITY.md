@@ -55,8 +55,14 @@ vault home for known plaintext markers after writes.
 | level | see name (any source) | MCP read content | UI read content | content search | MCP request-open | UI viewer |
 |---|---|---|---|---|---|---|
 | `normal` | yes | **yes** | yes (no confirmation) | yes | yes | markdown/web preview |
-| `secret` | yes (+ label) | **no** | yes, **after a confirmation dialog + tray notification** | no | **no** | native viewer (via UI confirmation) |
-| `secretfile` | yes (+ label) | **no** | **native plain-text viewer only**, confirmation required | no | **yes** (`request_open_secret`; the user sees it, the agent never does) | native viewer |
+| `secret` | yes (+ label) | **no** | yes, **only after an explicit approval** | no | **no** | plain-text modal (web) / editor without preview (desktop) |
+| `secretfile` | yes (+ label) | **no** | **only after an explicit approval** | no | **yes** (`request_open_secret`; the user sees it, the agent never does) | native viewer (desktop) / plain-text modal (web) |
+
+An approval is the desktop app's own dialog (`SecretRequestDialog`) — or, when no desktop app is
+attached at all, the browser's equivalent modal. It releases that one path for a short window
+(`VaultSession.SECRET_GRANT_TTL_MS`) and is dropped on lock; until then `vault.read_secret` answers
+`requires_approval`. A request made from the web UI is answered **into the web UI** (the native
+viewer is not opened); a request made by an agent keeps the desktop viewer as the only surface.
 
 Additional rules enforced by the same module:
 
@@ -196,10 +202,13 @@ stream. Its security contract:
   in-process, and never stored, echoed or logged. Decrypted content stays in the
   daemon process except for the specific file the user opened; the browser holds it
   only in the DOM (never `localStorage`, never the URL) and clears it on lock.
-* **Same sensitivity rules as the desktop UI.** `secret` files get a confirmation
+* **Same sensitivity rules as the desktop UI.** `secret` files get an explicit approval
   and a disabled markdown preview; `secretfile` content is rendered as plain text
-  only and `GET /api/blob` returns `403` for it. `vault.read_secret` is not exposed
-  to the browser at all.
+  only and `GET /api/blob` returns `403` for it. `vault.read_secret` is UI-only and
+  answers `requires_approval` until that path has been approved, so a browser tab
+  cannot read a password file on its own: the SPA asks (`request_open_secret`), the
+  desktop app puts the question, and the release it returns lasts a couple of minutes
+  for that one path.
 * **Throttling.** Wrong passwords are answered with `401 bad_password`, a `deny`
   row in the access log (`source="web"`) and an in-memory per-IP delay (5 s ×
   failures past the fifth, capped at 60 s). The counter is never persisted.

@@ -66,6 +66,11 @@ class MainWindow(QMainWindow):
         self.browser.settings_requested.connect(controller.open_settings)
         self.browser.list.setContextMenuPolicy(Qt.CustomContextMenu)
         self.browser.list.customContextMenuRequested.connect(self._show_file_menu)
+        # The tree lists folders without their parent being open, so it needs the same
+        # rename/delete entry points; without a menu here they were unreachable exactly where
+        # a folder is easiest to find.
+        self.browser.tree.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.browser.tree.customContextMenuRequested.connect(self._show_tree_menu)
 
         self.browser_dock = QDockWidget(self)
         self.browser_dock.setObjectName("browser-dock")
@@ -387,6 +392,35 @@ class MainWindow(QMainWindow):
         menu.addAction(i18n.tr("menu.tags"), lambda: self.controller.edit_tags(path))
         menu.exec(self.browser.list.viewport().mapToGlobal(position))
 
+    def tree_menu(self, path: str) -> QMenu:
+        """Build the folder context menu for ``path`` (shown by `_show_tree_menu`).
+
+        Kept separate from the showing so a test can read the actions, and so the tree's menu
+        and the file list's menu can drift only on purpose.
+        """
+        menu = QMenu(self)
+        menu.addAction(i18n.tr("menu.open"), lambda: self.browser.set_folder(path))
+        menu.addAction(i18n.tr("menu.new_note"), lambda: self.controller.new_note())
+        menu.addSeparator()
+        menu.addAction(i18n.tr("menu.rename"), lambda: self._rename(path))
+        menu.addAction(
+            i18n.tr("menu.delete_folder"), lambda: self._delete(path, is_dir=True)
+        )
+        menu.addAction(
+            i18n.tr("menu.copy_path"),
+            lambda: QGuiApplication.clipboard().setText(path),
+        )
+        return menu
+
+    def _show_tree_menu(self, position: Any) -> None:
+        """Show the folder context menu for the tree (the file list has `_show_file_menu`)."""
+        index = self.browser.tree.indexAt(position)
+        node = index.internalPointer() if index.isValid() else None
+        path = str(getattr(node, "path", "") or "")
+        if not path:
+            return
+        self.tree_menu(path).exec(self.browser.tree.viewport().mapToGlobal(position))
+
     def _rename(self, path: str) -> None:
         """Prompt for a new name and rename the file."""
         name, ok = QInputDialog.getText(
@@ -398,12 +432,13 @@ class MainWindow(QMainWindow):
         destination = f"{parent}/{name.strip()}" if parent else f"/{name.strip()}"
         self.controller.rename_path(path, destination)
 
-    def _delete(self, path: str) -> None:
-        """Confirm and delete a path."""
+    def _delete(self, path: str, *, is_dir: bool = False) -> None:
+        """Confirm and delete a path (a folder's confirmation says it takes its contents)."""
+        message_key = "dialog.delete_folder_confirm" if is_dir else "dialog.delete_confirm"
         choice = QMessageBox.question(
             self,
             i18n.tr("dialog.delete"),
-            i18n.tr("dialog.delete_confirm", path=path),
+            i18n.tr(message_key, path=path),
             QMessageBox.Yes | QMessageBox.No,
             QMessageBox.No,
         )
