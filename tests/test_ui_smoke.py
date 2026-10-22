@@ -128,8 +128,11 @@ class UiSmokeTest(unittest.TestCase):
         tabs = window.right_tabs
         log_index = tabs.indexOf(window.log_panel)
 
-        # 1. Arrange it: a size of its own, the access-log tab, the preview on.
-        window.resize(900, 640)
+        # 1. Arrange it: a size of its own, the access-log tab, the preview on. The arranged size
+        # must fit the screen — `restoreGeometry` clamps to it, and offscreen runs get 800x600,
+        # which is narrower than this window's own minimum (the side dock has a floor).
+        available = window.screen().availableGeometry()
+        window.resize(min(900, available.width()), min(640, available.height()))
         tabs.setCurrentIndex(log_index)
         window.editor.set_preview_enabled(True)
         window.save_layout()

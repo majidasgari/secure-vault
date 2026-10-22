@@ -22,6 +22,7 @@ sys.path.insert(0, str(REPO / "src"))
 
 from vault.api.service import Service  # noqa: E402
 from vault.core.session import VaultSession  # noqa: E402
+from vault.util import now_ms  # noqa: E402
 from vault.web.server import WebServer  # noqa: E402
 
 PASSWORD = "ui-probe-pass-123"
@@ -67,6 +68,30 @@ _EDITOR_NOTE = (
     "\n"
     "![نقطه](vault:/attachments/dot.png)\n"
 )
+
+def _sample_png(width: int = 320, height: int = 200) -> bytes:
+    """A plain-colour PNG with a real size (stdlib only), so a thumbnail has something to scale."""
+    import struct
+    import zlib
+
+    raw = b"".join(b"\x00" + bytes([30, 60, 120] * width) for _ in range(height))
+
+    def chunk(tag: bytes, payload: bytes) -> bytes:
+        body = tag + payload
+        return (
+            struct.pack(">I", len(payload))
+            + body
+            + struct.pack(">I", zlib.crc32(body) & 0xFFFFFFFF)
+        )
+
+    header = struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)
+    return (
+        b"\x89PNG\r\n\x1a\n"
+        + chunk(b"IHDR", header)
+        + chunk(b"IDAT", zlib.compress(raw, 9))
+        + chunk(b"IEND", b"")
+    )
+
 
 #: 1×1 transparent PNG — enough to prove a `vault:` image becomes an object URL in the editor.
 _DOT_PNG = base64.b64decode(
@@ -116,6 +141,7 @@ def build_vault() -> VaultSession:
     session.write_file("/الف/ب/ج/ادیتور.md", _EDITOR_NOTE.encode())
     session.write_file("/الف/ب/ج/نمایش.md", _DISPLAY_NOTE.encode())
     session.write_file("/attachments/dot.png", _DOT_PNG)
+    session.write_file("/attachments/sample.png", _sample_png())
     session.write_file("/الف/ب/ج/د/عمیق.md", "deep\n".encode())
     session.set_tags("/الف/ب/ج/یادداشت.md", ["تست", "نمونه"])
     # enough tags that the sidebar preview has to defer to the tag browser
@@ -123,6 +149,17 @@ def build_vault() -> VaultSession:
         path = f"/شخصی/یادداشت {index}.md"
         session.write_file(path, f"# یادداشت {index}\n".encode())
         session.set_tags(path, [f"بتا{index}", "تست"])
+    # The learning cycle: one card three days late, one due tomorrow — the view has to split them.
+    now = now_ms()
+    note = session.index.require_file("الف/ب/ج/یادداشت.md")
+    session.index.learning_set(
+        int(note["id"]),
+        stage=1,
+        due=now - 3 * 86_400_000,
+        started=now - 9 * 86_400_000,
+        seen=now - 5 * 86_400_000,
+    )
+    session.learning_start("/الف/ب/ج/د/عمیق.md")
     return session
 
 

@@ -109,6 +109,39 @@ class SearchBehaviourTest(unittest.TestCase):
         names = self.session.search_filenames("md", path_prefix="other")
         self.assertEqual({h["logical_path"] for h in names}, {"other/b.md"})
 
+    def test_only_secret_returns_credential_files(self) -> None:
+        """``only_secret`` keeps just ``secretfile`` rows, and does so before the limit."""
+        for index in range(5):
+            self.session.write_file(f"token-{index}.md", b"x")
+        self.session.write_file("bank/token-card.md", b"x")
+        self.session.set_sensitivity("bank/token-card.md", "secretfile")
+        self.session.write_file("token-note.md", b"x")
+        self.session.set_sensitivity("token-note.md", "secret")
+        names = self.session.search_filenames("token", only_secret=True)
+        self.assertEqual([hit["logical_path"] for hit in names], ["bank/token-card.md"])
+        # The unfiltered search still sees every level.
+        self.assertGreater(len(self.session.search_filenames("token", limit=50)), 5)
+
+    def test_credential_fields_search_never_matches_a_password(self) -> None:
+        """``fields`` finds a credential by login/site/address, and never by its password."""
+        self.session.write_file("keep/bank.md", b"x")  # noise under a normal folder
+        body = (
+            "# حساب اصلی\nسایت: blubank.ir | دسته: بانک\n"
+            "نام کاربری: max.card.user@mail.com\nآدرس: https://blubank.ir/login\n"
+            "گذرواژه: very-secret-value-42\n"
+        ).encode("utf-8")
+        self.session.write_file("رمزها/بانک/بلوبانک/اصلی.md", body)
+        self.session.set_sensitivity("رمزها/بانک/بلوبانک/اصلی.md", "secretfile")
+        hits = self.session.search_filenames("max.card.user", fields=True)
+        self.assertEqual([h["logical_path"] for h in hits], ["رمزها/بانک/بلوبانک/اصلی.md"])
+        self.assertIn("username", hits[0]["fields"])
+        self.assertEqual(hits[0]["match"], "field")
+        # The value itself must not travel with the hit.
+        self.assertNotIn("max.card.user", repr(hits[0]))
+        # A password is not a searchable field, and a name-only search sees no fields at all.
+        self.assertEqual(self.session.search_filenames("very-secret-value-42", fields=True), [])
+        self.assertEqual(self.session.search_filenames("max.card.user"), [])
+
     def test_search_text_returns_line_and_offset(self) -> None:
         """Literal hits carry the 1-based line and character offset of the match."""
         body = "line one\nline two\nneedle here\n"

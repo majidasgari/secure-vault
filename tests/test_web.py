@@ -1475,3 +1475,187 @@ class PrintSpaTest(unittest.TestCase):
             for key in keys:
                 self.assertIn(key, data, f"{key} missing in {path.name}")
                 self.assertTrue(str(data[key]).strip(), f"{key} empty in {path.name}")
+
+
+class LearningTest(_WebTestCase):
+    """The learning cycle over the web API: the four actions and the due/upcoming split."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.session.mkdir("notes")
+        self.session.write_file("notes/card.md", b"# card\n")
+
+    def test_start_list_review_reset_stop(self) -> None:
+        """One round trip through every action, over ``/api/call``."""
+        self.unlock()
+        status, data = self.call("vault.learning_start", {"path": "/notes/card.md"})
+        self.assertEqual(status, 200, data)
+        self.assertEqual(data["result"]["stage"], 0)
+        self.assertEqual(data["result"]["total"], 6)
+
+        status, data = self.call("vault.learning_list")
+        self.assertEqual([card["path"] for card in data["result"]["upcoming"]],
+                         ["/notes/card.md"])
+        self.assertEqual(data["result"]["due"], [])
+        self.assertEqual(data["result"]["intervals"], [1, 2, 4, 8, 16, 32])
+
+        status, data = self.call("vault.learning_seen", {"path": "/notes/card.md"})
+        self.assertEqual(data["result"]["stage"], 1)
+
+        status, data = self.call("vault.learning_reset", {"path": "/notes/card.md"})
+        self.assertEqual(data["result"]["stage"], 0)
+
+        status, data = self.call("vault.learning_stop", {"path": "/notes/card.md"})
+        self.assertTrue(data["result"]["removed"])
+        self.assertEqual(self.call("vault.learning_list")[1]["result"]["upcoming"], [])
+
+    def test_a_folder_is_not_a_card(self) -> None:
+        """The cycle is for notes; a folder is refused, not silently accepted."""
+        self.unlock()
+        status, data = self.call("vault.learning_start", {"path": "/notes"})
+        self.assertEqual(data["error"]["code"], "BAD_REQUEST")
+
+    def test_reviewing_a_note_that_is_not_in_learning(self) -> None:
+        """Nothing to advance: NOT_FOUND rather than a quiet new card."""
+        self.unlock()
+        status, data = self.call("vault.learning_seen", {"path": "/notes/card.md"})
+        self.assertEqual(data["error"]["code"], "NOT_FOUND")
+
+    def test_a_locked_browser_reads_the_queue_but_cannot_review(self) -> None:
+        """The schedule is metadata (readable while locked); recording a review is a write."""
+        self.unlock()
+        self.call("vault.learning_start", {"path": "/notes/card.md"})
+        self.session.lock()
+        status, data = self.call("vault.learning_list")
+        self.assertEqual(status, 200, data)
+        self.assertEqual(len(data["result"]["upcoming"]), 1)
+        status, data = self.call("vault.learning_seen", {"path": "/notes/card.md"})
+        self.assertEqual(data["error"]["code"], "VAULT_LOCKED")
+
+
+class LearningSpaTest(unittest.TestCase):
+    """The SPA's learning surface: one sidebar entry, one hash route, the card and its actions."""
+
+    def setUp(self) -> None:
+        self.js = (WEBUI_DIR / "app.js").read_text(encoding="utf-8")
+        self.html = (WEBUI_DIR / "index.html").read_text(encoding="utf-8")
+
+    def _function(self, name: str) -> str:
+        """Return the source of ``function <name>(…​) { … }`` by brace matching."""
+        start = self.js.index(f"function {name}(")
+        index = self.js.index("{", start)
+        depth = 0
+        for offset in range(index, len(self.js)):
+            if self.js[offset] == "{":
+                depth += 1
+            elif self.js[offset] == "}":
+                depth -= 1
+                if depth == 0:
+                    return self.js[start : offset + 1]
+        raise AssertionError(f"unbalanced braces in {name}")
+
+    def test_the_sidebar_carries_one_entry_and_a_count(self) -> None:
+        """A destination of its own, with the number of cards waiting today."""
+        self.assertIn('id="btn-learn"', self.html)
+        self.assertIn('id="learn-count"', self.html)
+        self.assertIn("renderLearnBadge()", self._function("refreshLearning"))
+
+    def test_the_view_is_a_hash_route(self) -> None:
+        """Back/Forward and a reload return to the cycle, like every other destination."""
+        self.assertIn('hash.indexOf("#/learn")', self._function("applyRoute"))
+        self.assertIn('window.location.hash = "#/learn"', self._function("navigateLearn"))
+
+    def test_the_card_starts_hidden_and_renders_the_note(self) -> None:
+        """A flashcard, not a page: the text is behind «نمایش متن» and is the note's own render."""
+        show = self._function("showLearnCard")
+        self.assertIn("body.hidden = true", show)
+        self.assertIn('t("learn.secret_note")', show)
+        load = self._function("loadLearnBody")
+        for marker in ("renderMarkdown(", "hydrateCodeBlocks(", "hydrateImages("):
+            self.assertIn(marker, load)
+
+    def test_the_four_actions_are_wired(self) -> None:
+        """Reveal, review, restart, leave — each one a handler, none a dead button."""
+        for selector, handler in (
+            ("#btn-learn-reveal", "toggleReveal"),
+            ("#btn-learn-seen", "markLearnSeen"),
+            ("#btn-learn-reset", "resetLearnCard"),
+            ("#btn-learn-stop", "stopLearnCard"),
+        ):
+            self.assertIn(f'"{selector}"', self.js)
+            self.assertIn(f"function {handler}(", self.js)
+
+    def test_reset_and_stop_ask_before_they_act(self) -> None:
+        """A mis-click must not restart or drop a schedule."""
+        self.assertIn('confirmDialog(t("learn.reset_confirm")', self._function("resetLearnCard"))
+        self.assertIn('confirmDialog(t("learn.stop_confirm")', self._function("stopLearnCard"))
+
+    def test_the_note_offers_the_cycle_and_names_its_state(self) -> None:
+        """One button on the note head: add it, or open the cycle it is already in."""
+        self.assertIn('id="btn-note-learn-top"', self.html)
+        body = self._function("renderNoteView")
+        self.assertIn('t("learn.in_progress")', body)
+        self.assertIn('t("learn.start")', body)
+        self.assertIn("toggleNoteLearning", self.js)
+
+    def test_a_reviewed_card_gives_way_to_the_next_one(self) -> None:
+        """Reviewing with more cards waiting shows the next card, not an empty pane."""
+        body = self._function("markLearnSeen")
+        self.assertIn("vault.learning_seen", body)
+        self.assertIn("showLearnCard(due[0])", body)
+
+    def test_the_learning_labels_exist_in_every_language(self) -> None:
+        """Every label the page asks for is translated — no ‹learn.*› leaks into the UI."""
+        used = set(re.findall(r't\("(learn\.[a-z_]+)"', self.js)) | set(
+            re.findall(r'data-i18n="(learn\.[a-z_]+)"', self.html)
+        )
+        self.assertTrue(used)
+        for path in sorted(I18N_DIR.glob("*.json")):
+            data = json.loads(path.read_text(encoding="utf-8"))
+            missing = sorted(key for key in used if key not in data)
+            self.assertEqual(missing, [], f"{path.name}: {missing}")
+
+
+class ImagePreviewSpaTest(unittest.TestCase):
+    """Pointing at an image row shows the picture (attachment names are hashes)."""
+
+    def setUp(self) -> None:
+        self.js = (WEBUI_DIR / "app.js").read_text(encoding="utf-8")
+        self.css = (WEBUI_DIR / "styles.css").read_text(encoding="utf-8")
+
+    def _function(self, name: str) -> str:
+        start = self.js.index(f"function {name}(")
+        index = self.js.index("{", start)
+        depth = 0
+        for offset in range(index, len(self.js)):
+            if self.js[offset] == "{":
+                depth += 1
+            elif self.js[offset] == "}":
+                depth -= 1
+                if depth == 0:
+                    return self.js[start : offset + 1]
+        raise AssertionError(f"unbalanced braces in {name}")
+
+    def test_every_listing_attaches_the_preview(self) -> None:
+        """The folder view, the tag page and the search results all carry the thumbnail."""
+        self.assertIn("attachImagePreview(li, entry)", self._function("renderFolderView"))
+        self.assertIn("attachImagePreview(li, entryRef(entry))", self.js)
+
+    def test_only_pictures_get_one_and_only_after_a_dwell(self) -> None:
+        """A note row previews nothing, and sweeping the pointer does not read every picture."""
+        attach = self._function("attachImagePreview")
+        self.assertIn("entry.is_dir", attach)
+        self.assertIn("isImagePath(entry.path)", attach)
+        self.assertIn("setTimeout", self._function("scheduleImagePreview"))
+
+    def test_the_blob_is_cached_and_bounded(self) -> None:
+        """One read per path, a small cache, object URLs revoked when they age out."""
+        self.assertIn("/api/blob?path=", self._function("showImagePreview"))
+        self.assertIn("URL.revokeObjectURL", self._function("rememberPreview"))
+        self.assertIn("PREVIEW_LIMIT", self.js)
+
+    def test_the_preview_never_outlives_its_view(self) -> None:
+        """Changing view or locking the vault must not leave a picture on screen."""
+        self.assertIn("hideImagePreview();", self._function("showView"))
+        self.assertIn("hideImagePreview();", self._function("handleLockEvent"))
+        self.assertIn("#image-preview", self.css)

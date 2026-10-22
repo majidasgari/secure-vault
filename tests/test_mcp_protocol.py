@@ -19,6 +19,10 @@ EXPECTED_TOOLS = {
     "set_sensitivity",
     "set_emoji",
     "emoji_palette",
+    "learning_list",
+    "learning_start",
+    "learning_seen",
+    "learning_stop",
     "search_filenames",
     "search_text",
     "search_semantic",
@@ -130,6 +134,20 @@ class MCPProtocolTest(unittest.TestCase):
             "secret",
             by_name["set_sensitivity"]["inputSchema"]["properties"]["level"]["enum"],
         )
+
+    def test_learning_tools_round_trip(self) -> None:
+        """The learning cycle is reachable from the bridge: start, list, review, stop."""
+        started = self._structured("learning_start", {"path": "/notes/hello.md"})
+        self.assertEqual(started["path"], "/notes/hello.md")
+        self.assertEqual(started["stage"], 0)
+        listing = self._structured("learning_list")
+        self.assertEqual([card["path"] for card in listing["upcoming"]], ["/notes/hello.md"])
+        self.assertEqual(listing["due"], [])
+        self.assertEqual(listing["intervals"], [1, 2, 4, 8, 16, 32])
+        seen = self._structured("learning_seen", {"path": "/notes/hello.md"})
+        self.assertEqual(seen["stage"], 1)
+        self.assertTrue(self._structured("learning_stop", {"path": "/notes/hello.md"})["removed"])
+        self.assertEqual(self._structured("learning_list")["upcoming"], [])
 
     def test_tools_call_success_shapes(self) -> None:
         """The documented tools return the documented payload shapes."""

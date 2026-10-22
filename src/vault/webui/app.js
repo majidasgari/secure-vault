@@ -46,7 +46,12 @@
     busy: 0,
     lastActivity: Date.now(),
     selectedIndex: -1,
-    editing: false
+    editing: false,
+    //: The learning cycle: `{due: [...], upcoming: [...], count}` from the last listing, plus the
+    //: card currently on screen. Kept here so the note's own button can name the state.
+    learning: { due: [], upcoming: [], count: 0 },
+    learnCard: null,
+    learnBodyPath: null
   };
 
   //: The visual (Milkdown/Crepe) editor: its vendored module is ~4 MB, so it is imported the first
@@ -369,6 +374,9 @@
       loadFont();
       return loadIndex();
     }).then(function () {
+      //: The sidebar badge has to be right before the first route paints.
+      return refreshLearning().catch(function () { return null; });
+    }).then(function () {
       connectEvents();
       startAutoLock();
       applyRoute();
@@ -585,6 +593,7 @@
         li.appendChild(rowActions(entry));
         li.title = t("menu.open");
         li.addEventListener("click", function () { navigateNote(entry.logical_path || entry.path); });
+        attachImagePreview(li, entryRef(entry));
         bindRowMenu(li, entry);
         list.appendChild(li);
       });
@@ -629,6 +638,10 @@
 
   function applyRoute() {
     var hash = window.location.hash || "#/folder/";
+    if (hash.indexOf("#/learn") === 0) {
+      loadLearn();
+      return;
+    }
     if (hash.indexOf("#/note/") === 0) {
       var path = decodeURIComponent(hash.slice("#/note".length)).replace(/^\/+/, "/");
       openFile({ path: path, name: path.split("/").pop() });
@@ -646,6 +659,226 @@
       return;
     }
     loadFolder("/");
+  }
+
+  /* ------------------------------------------------------------- learning */
+  //: The cycle is 1, 2, 4, 8, 16 and 32 days. The server owns that arithmetic and hands back the
+  //: due/upcoming split; this page shows the cards and records the reviews.
+  var DAY_MS = 24 * 60 * 60 * 1000;
+
+  function refreshLearning() {
+    return call("vault.learning_list", {}).then(function (result) {
+      state.learning = result || { due: [], upcoming: [], count: 0 };
+      renderLearnBadge();
+      return state.learning;
+    });
+  }
+
+  function renderLearnBadge() {
+    //: One number, the cards waiting today: the sidebar entry is a reminder, not a report.
+    var count = (state.learning && state.learning.due) ? state.learning.due.length : 0;
+    var badge = $("#learn-count");
+    if (badge) {
+      badge.textContent = count ? String(count) : "";
+      badge.hidden = !count;
+    }
+  }
+
+  function learningCardFor(path) {
+    var data = state.learning || {};
+    var all = (data.due || []).concat(data.upcoming || []);
+    for (var i = 0; i < all.length; i += 1) {
+      if (all[i].path === path) { return all[i]; }
+    }
+    return null;
+  }
+
+  function navigateLearn() {
+    closeMobilePanels();
+    window.location.hash = "#/learn";
+  }
+
+  function loadLearn() {
+    return refreshLearning().then(function () {
+      renderLearn();
+      showView("learn");
+      refreshStatusBar();
+    }).catch(function (err) { showToast(errorText(err), "error"); });
+  }
+
+  function formatDay(ms) {
+    try {
+      var date = new Date(Number(ms));
+      var pad = function (n) { return (n < 10 ? "0" : "") + n; };
+      return pad(date.getFullYear()) + "-" + pad(date.getMonth() + 1) + "-" + pad(date.getDate());
+    } catch (e) { return ""; }
+  }
+
+  function dueLabel(card) {
+    if (card.overdue_days) { return t("learn.overdue", { days: card.overdue_days }); }
+    return t("learn.due_today");
+  }
+
+  function nextLabel(card) {
+    var days = Math.ceil((Number(card.due) - Date.now()) / DAY_MS);
+    if (days <= 0) { return t("learn.due_today"); }
+    return t("learn.in_days", { days: days });
+  }
+
+  function renderLearn() {
+    var data = state.learning || { due: [], upcoming: [] };
+    var due = data.due || [];
+    var upcoming = data.upcoming || [];
+    $("#learn-status").textContent = due.length
+      ? t("learn.status_due", { count: due.length })
+      : t("learn.status_empty");
+    renderLearnRows($("#learn-due"), due, true);
+    renderLearnRows($("#learn-upcoming"), upcoming, false);
+    $("#learn-due-empty").hidden = due.length > 0;
+    $("#learn-upcoming-empty").hidden = upcoming.length > 0;
+    $("#learn-card").hidden = !state.learnCard;
+  }
+
+  function renderLearnRows(list, cards, isDue) {
+    if (!list) { return; }
+    list.textContent = "";
+    cards.forEach(function (card) {
+      var li = document.createElement("li");
+      li.className = "note-row";
+      li.dir = "auto";
+      var name = document.createElement("span");
+      name.textContent = (card.emoji ? card.emoji + " " : "") + card.name;
+      var meta = document.createElement("span");
+      meta.className = "meta";
+      meta.textContent = isDue ? dueLabel(card) : nextLabel(card);
+      li.appendChild(name);
+      li.appendChild(meta);
+      li.addEventListener("click", function () { showLearnCard(card); });
+      list.appendChild(li);
+    });
+  }
+
+  function showLearnCard(card) {
+    if (!card) { hideLearnCard(); return; }
+    state.learnCard = card;
+    state.learnBodyPath = null;
+    $("#learn-card").hidden = false;
+    var title = $("#learn-card-title");
+    title.textContent = (card.emoji ? card.emoji + " " : "") + card.name;
+    title.setAttribute("dir", blockDir(card.name || ""));
+    $("#learn-card-meta").textContent =
+      t("learn.stage_of", { stage: card.stage + 1, total: card.total }) + " · " + dueLabel(card);
+    var body = $("#learn-card-body");
+    body.textContent = "";
+    body.hidden = true;
+    revealLabel(false);
+    var reveal = $("#btn-learn-reveal");
+    if (card.sensitivity !== "normal") {
+      //: A gated file's text never renders here without the main app's approval, and asking for
+      //: it mid-review would bury the card under a dialog — say so and leave the card in place.
+      if (reveal) { reveal.hidden = true; }
+      body.textContent = t("learn.secret_note");
+      body.hidden = false;
+      return;
+    }
+    if (reveal) { reveal.hidden = false; }
+    loadLearnBody(card.path);
+  }
+
+  function hideLearnCard() {
+    state.learnCard = null;
+    state.learnBodyPath = null;
+    var box = $("#learn-card");
+    if (box) { box.hidden = true; }
+  }
+
+  function loadLearnBody(path) {
+    return call("vault.read_file", { path: path }).then(function (result) {
+      //: The answer may land after another card was picked; only the current one may paint.
+      if (!state.learnCard || state.learnCard.path !== path) { return; }
+      var body = $("#learn-card-body");
+      var content = result.content || "";
+      body.innerHTML = renderMarkdown(content, path);
+      body.dir = hasRtlChars(content) ? "rtl" : "ltr";
+      hydrateCodeBlocks(body);
+      hydrateImages(body);
+      state.learnBodyPath = path;
+    }).catch(function (err) { showToast(errorText(err), "error"); });
+  }
+
+  function revealLabel(showing) {
+    var button = $("#btn-learn-reveal");
+    if (!button) { return; }
+    button.textContent = t(showing ? "learn.hide" : "learn.reveal");
+    button.setAttribute("aria-pressed", showing ? "true" : "false");
+  }
+
+  function toggleReveal() {
+    var body = $("#learn-card-body");
+    if (!body || !state.learnCard || state.learnCard.sensitivity !== "normal") { return; }
+    if (body.hidden && state.learnBodyPath !== state.learnCard.path) {
+      loadLearnBody(state.learnCard.path);
+    }
+    var showing = body.hidden;
+    body.hidden = !showing;
+    revealLabel(showing);
+  }
+
+  function learnAction(method, path) {
+    return call(method, { path: path }).then(function (result) {
+      return refreshLearning().then(function () { return result; });
+    });
+  }
+
+  function markLearnSeen() {
+    var card = state.learnCard;
+    if (!card) { return; }
+    learnAction("vault.learning_seen", card.path).then(function (result) {
+      if (result && result.completed) {
+        showToast(t("learn.done_toast"), "ok");
+      } else {
+        showToast(t("learn.seen_toast", { date: formatDay(result && result.due) }), "ok");
+      }
+      //: The card just left today's queue, so the next one takes its place.
+      var due = (state.learning && state.learning.due) || [];
+      if (due.length) { showLearnCard(due[0]); } else { hideLearnCard(); }
+      renderLearn();
+    }).catch(function (err) { showToast(errorText(err), "error"); });
+  }
+
+  function resetLearnCard() {
+    var card = state.learnCard;
+    if (!card) { return; }
+    confirmDialog(t("learn.reset_confirm"), t("learn.reset")).then(function (ok) {
+      if (!ok) { return; }
+      learnAction("vault.learning_reset", card.path).then(function (result) {
+        showToast(t("learn.reset_toast", { date: formatDay(result && result.due) }), "ok");
+        showLearnCard(learningCardFor(card.path) || card);
+        renderLearn();
+      }).catch(function (err) { showToast(errorText(err), "error"); });
+    });
+  }
+
+  function stopLearnCard() {
+    var card = state.learnCard;
+    if (!card) { return; }
+    confirmDialog(t("learn.stop_confirm"), t("learn.stop")).then(function (ok) {
+      if (!ok) { return; }
+      learnAction("vault.learning_stop", card.path).then(function () {
+        showToast(t("learn.stopped_toast"), "ok");
+        hideLearnCard();
+        renderLearn();
+      }).catch(function (err) { showToast(errorText(err), "error"); });
+    });
+  }
+
+  function toggleNoteLearning() {
+    if (!state.file) { return; }
+    if (learningCardFor(state.file.path)) { navigateLearn(); return; }
+    learnAction("vault.learning_start", state.file.path).then(function () {
+      renderNoteView();
+      showToast(t("learn.added"), "ok");
+    }).catch(function (err) { showToast(errorText(err), "error"); });
   }
 
   /* ------------------------------------------------------------- browsing */
@@ -854,6 +1087,7 @@
       }
       li.appendChild(rowActions(entry));
       li.addEventListener("click", function () { navigateNote(entry.path); });
+      attachImagePreview(li, entry);
       notes.appendChild(li);
     });
   }
@@ -1019,12 +1253,91 @@
     try { return new Date(Number(ms)).toLocaleString(); } catch (e) { return ""; }
   }
 
+  /* ------------------------------------------------------- image previews */
+  //: Attachments are hash-named, so the name says nothing about the picture. Pointing at a row
+  //: shows the picture itself: one blob read per path, a small cache of object URLs, nothing
+  //: written anywhere. Clicking still opens the picture in the note pane, as before.
+  var PREVIEW_LIMIT = 24;
+  var previewCache = {};
+  var previewOrder = [];
+  var previewNode = null;
+  var previewTimer = null;
+
+  function previewElement() {
+    if (previewNode) { return previewNode; }
+    previewNode = document.createElement("img");
+    previewNode.id = "image-preview";
+    previewNode.alt = "";
+    previewNode.hidden = true;
+    document.body.appendChild(previewNode);
+    return previewNode;
+  }
+
+  function attachImagePreview(li, entry) {
+    if (!entry || entry.is_dir || !isImagePath(entry.path)) { return; }
+    li.addEventListener("mouseenter", function () { scheduleImagePreview(li, entry.path); });
+    li.addEventListener("mouseleave", hideImagePreview);
+  }
+
+  function scheduleImagePreview(li, path) {
+    //: A short delay: sweeping the pointer across a folder must not read twenty pictures.
+    hideImagePreview();
+    previewTimer = window.setTimeout(function () { showImagePreview(li, path); }, 160);
+  }
+
+  function showImagePreview(li, path) {
+    if (previewCache[path]) { placeImagePreview(li, previewCache[path]); return; }
+    request("GET", "/api/blob?path=" + encodeURIComponent(path), { raw: true }).then(function (r) {
+      if (!r.ok || !r.response) { return null; }
+      return r.response.blob().then(function (blob) {
+        var url = URL.createObjectURL(blob);
+        rememberPreview(path, url);
+        return url;
+      });
+    }).then(function (url) {
+      if (url) { placeImagePreview(li, url); }
+    }).catch(function () { /* an unreadable or gated picture simply has no thumbnail */ });
+  }
+
+  function rememberPreview(path, url) {
+    previewCache[path] = url;
+    previewOrder.push(path);
+    while (previewOrder.length > PREVIEW_LIMIT) {
+      var old = previewOrder.shift();
+      if (old !== path && previewCache[old]) {
+        URL.revokeObjectURL(previewCache[old]);
+        delete previewCache[old];
+      }
+    }
+  }
+
+  function placeImagePreview(li, url) {
+    if (!li.isConnected) { return; }
+    var node = previewElement();
+    var box = li.getBoundingClientRect();
+    var width = Math.min(240, window.innerWidth - 24);
+    var budget = 250;
+    var top = box.bottom + 6;
+    if (top + budget > window.innerHeight) { top = Math.max(8, box.top - budget - 6); }
+    node.src = url;
+    node.hidden = false;
+    node.style.maxWidth = width + "px";
+    node.style.top = top + "px";
+    node.style.left = Math.max(8, Math.min(box.left, window.innerWidth - width - 12)) + "px";
+  }
+
+  function hideImagePreview() {
+    if (previewTimer) { window.clearTimeout(previewTimer); previewTimer = null; }
+    if (previewNode) { previewNode.hidden = true; }
+  }
+
   /* ----------------------------------------------------------- view panes */
   function showView(name) {
     // Leaving the edit view tears the visual editor down: its DOM must not survive into the note
     // view (and a locked vault keeps nothing on screen).
     if (name !== "edit" && visual.on) { closeVisualEditor(); }
-    ["welcome", "folder", "note", "edit", "search", "tag"].forEach(function (view) {
+    hideImagePreview();
+    ["welcome", "folder", "note", "edit", "search", "tag", "learn"].forEach(function (view) {
       var el = $("#view-" + view);
       if (el) { el.hidden = view !== name; }
     });
@@ -1556,6 +1869,14 @@
       var button = $(selector);
       if (button) { button.hidden = !!state.file.binary; }
     });
+    //: One button, two meanings, named out loud: add this note to the learning cycle, or open the
+    //: cycle when it is already in it.
+    var learnButton = $("#btn-note-learn-top");
+    if (learnButton) {
+      var learnCard = learningCardFor(state.file.path);
+      learnButton.textContent = learnCard ? t("learn.in_progress") : t("learn.start");
+      learnButton.hidden = !!state.file.binary;
+    }
     //: Printing is offered only when there is something to print: a normal note's rendered
     //: markdown or a picture. A secret's text never reaches the web UI (it shows a notice and asks
     //: the desktop app for the file), and a non-image binary has nothing but a placeholder box.
@@ -2297,8 +2618,12 @@
       if (!name || name === entry.name) { return; }
       var parent = entry.path.split("/").slice(0, -1).join("/");
       var dst = (parent ? parent : "") + "/" + name;
-      return call("vault.file_ops", { op: "move", src: entry.path, dst: dst }).then(function () {
-        showToast(t("web.renamed"), "ok");
+      return call("vault.file_ops", { op: "move", src: entry.path, dst: dst }).then(function (result) {
+        //: A rename travels: the notes that linked to the file were rewritten server-side.
+        var updated = (result && result.references_updated) || 0;
+        showToast(
+          updated ? t("dialog.renamed_refs", { count: updated }) : t("web.renamed"), "ok"
+        );
         return Promise.all([loadIndex(), loadFolder(state.cwd)]).then(function () {
           // The open note followed its own rename — in the header *and* in the URL, or a reload
           // would ask for the path that no longer exists.
@@ -2311,6 +2636,9 @@
               } catch (e) { /* ignore */ }
             }
             renderNoteView();
+          } else if (updated && state.file) {
+            //: The open note may be one of the documents that got repointed — show the new text.
+            openFile({ path: state.file.path, name: state.file.name });
           }
         });
       });
@@ -2478,6 +2806,7 @@
       }
       li.addEventListener("click", function () { navigateNote("/" + path.replace(/^\//, "")); });
       bindRowMenu(li, hit);
+      attachImagePreview(li, entryRef(hit));
       list.appendChild(li);
     });
   }
@@ -2694,6 +3023,13 @@
       // the web UI has no log panel; the tray and the desktop app own that view
     } else if (event.event === "data_changed") {
       loadIndex();
+      //: The badge and the card list follow a write made anywhere (this tab, the desktop app, an
+      //: agent), which is what makes "I read them on the desktop" land here without a reload.
+      if ($("#view-learn") && !$("#view-learn").hidden) {
+        refreshLearning().then(renderLearn).catch(function () { return null; });
+      } else {
+        refreshLearning().catch(function () { return null; });
+      }
     } else if (event.event === "lock") {
       handleLockEvent();
     } else if (event.event === "unlock") {
@@ -2717,9 +3053,17 @@
     state.file = null;
     state.dirty = false;
     state.index = { tree: [], tags: [], counts: {} };
+    state.learning = { due: [], upcoming: [], count: 0 };
+    state.learnCard = null;
+    state.learnBodyPath = null;
     $("#folder-tree").textContent = "";
     $("#tag-chips").textContent = "";
     $("#global-results").textContent = "";
+    $("#learn-due").textContent = "";
+    $("#learn-upcoming").textContent = "";
+    $("#learn-card").hidden = true;
+    renderLearnBadge();
+    hideImagePreview();
     state.activity = [];
     var banner = $("#activity-banner");
     if (banner) { banner.hidden = true; }
@@ -2990,6 +3334,17 @@
     $("#btn-save").addEventListener("click", saveFile);
     $("#btn-cancel").addEventListener("click", cancelEdit);
     $("#btn-note-edit-top").addEventListener("click", enterEditMode);
+    var learnTop = $("#btn-note-learn-top");
+    if (learnTop) { learnTop.addEventListener("click", toggleNoteLearning); }
+    var learnOpen = $("#btn-learn");
+    if (learnOpen) { learnOpen.addEventListener("click", navigateLearn); }
+    $("#btn-learn-reveal").addEventListener("click", toggleReveal);
+    $("#btn-learn-seen").addEventListener("click", markLearnSeen);
+    $("#btn-learn-reset").addEventListener("click", resetLearnCard);
+    $("#btn-learn-stop").addEventListener("click", stopLearnCard);
+    $("#btn-learn-open").addEventListener("click", function () {
+      if (state.learnCard) { navigateNote(state.learnCard.path); }
+    });
     var renameTop = $("#btn-note-rename-top");
     if (renameTop) {
       renameTop.addEventListener("click", function () {

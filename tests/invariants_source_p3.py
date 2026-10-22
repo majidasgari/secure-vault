@@ -157,6 +157,55 @@ def t08_search_panel_three_kinds():
         assert "PROVIDER_UNAVAILABLE" in str(e) or getattr(e, "code", "") == "PROVIDER_UNAVAILABLE", e
 check("08 search panel exposes the three separate kinds", t08_search_panel_three_kinds)
 
+def t08b_credentials_only_filter():
+    """The filename tab can be narrowed to credential files, and one gesture opens once."""
+    from vault.ui.search_panel import _SearchTab
+
+    panel = window.search_panel
+    tab = panel._tabs["filename"]
+    assert tab.only_secret is not None, "the filename tab has no credential-only switch"
+    tab.only_secret.setChecked(True)
+    try:
+        res = panel.run_search("filename", "secret")
+        assert res and all(r["sensitivity"] == "secretfile" for r in res), res
+        assert any(r["logical_path"].lstrip("/") == "secrets/creds.md" for r in res), res
+    finally:
+        tab.only_secret.setChecked(False)
+    # A credential is found by its own fields (user name, site, address) — never by its password.
+    session.write_file(
+        "/رمزها/ایمیل/جیمیل.md",
+        "# جیمیل\nسایت: gmail.com | دسته: ایمیل\nنام کاربری: sample.user@gmail.com\n"
+        "گذرواژه: ZZ-top-secret-9\n".encode("utf-8"),
+    )
+    session.set_sensitivity("/رمزها/ایمیل/جیمیل.md", "secretfile")
+    tab.only_secret.setChecked(True)
+    try:
+        res = panel.run_search("filename", "sample.user")
+        hits = [r for r in res if r["logical_path"].lstrip("/") == "رمزها/ایمیل/جیمیل.md"]
+        assert hits, f"a user name did not find its credential: {res}"
+        assert "username" in hits[0]["fields"], hits[0]
+        assert "ZZ-top-secret-9" not in repr(res), "a password travelled with the results"
+        texts = [tab.list.item(i).text() for i in range(tab.list.count())]
+        assert any("نام کاربری" in text for text in texts), texts
+        assert panel.run_search("filename", "ZZ-top-secret-9") == [], "the password is searchable"
+    finally:
+        tab.only_secret.setChecked(False)
+
+    # Rows read name first, then the folder; a double-click must emit one activation.
+    lone = _SearchTab(only_secret_filter=True)
+    lone.set_results([{"logical_path": "/secrets/creds.md", "sensitivity": "secretfile"}])
+    text = lone.list.item(0).text()
+    assert text.startswith("creds.md"), text
+    assert "/secrets" in text, text
+    assert lone.secret_only() is False, "the filter is on by default"
+    opened = []
+    lone.activated.connect(opened.append)
+    item = lone.list.item(0)
+    lone._on_activated(item)
+    lone._on_activated(item)  # what a double-click delivers: activated + doubleClicked
+    assert opened == ["/secrets/creds.md"], opened
+check("08b filename search filters to credential files and opens once", t08b_credentials_only_filter)
+
 def t09_lock_returns_to_unlock():
     app.lock()
     assert session.is_locked, "controller lock() did not lock the session"

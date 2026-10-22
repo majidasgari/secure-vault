@@ -382,6 +382,15 @@ input[type="checkbox"] { min-height: auto; width: 18px; height: 18px; }
   flex: 1 1 0; min-height: 36px; font-size: 0.88rem; padding: 4px 8px;
 }
 .panel-left { gap: 10px; }
+/* The learning entry is a destination of its own, not a sibling of the two create buttons. */
+.learn-open {
+  display: flex; align-items: center; gap: 8px;
+  width: 100%; min-height: 36px; font-size: 0.9rem;
+}
+.learn-open .learn-count {
+  margin-inline-start: auto; background: var(--accent); color: var(--bg);
+  border-radius: 999px; padding: 0 8px; font-size: 0.75rem; line-height: 1.6;
+}
 .panel-left .panel-head { gap: 6px; }
 .panel-left .tree { flex: 1 1 auto; overflow: auto; min-height: 0; }
 .panel-left .tags {
@@ -605,6 +614,12 @@ input[type="checkbox"] { min-height: auto; width: 18px; height: 18px; }
 }
 
 /* rows that open something: pointer cursor + hover, in every list */
+/* A thumbnail of the picture under the pointer: attachment names are hashes. */
+#image-preview {
+  position: fixed; z-index: 60; max-height: 240px;
+  border: 1px solid var(--border); border-radius: 8px; background: var(--panel);
+  box-shadow: 0 10px 26px rgba(0, 0, 0, 0.35); pointer-events: none;
+}
 .notes-list li, #tag-results li, .results li { cursor: pointer; }
 .notes-list li:not(.note-row), #tag-results li { display: flex; align-items: center; gap: 8px; }
 .notes-list li:hover, #tag-results li:hover { background: var(--panel2); }

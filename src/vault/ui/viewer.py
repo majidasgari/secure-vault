@@ -358,29 +358,42 @@ class SecretViewer(QDialog):
         self._timer.stop()
         super().hideEvent(event)
 
+    def _can_close(self) -> bool:
+        """Ask about unsaved edits once, for both the window's Close and Esc/cancel."""
+        if not self._dirty:
+            return True
+        choice = QMessageBox.question(
+            self,
+            i18n.tr("editor.unsaved_title"),
+            i18n.tr("editor.unsaved_text"),
+            QMessageBox.Save | QMessageBox.Discard | QMessageBox.Cancel,
+            QMessageBox.Save,
+        )
+        if choice == QMessageBox.Cancel:
+            return False
+        if choice == QMessageBox.Save:
+            return self.save()
+        return True
+
     def closeEvent(self, event: Any) -> None:
-        """Ask before closing with unsaved edits; stop countdown."""
-        if self._dirty:
-            choice = QMessageBox.question(
-                self,
-                i18n.tr("editor.unsaved_title"),
-                i18n.tr("editor.unsaved_text"),
-                QMessageBox.Save | QMessageBox.Discard | QMessageBox.Cancel,
-                QMessageBox.Save,
-            )
-            if choice == QMessageBox.Save:
-                if not self.save():
-                    event.ignore()
-                    return
-            elif choice == QMessageBox.Cancel:
-                event.ignore()
-                return
+        """Ask before closing with unsaved edits; stop countdown.
+
+        The event is accepted here directly instead of going through ``QDialog.closeEvent``:
+        that one calls ``reject()``, and a ``reject()`` that closed the window recursed until the
+        close was *ignored* — the Close button did nothing at all.
+        """
+        if not self._can_close():
+            event.ignore()
+            return
         self._timer.stop()
-        super().closeEvent(event)
+        event.accept()
 
     def reject(self) -> None:
-        """Esc or dialog cancel triggers close with the unsaved guard."""
-        self.close()
+        """Esc or the dialog's cancel: the same guard, then hide (never by calling close())."""
+        if not self._can_close():
+            return
+        self._timer.stop()
+        super().reject()
 
     # ------------------------------------------------------------------ buttons
     def _on_clicked(self, button: Any) -> None:

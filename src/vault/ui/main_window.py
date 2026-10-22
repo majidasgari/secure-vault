@@ -19,6 +19,7 @@ from PySide6.QtWidgets import (
 from . import bidi, i18n, image_view
 from .browser import BrowserPanel
 from .editor import EditorPanel
+from .learning_panel import LearningPanel
 from .log_panel import LogPanel
 from .search_panel import SearchPanel
 
@@ -55,6 +56,7 @@ class MainWindow(QMainWindow):
         self.editor.open_text_editor.connect(controller.open_in_text_editor)
         self.setCentralWidget(self.editor)
 
+        self.right_tabs = QTabWidget(self)
         self.browser = BrowserPanel(controller, self)
         self.browser.file_activated.connect(self.open_file)
         self.browser.folder_selected.connect(self._on_folder_selected)
@@ -72,18 +74,16 @@ class MainWindow(QMainWindow):
         self.browser.tree.setContextMenuPolicy(Qt.CustomContextMenu)
         self.browser.tree.customContextMenuRequested.connect(self._show_tree_menu)
 
-        self.browser_dock = QDockWidget(self)
-        self.browser_dock.setObjectName("browser-dock")
-        self.browser_dock.setWidget(self.browser)
-        self.addDockWidget(Qt.LeftDockWidgetArea, self.browser_dock)
-
-        self.right_tabs = QTabWidget(self)
         self.log_panel = LogPanel(controller.dispatch_ui, self.right_tabs)
         self.search_panel = SearchPanel(controller.dispatch_ui, self.right_tabs)
         self.search_panel.result_activated.connect(self.open_file)
-        # Search comes first: it is the everyday action, while the access log is a diagnostic
-        # view. That also makes search the dock's default tab.
+        self.learning_panel = LearningPanel(controller.dispatch_ui, self.right_tabs)
+        self.learning_panel.open_requested.connect(self.open_file)
+        # One dock, four tabs: the browser first (the everyday pane), then search, the learning
+        # cards and last the access log — the diagnostic view you go looking for sits at the end.
+        self.right_tabs.addTab(self.browser, "")
         self.right_tabs.addTab(self.search_panel, "")
+        self.right_tabs.addTab(self.learning_panel, "")
         self.right_tabs.addTab(self.log_panel, "")
         self.right_dock = QDockWidget(self)
         self.right_dock.setObjectName("right-dock")
@@ -194,15 +194,13 @@ class MainWindow(QMainWindow):
 
         view_menu = self.menuBar().addMenu("")
         self._menus["view"] = view_menu
-        add(view_menu, "browser_dock", None,
-            lambda checked: self.browser_dock.setVisible(checked), checkable=True)
-        self.actions["browser_dock"].setChecked(True)
+        add(view_menu, "browser_dock", None, self.show_browser)
         add(view_menu, "right_dock", None,
             lambda checked: self.right_dock.setVisible(checked), checkable=True)
         self.actions["right_dock"].setChecked(True)
-        # Closing a dock with its own ✕ must leave the menu check telling the truth.
-        self.browser_dock.visibilityChanged.connect(lambda _visible: self._sync_dock_actions())
+        # Closing the dock with its own ✕ must leave the menu check telling the truth.
         self.right_dock.visibilityChanged.connect(lambda _visible: self._sync_dock_actions())
+        add(view_menu, "learning", None, self.show_learning)
         add(view_menu, "preview", None,
             lambda checked: self.editor.set_preview_enabled(checked), checkable=True)
         # The preview is off unless the user asked for it; the check follows the restored wish.
@@ -230,7 +228,6 @@ class MainWindow(QMainWindow):
         Read from ``isHidden()``, never from ``isVisible()``: hiding the whole window (to the
         tray, or on lock) makes every dock invisible without the user having closed anything.
         """
-        self.actions["browser_dock"].setChecked(not self.browser_dock.isHidden())
         self.actions["right_dock"].setChecked(not self.right_dock.isHidden())
 
     def _on_preview_changed(self, enabled: bool) -> None:
@@ -334,6 +331,46 @@ class MainWindow(QMainWindow):
         except Exception:  # noqa: BLE001 - persistence is best effort
             pass
 
+    # ---------------------------------------------------------------- learning
+    def learning_card(self, path: str) -> dict | None:
+        """Return the learning card for ``path`` (None when the note is not in the cycle)."""
+        try:
+            listing = self.controller.dispatch_ui("vault.learning_list", {})
+        except Exception:  # noqa: BLE001 - a locked vault has no cycle to read
+            return None
+        for card in (listing.get("due") or []) + (listing.get("upcoming") or []):
+            if card.get("path") == path:
+                return card
+        return None
+
+    def _toggle_learning(self, path: str, in_cycle: bool) -> None:
+        """Add a note to its learning cycle, or show the cards when it is already in one."""
+        if in_cycle:
+            self.show_learning()
+            return
+        try:
+            self.controller.dispatch_ui("vault.learning_start", {"path": path})
+        except Exception as exc:  # noqa: BLE001 - report it, never crash a menu action
+            QMessageBox.warning(self, i18n.tr("learn.title"), str(exc))
+            return
+        self.learning_panel.refresh()
+        self.statusBar().showMessage(i18n.tr("learn.added"), 4000)
+
+    def _show_tab(self, widget: Any) -> None:
+        """Reveal the side dock on ``widget``'s tab (and keep the View menu check honest)."""
+        self.right_dock.setVisible(True)
+        self.actions["right_dock"].setChecked(True)
+        self.right_tabs.setCurrentWidget(widget)
+
+    def show_browser(self) -> None:
+        """Reveal the side dock on the browser tab (the tree, the file list and their notes)."""
+        self._show_tab(self.browser)
+
+    def show_learning(self) -> None:
+        """Reveal the side dock on the learning tab."""
+        self._show_tab(self.learning_panel)
+        self.learning_panel.refresh()
+
     def _on_save_requested(self, path: str, text: str) -> None:
         """Persist an editor save through the controller."""
         try:
@@ -390,6 +427,14 @@ class MainWindow(QMainWindow):
             )
         menu.addAction(i18n.tr("menu.emoji"), lambda: self.controller.edit_emoji(path))
         menu.addAction(i18n.tr("menu.tags"), lambda: self.controller.edit_tags(path))
+        # The learning cycle is reached from the note it belongs to, and from the View menu when
+        # no row is selected. A folder is never a card, so the action is not offered for one.
+        if not entry.get("is_dir"):
+            in_cycle = self.learning_card(path) is not None
+            menu.addAction(
+                i18n.tr("learn.in_progress" if in_cycle else "learn.start"),
+                lambda: self._toggle_learning(path, in_cycle),
+            )
         menu.exec(self.browser.list.viewport().mapToGlobal(position))
 
     def tree_menu(self, path: str) -> QMenu:
@@ -422,15 +467,29 @@ class MainWindow(QMainWindow):
         self.tree_menu(path).exec(self.browser.tree.viewport().mapToGlobal(position))
 
     def _rename(self, path: str) -> None:
-        """Prompt for a new name and rename the file."""
+        """Prompt for a new name and rename the file.
+
+        The current name is filled in: renaming a picture or an attachment (a hash-named file)
+        by retyping the whole name from an empty box was the wrong way round.
+        """
+        current = str(path).rstrip("/").rsplit("/", 1)[-1]
         name, ok = QInputDialog.getText(
-            self, i18n.tr("dialog.rename"), i18n.tr("dialog.rename_prompt")
+            self, i18n.tr("dialog.rename"), i18n.tr("dialog.rename_prompt"), text=current
         )
-        if not ok or not name.strip():
+        if not ok or not name.strip() or name.strip() == current:
             return
         parent = path.rsplit("/", 1)[0] if "/" in path.strip("/") else ""
         destination = f"{parent}/{name.strip()}" if parent else f"/{name.strip()}"
-        self.controller.rename_path(path, destination)
+        result = self.controller.rename_path(path, destination)
+        if not result:
+            return
+        # The open note follows its own rename, and the notes that linked to the file were
+        # rewritten by the vault itself — say how many, or the change looks like it did nothing.
+        if self._current_path == path:
+            self.set_current_path(destination)
+        updated = int(result.get("references_updated") or 0)
+        if updated:
+            self.statusBar().showMessage(i18n.tr("dialog.renamed_refs", count=updated), 6000)
 
     def _delete(self, path: str, *, is_dir: bool = False) -> None:
         """Confirm and delete a path (a folder's confirmation says it takes its contents)."""
@@ -457,7 +516,6 @@ class MainWindow(QMainWindow):
             "right_tab": int(self.right_tabs.currentIndex()),
             # The docks' *own* shown/hidden flag: `isHidden()` is False while the whole window
             # is hidden to the tray, which is when this is usually written.
-            "browser_dock": not self.browser_dock.isHidden(),
             "right_dock": not self.right_dock.isHidden(),
         }
         ratio = self.editor.split_ratio()
@@ -494,7 +552,7 @@ class MainWindow(QMainWindow):
             restored = True
         # ``restoreState`` restores positions and sizes but not whether a dock is closed, so the
         # two flags are applied here (and the View menu is re-synced from the real state).
-        for key, dock in (("browser_dock", self.browser_dock), ("right_dock", self.right_dock)):
+        for key, dock in (("right_dock", self.right_dock),):
             visible = saved.get(key)
             if isinstance(visible, bool) and visible != (not dock.isHidden()):
                 dock.setVisible(visible)
@@ -535,10 +593,11 @@ class MainWindow(QMainWindow):
     def retranslate(self) -> None:
         """Re-apply translated strings to menus, docks and status bar."""
         self.setWindowTitle(i18n.tr("app.title"))
-        self.browser_dock.setWindowTitle(i18n.tr("browser.title"))
         self.right_dock.setWindowTitle(i18n.tr("right.title"))
-        self.right_tabs.setTabText(0, i18n.tr("log.tab"))
+        self.right_tabs.setTabText(0, i18n.tr("browser.title"))
         self.right_tabs.setTabText(1, i18n.tr("search.tab"))
+        self.right_tabs.setTabText(2, i18n.tr("learn.title"))
+        self.right_tabs.setTabText(3, i18n.tr("log.tab"))
         self._menus["file"].setTitle(i18n.tr("menu.file"))
         self._menus["edit"].setTitle(i18n.tr("menu.edit"))
         self._menus["view"].setTitle(i18n.tr("menu.view"))
@@ -555,6 +614,7 @@ class MainWindow(QMainWindow):
             "find": "menu.find",
             "browser_dock": "menu.browser_dock",
             "right_dock": "menu.right_dock",
+            "learning": "learn.title",
             "preview": "menu.preview",
             "settings": "menu.settings",
             "verify": "menu.verify",

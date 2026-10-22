@@ -538,10 +538,12 @@ class Service:
         dst_raw = params.get("dst")
         dst = normalize_vault_path(dst_raw) if isinstance(dst_raw, str) else None
         recursive = bool(params.get("recursive", False))
+        references = 0
         if op == "move":
             if dst is None:
                 raise BadRequest("missing_param", details={"param": "dst"})
-            self.session.move(src, dst, source=role)
+            moved = self.session.move(src, dst, source=role)
+            references = int(moved.get("references_updated") or 0)
             affected = 1
         elif op == "copy":
             if dst is None:
@@ -561,6 +563,8 @@ class Service:
             "src": _api_path(src),
             "dst": _api_path(dst) if dst is not None else None,
             "affected": affected,
+            #: How many notes were rewritten to point at the new name (a rename travels).
+            "references_updated": references,
         }
 
     def _h_set_sensitivity(self, params: dict, role: str, session_id: str) -> dict:
@@ -594,6 +598,26 @@ class Service:
     def _h_emoji_palette(self, params: dict, role: str, session_id: str) -> dict:
         """Return the built-in emoji palette (grouped; ``group`` is an i18n key)."""
         return {"groups": emoji_mod.palette()}
+
+    def _h_learning_list(self, params: dict, role: str, session_id: str) -> dict:
+        """Return the learning cards due now (plus any missed) and the ones ahead."""
+        return self.session.learning_list()
+
+    def _h_learning_start(self, params: dict, role: str, session_id: str) -> dict:
+        logical = normalize_vault_path(self._text(self._require(params, "path"), param="path"))
+        return self.session.learning_start(logical, source=role)
+
+    def _h_learning_seen(self, params: dict, role: str, session_id: str) -> dict:
+        logical = normalize_vault_path(self._text(self._require(params, "path"), param="path"))
+        return self.session.learning_seen(logical, source=role)
+
+    def _h_learning_reset(self, params: dict, role: str, session_id: str) -> dict:
+        logical = normalize_vault_path(self._text(self._require(params, "path"), param="path"))
+        return self.session.learning_reset(logical, source=role)
+
+    def _h_learning_stop(self, params: dict, role: str, session_id: str) -> dict:
+        logical = normalize_vault_path(self._text(self._require(params, "path"), param="path"))
+        return self.session.learning_stop(logical, source=role)
 
     def _h_folder_note(self, params: dict, role: str, session_id: str) -> dict:
         logical = normalize_vault_path(self._text(self._require(params, "path"), param="path"))
@@ -710,8 +734,15 @@ class Service:
     def _h_search_filenames(self, params: dict, role: str, session_id: str) -> dict:
         query = self._text(self._require(params, "query"), param="query")
         limit = int(params.get("limit", 50))
+        # Field search reads the metadata of every credential entry, so it stays a UI-only
+        # affordance: an agent gets the name-only answer even if it asks for more.
         results = self.session.search_filenames(
-            query, limit=limit, path_prefix=self._prefix(params), source=role
+            query,
+            limit=limit,
+            path_prefix=self._prefix(params),
+            only_secret=bool(params.get("only_secret")),
+            fields=bool(params.get("fields")) and role == SOURCE_UI,
+            source=role,
         )
         return {"query": query, "count": len(results), "results": results}
 
@@ -1103,6 +1134,11 @@ class Service:
         "vault.set_tags": (_h_set_tags, _BOTH),
         "vault.set_emoji": (_h_set_emoji, _BOTH),
         "vault.emoji_palette": (_h_emoji_palette, _BOTH),
+        "vault.learning_list": (_h_learning_list, _BOTH),
+        "vault.learning_start": (_h_learning_start, _BOTH),
+        "vault.learning_seen": (_h_learning_seen, _BOTH),
+        "vault.learning_reset": (_h_learning_reset, _BOTH),
+        "vault.learning_stop": (_h_learning_stop, _BOTH),
         "vault.folder_note": (_h_folder_note, _BOTH),
         "vault.set_folder_note": (_h_set_folder_note, _BOTH),
         "vault.file_note": (_h_file_note, _BOTH),

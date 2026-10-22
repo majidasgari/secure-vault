@@ -271,6 +271,37 @@ _TOOL_SPECS: list[dict[str, Any]] = [
         _forward("vault.emoji_palette"),
     ),
     _tool(
+        "learning_list",
+        "List the notes in the learning cycle: the cards due now (including any the user missed) "
+        "and the ones ahead. Metadata only (paths, levels, stage, due date).",
+        {},
+        [],
+        _forward("vault.learning_list"),
+    ),
+    _tool(
+        "learning_start",
+        "Put a note into the learning cycle (it comes back as a card after 1, 2, 4, 8, 16 and 32 "
+        "days). Idempotent: a note already in learning keeps its schedule.",
+        {"path": {"type": "string"}},
+        ["path"],
+        _forward("vault.learning_start"),
+    ),
+    _tool(
+        "learning_seen",
+        "Record that the user reviewed a learning card: it moves to the next interval, and the "
+        "sixth review finishes the cycle. Use it when the user says they read the due cards.",
+        {"path": {"type": "string"}},
+        ["path"],
+        _forward("vault.learning_seen"),
+    ),
+    _tool(
+        "learning_stop",
+        "Take a note out of the learning cycle.",
+        {"path": {"type": "string"}},
+        ["path"],
+        _forward("vault.learning_stop"),
+    ),
+    _tool(
         "digest",
         "One compact overview of a folder or file: its note plus, for each child, name, "
         "size, sensitivity, tags, note and (normal files) the first line. Use instead of "

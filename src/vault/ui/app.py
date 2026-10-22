@@ -1466,16 +1466,17 @@ class VaultApplication(QObject):
         self.last_import_error = message
         QMessageBox.warning(self.window, i18n.tr("menu.import"), message)
 
-    def rename_path(self, src: str, dst: str) -> None:
-        """Move/rename a path."""
+    def rename_path(self, src: str, dst: str) -> dict:
+        """Move/rename a path; the result carries how many notes were repointed."""
         try:
-            self.dispatch_ui(
+            result = self.dispatch_ui(
                 "vault.file_ops", {"op": "move", "src": self._api(src), "dst": self._api(dst)}
             )
         except VaultError as exc:
             QMessageBox.warning(self.window, i18n.tr("app.title"), error_message(exc))
-            return
+            return {}
         self.hub.notify()
+        return dict(result or {})
 
     def delete_path(self, path: str) -> None:
         """Delete a path recursively."""

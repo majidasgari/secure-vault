@@ -78,6 +78,11 @@
           <button id="btn-new-note-side" type="button" data-i18n="web.new_note"></button>
           <button id="btn-new-folder" type="button" data-i18n="web.new_folder"></button>
         </div>
+        <button id="btn-learn" type="button" class="learn-open">
+          <span aria-hidden="true">🎓</span>
+          <span data-i18n="learn.title"></span>
+          <span id="learn-count" class="learn-count" hidden></span>
+        </button>
         <div class="panel-section">
           <h3 class="section-title" data-i18n="web.tree_heading"></h3>
           <ul id="folder-tree" class="tree"></ul>
@@ -107,6 +112,7 @@
           <div class="note-head">
             <nav id="note-crumbs" class="breadcrumbs"></nav>
             <div class="note-actions">
+              <button id="btn-note-learn-top" type="button" data-i18n="learn.start"></button>
               <button id="btn-note-edit-top" type="button" class="primary" data-i18n="menu.edit"></button>
               <button id="btn-note-history-top" type="button" data-i18n="editor.history"></button>
               <button id="btn-note-raw-top" type="button" data-i18n="web.raw"></button>
@@ -170,6 +176,31 @@
           <h2 id="search-heading"></h2>
           <p id="search-status" class="muted"></p>
           <ul id="global-results" class="results"></ul>
+        </div>
+
+        <div id="view-learn" class="view-pane" hidden>
+          <nav class="breadcrumbs"><span class="crumb current" data-i18n="learn.title"></span></nav>
+          <p id="learn-status" class="muted"></p>
+          <div id="learn-card" hidden>
+            <div class="note-head">
+              <h1 id="learn-card-title" dir="auto"></h1>
+              <div class="note-actions">
+                <button id="btn-learn-reveal" type="button" data-i18n="learn.reveal"></button>
+                <button id="btn-learn-seen" type="button" class="primary" data-i18n="learn.seen"></button>
+                <button id="btn-learn-reset" type="button" data-i18n="learn.reset"></button>
+                <button id="btn-learn-open" type="button" data-i18n="learn.open_note"></button>
+                <button id="btn-learn-stop" type="button" class="danger" data-i18n="learn.stop"></button>
+              </div>
+            </div>
+            <p id="learn-card-meta" class="meta-line"></p>
+            <article id="learn-card-body" class="preview" dir="auto" hidden></article>
+          </div>
+          <h2 data-i18n="learn.due_heading"></h2>
+          <p id="learn-due-empty" class="muted" data-i18n="learn.empty_due"></p>
+          <ul id="learn-due" class="notes-list"></ul>
+          <h2 data-i18n="learn.upcoming_heading"></h2>
+          <p id="learn-upcoming-empty" class="muted" data-i18n="learn.empty_upcoming"></p>
+          <ul id="learn-upcoming" class="notes-list"></ul>
         </div>
 
       </section>

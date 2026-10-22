@@ -541,7 +541,10 @@ class EditorPanel(QWidget):
             old.page().deleteLater()
         except Exception:  # noqa: BLE001 - defensive
             pass
-        old.setParent(None)
+        # Keep the dead view as a child and hide it: `setParent(None)` made it a top-level
+        # window, and a parentless web view is destroyed *after* the engine's profile at exit —
+        # which is the QtWebEngine teardown segfault. As a child, the deletion is ordered.
+        old.hide()
         old.deleteLater()
         self.preview = browser
         self.preview_kind = "text"
@@ -610,8 +613,10 @@ class EditorPanel(QWidget):
             bar.setValue(int(bar.minimum() + fraction * span))
         else:
             try:
+                #: The document can still be about:blank here (a preview that is loading,
+                #: or one being replaced) — touching ``documentElement`` then threw.
                 self.preview.page().runJavaScript(
-                    "window.scrollTo(0, %f * Math.max(0, "
+                    "if(document.documentElement)window.scrollTo(0, %f * Math.max(0, "
                     "document.documentElement.scrollHeight - window.innerHeight));"
                     % fraction
                 )
@@ -636,7 +641,8 @@ class EditorPanel(QWidget):
             return
         try:
             self.preview.page().runJavaScript(
-                "(function(){var h=document.documentElement.scrollHeight-"
+                "(function(){if(!document.documentElement)return 0;"
+                "var h=document.documentElement.scrollHeight-"
                 "window.innerHeight;return h>0?window.scrollY/h:0;})()",
                 self._on_preview_fraction,
             )

@@ -18,13 +18,14 @@ from pathlib import Path
 from typing import Any
 
 from PySide6.QtCore import Qt, QTimer
-from PySide6.QtWidgets import QApplication, QMessageBox
+from PySide6.QtWidgets import QApplication, QDialogButtonBox, QMessageBox
 
 from . import __version__
 from .config import DEFAULT_VAULT_HOME, runtime_dir, user_config
 from .core import fingerprint, semantics
 from .core.session import VaultSession
 from .errors import Unauthorized
+from .util import now_ms
 from .ui import editor as editor_module
 from .ui import i18n, image_view, theme, viewer
 from .ui.app import VaultApplication
@@ -315,6 +316,68 @@ def run_self_test(
     checks["open_secret_image"] = bool(controller.open_path("/secrets/scan.png"))
     checks["secret_image_shown"] = image_view.last_path == "/secrets/scan.png"
 
+    # Selecting a picture in the file list shows a thumbnail of it: attachment names are hashes,
+    # so the name alone says nothing. Selecting a note must take the thumbnail away again.
+    window.browser.set_folder("/notes")
+    qapp.processEvents()
+    rows = window.browser.list_model.entries()
+    shot_row = next(
+        (i for i, entry in enumerate(rows) if str(entry.get("path", "")).endswith("shot.png")), -1
+    )
+    checks["preview_row_present"] = shot_row >= 0
+    if shot_row >= 0:
+        window.browser.list.setCurrentIndex(window.browser.proxy.index(shot_row, 0))
+        qapp.processEvents()
+        thumb = window.browser.preview.pixmap()
+        checks["image_preview_thumbnail"] = bool(thumb and not thumb.isNull() and thumb.width() > 0)
+        checks["image_preview_visible"] = not window.browser.preview.isHidden()
+    hello_row = next(
+        (i for i, entry in enumerate(rows) if str(entry.get("path", "")).endswith("hello.md")), -1
+    )
+    if hello_row >= 0:
+        window.browser.list.setCurrentIndex(window.browser.proxy.index(hello_row, 0))
+        qapp.processEvents()
+        checks["image_preview_hidden_for_note"] = window.browser.preview.isHidden()
+
+    # The secret viewer's Close has to close: it used to recurse through QDialog.closeEvent's
+    # own reject() and end up *ignored*, which read as a dead button.
+    probe_viewer = viewer.open_viewer(window, "/secrets/key.txt", "body\n")
+    qapp.processEvents()
+    close_button = probe_viewer.buttons.button(QDialogButtonBox.Close)
+    checks["viewer_close_button_present"] = close_button is not None
+    if close_button is not None:
+        close_button.click()
+        qapp.processEvents()
+        checks["viewer_close_hides"] = not probe_viewer.isVisible()
+    probe_viewer.deleteLater()
+
+    # One gesture, one open: a platform that delivers a double-click as two activations must not
+    # give two confirm dialogs and two viewers for the same row.
+    emitted: list[str] = []
+    window.browser.file_activated.connect(emitted.append)
+    window.browser.set_folder("/notes")
+    qapp.processEvents()
+    note_rows = window.browser.list_model.entries()
+    hello_row = next(
+        (i for i, entry in enumerate(note_rows) if str(entry.get("path", "")).endswith("hello.md")),
+        -1,
+    )
+    if hello_row >= 0:
+        twice = window.browser.proxy.index(hello_row, 0)
+        window.browser._on_file_activated(twice)
+        window.browser._on_file_activated(twice)
+        qapp.processEvents()
+        checks["activate_once_per_gesture"] = emitted == ["/notes/hello.md"]
+    window.browser.file_activated.disconnect(emitted.append)
+
+    # A rename travels: the note that shows the picture is repointed by the vault itself.
+    session.write_file("notes/pic.md", b"![shot](vault:/notes/shot.png)\n")
+    renamed = controller.rename_path("/notes/shot.png", "/notes/shot-2.png")
+    checks["rename_reports_references"] = int(renamed.get("references_updated") or 0) == 1
+    checks["rename_repoints_note"] = bool(
+        "shot-2.png" in session.read_file("notes/pic.md").decode("utf-8")
+    )
+
     # Appearance: a forced dark theme repaints the widgets that carry their own colours.
     light_bg = theme.colors()["bg"]
     checks["theme_default"] = theme.preference()
@@ -353,9 +416,62 @@ def run_self_test(
     # user sets — geometry, dock state, active tab, preview, split — is written to ui.json so
     # the next start looks the way they left it instead of snapping back to a default.
     checks["search_tab_first"] = (
-        window.right_tabs.indexOf(window.search_panel) == 0
-        and window.right_tabs.indexOf(window.log_panel) == 1
+        window.right_tabs.indexOf(window.browser) == 0
+        and window.right_tabs.indexOf(window.search_panel) == 1
+        and window.right_tabs.indexOf(window.learning_panel) == 2
+        and window.right_tabs.indexOf(window.log_panel) == 3
     )
+    # The browser is a tab of the side dock now, not a dock of its own.
+    checks["browser_in_side_dock"] = window.right_tabs.widget(0) is window.browser
+    checks["no_browser_dock"] = not hasattr(window, "browser_dock")
+    window.right_dock.setVisible(False)
+    window.actions["browser_dock"].trigger()
+    qapp.processEvents()
+    checks["view_menu_browser_tab"] = (
+        not window.right_dock.isHidden()
+        and window.right_tabs.currentWidget() is window.browser
+    )
+
+    # The centre list is not a dead end: a double-click on a folder row walks into it, and the
+    # tree follows, because two panes naming different folders reads as a broken window.
+    window.browser.set_folder("/")
+    qapp.processEvents()
+    rows = window.browser.list_model.entries()
+    folder_row = next((i for i, entry in enumerate(rows) if entry.get("is_dir")), -1)
+    checks["folder_row_present"] = folder_row >= 0
+    if folder_row >= 0:
+        target = str(rows[folder_row]["path"])
+        window.browser._on_file_activated(window.browser.proxy.index(folder_row, 0))
+        qapp.processEvents()
+        checks["folder_double_click"] = window.browser.current_folder == target
+        node = window.browser.tree.currentIndex().internalPointer()
+        checks["folder_double_click_tree"] = bool(node is not None and node.path == target)
+        window.browser.set_folder("/")
+
+    # The learning cycle: the panel lists a card, marks it reviewed, and the row moves on.
+    panel = window.learning_panel
+    panel.refresh()
+    checks["learning_empty"] = panel.due_list.count() == 0 and panel.ahead_list.count() == 0
+    session.learning_start("notes/hello.md")
+    panel.refresh()
+    checks["learning_upcoming_row"] = panel.ahead_list.count() == 1
+    checks["learning_label"] = "hello.md" in panel.ahead_list.item(0).text()
+    hello_id = int(session.index.require_file("notes/hello.md")["id"])
+    session.index.learning_set(
+        hello_id, stage=1, due=now_ms() - 1000, started=now_ms(), seen=0
+    )
+    panel.refresh()
+    checks["learning_due_row"] = panel.due_list.count() == 1
+    panel.due_list.setCurrentRow(0)
+    checks["learning_actions_enabled"] = panel.seen_button.isEnabled()
+    panel.mark_seen()
+    qapp.processEvents()
+    checks["learning_seen_moves"] = (
+        panel.due_list.count() == 0 and panel.ahead_list.count() == 1
+    )
+    window._toggle_learning("/notes/hello.md", True)
+    checks["learning_menu_shows_tab"] = window.right_tabs.currentWidget() is panel
+    session.learning_stop("notes/hello.md")
     window.right_tabs.setCurrentIndex(window.right_tabs.indexOf(window.log_panel))
     window.save_layout()
     saved_layout = dict(controller.config.data.get("window") or {})
@@ -423,6 +539,11 @@ def run_self_test(
                        "image_suffix_no", "image_uses_web", "image_size",
                        "web_views_for_otp")
     )
+
+    # The preview falls back to a text browser when the engine cannot render headlessly, and the
+    # abandoned web view is removed with `deleteLater()`: a pending deletion left to the
+    # application teardown segfaults in QtWebEngine, so run the queue once while Qt is healthy.
+    qapp.processEvents()
 
     return SelfTestResult(
         home=vault_home,

@@ -1,7 +1,8 @@
 """The plaintext ``meta.sqlite`` metadata index (SPEC/01 §6).
 
-This DB deliberately contains only names, levels, tags and the append-only access log —
-never file content, folder-note text or FTS rows (the tests scan it for plaintext markers).
+This DB deliberately contains only names, levels, tags, path labels, the learning schedule and
+the append-only access log — never file content, folder-note text or FTS rows (the tests scan it
+for plaintext markers).
 """
 
 from __future__ import annotations
@@ -17,7 +18,7 @@ from ..errors import AlreadyExists, BadRequest, NotFound
 from ..util import atomic_write_bytes, normalize_logical_path, now_ms
 from .security import LEVELS
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS schema_meta(key TEXT PRIMARY KEY, value TEXT);
@@ -62,6 +63,14 @@ CREATE TABLE IF NOT EXISTS access_log(
   code TEXT, details TEXT, session TEXT
 );
 CREATE TABLE IF NOT EXISTS kv(key TEXT PRIMARY KEY, value TEXT);
+CREATE TABLE IF NOT EXISTS learning(
+  file_id INTEGER PRIMARY KEY REFERENCES files(id) ON DELETE CASCADE,
+  stage INTEGER NOT NULL DEFAULT 0,
+  due INTEGER NOT NULL,
+  started INTEGER NOT NULL,
+  seen INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_learning_due ON learning(due);
 """
 
 
@@ -459,6 +468,52 @@ class Index:
             "SELECT logical_path, emoji FROM files WHERE emoji IS NOT NULL AND emoji != ''"
         )
         return {str(r["logical_path"]): str(r["emoji"]) for r in cur.fetchall()}
+
+    # ------------------------------------------------------------------ learning
+    def learning_get(self, file_id: int) -> dict[str, Any] | None:
+        """Return the learning row for ``file_id`` (``None`` when the file is not in learning)."""
+        row = self._conn.execute(
+            "SELECT * FROM learning WHERE file_id=?", (int(file_id),)
+        ).fetchone()
+        return self._row(row)
+
+    def learning_set(
+        self, file_id: int, *, stage: int, due: int, started: int, seen: int
+    ) -> None:
+        """Insert or update the learning row of ``file_id``."""
+        self._conn.execute(
+            "INSERT INTO learning(file_id, stage, due, started, seen) VALUES(?,?,?,?,?) "
+            "ON CONFLICT(file_id) DO UPDATE SET stage=excluded.stage, due=excluded.due, "
+            "started=excluded.started, seen=excluded.seen",
+            (int(file_id), int(stage), int(due), int(started), int(seen)),
+        )
+        self._conn.commit()
+
+    def learning_delete(self, file_id: int) -> None:
+        """Drop ``file_id`` out of learning."""
+        self._conn.execute("DELETE FROM learning WHERE file_id=?", (int(file_id),))
+        self._conn.commit()
+
+    def learning_records(self) -> list[dict[str, Any]]:
+        """Return every learning card as the file row plus its ``stage``/``due``/``started``/``seen``.
+
+        One query, because a caller that lists cards needs the name, level and label of each —
+        and a per-card lookup would be N more round trips through the same connection.
+        """
+        cur = self._conn.execute(
+            "SELECT f.*, l.stage AS stage, l.due AS due, l.started AS started, l.seen AS seen "
+            "FROM learning l JOIN files f ON f.id=l.file_id WHERE f.is_dir=0 ORDER BY l.due"
+        )
+        return [dict(row) for row in cur.fetchall()]
+
+    def learning_record(self, file_id: int) -> dict[str, Any] | None:
+        """Return one card in the :meth:`learning_records` shape (or ``None``)."""
+        row = self._conn.execute(
+            "SELECT f.*, l.stage AS stage, l.due AS due, l.started AS started, l.seen AS seen "
+            "FROM learning l JOIN files f ON f.id=l.file_id WHERE l.file_id=?",
+            (int(file_id),),
+        ).fetchone()
+        return dict(row) if row is not None else None
 
     # ---------------------------------------------------------------------- tags
     def set_tags(self, logical_path: str, tags: list[str]) -> None:

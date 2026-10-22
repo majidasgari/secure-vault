@@ -149,6 +149,31 @@ class VaultTreeModel(QAbstractItemModel):
         self._root = _Node("/", "", None)
         self.endResetModel()
 
+    def index_for_path(self, path: str) -> QModelIndex:
+        """Return the index of the folder at ``path``, reading the parents it needs.
+
+        Children load lazily, so a folder the user reached from the file list (or one restored
+        from ``ui.json``) has no index until its parents are read. Returns an invalid index when
+        the folder is not in the tree — ``/`` included, since the root has no row.
+        """
+        wanted = "/" + str(path or "").strip("/")
+        if wanted == "/":
+            return QModelIndex()
+        index = QModelIndex()
+        prefix = ""
+        for part in [piece for piece in wanted.split("/") if piece]:
+            prefix = prefix + "/" + part
+            row = -1
+            for candidate in range(self.rowCount(index)):
+                node = self.index(candidate, 0, index).internalPointer()
+                if node is not None and node.path == prefix:
+                    row = candidate
+                    break
+            if row < 0:
+                return QModelIndex()
+            index = self.index(row, 0, index)
+        return index
+
     # -------------------------------------------------------------- Qt interface
     def index(self, row: int, column: int, parent: QModelIndex = QModelIndex()) -> QModelIndex:
         """Return the index of child ``(row, column)`` of ``parent``."""

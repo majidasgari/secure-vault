@@ -126,7 +126,7 @@ QT_QPA_PLATFORM=offscreen PYTHONPATH=src ./.venv/bin/python -m vault --self-test
 
 ## Quick tour
 
-* **Browser** (left dock): a tree of folders/files with a sensitivity label per entry and an
+* **Browser** (the side dock's first tab): a tree of folders/files with a sensitivity label per entry and an
   optional emoji in front of every folder/file name (a `files.emoji` column; the shared
   palette lives in `core/emoji.py`, and the desktop list, the web rows and the Android app
   all show it).
@@ -146,9 +146,9 @@ QT_QPA_PLATFORM=offscreen PYTHONPATH=src ./.venv/bin/python -m vault --self-test
   its fields call for — see [credentials and one-time codes](#credentials-and-one-time-codes).
 * **Picture viewer**: images open in a native viewer at every sensitivity level, never in
   the web view (`vault.read_file` can return bytes intact via `binary`).
-* **Search** (right dock): three separate searches — filenames, literal content
+* **Search** (side dock, second tab): three separate searches — filenames, literal content
   (FTS5) and semantic (opt-in) — never hybridized.
-* **Log panel** (right dock): the append-only access log; every agent call is there.
+* **Log panel** (side dock, last tab): the append-only access log; every agent call is there.
 * **Window arrangement**: whatever you set — geometry, which docks are open and how they are
   sized, the active right-dock tab, the source/preview split and the preview itself — is
   written to `ui.json` and restored on the next start (closing to the tray counts as setting it).
@@ -271,6 +271,17 @@ paper-white with dark text, long code lines wrap instead of being clipped and ta
 their header row — without that the note was silently cut off at the fold. The orientation is
 injected into the document as an `@page` rule, so `Ctrl+P` honours it too, and the choice is
 kept in `sessionStorage` (`docs/WEBUI.md` §3d).
+
+**Learning** turns a note into a flashcard. The note view's «افزودن به یادگیری» button puts it into a
+cycle of 1, 2, 4, 8, 16 and 32 days, and the sidebar's «یادگیری» entry lists what is due today (with
+how many days late anything missed is) plus what comes next. A card opens with its text hidden, shows
+the note rendered when asked, and carries «خوندم» (record the review, move to the next interval),
+«از اول» (restart the cycle) and «خروج از یادگیری». The sixth review finishes the cycle and the note
+leaves it. The schedule is plaintext metadata in `meta.sqlite` (the `learning` table, keyed by file
+id), so it syncs with everything else and the read-only phone client shows the same cards — the
+phone never writes, so a review is recorded on the desktop. An agent reaches the same cycle through
+`vault.learning_list`/`_start`/`_seen`/`_reset`/`_stop` (tools `learning_list`, `learning_start`,
+`learning_seen`, `learning_stop`).
 
 **You normally do not start it by hand.** The Qt app is the shell: after unlock it
 starts the same `WebServer` in-process on the same session (`web.enabled`, default

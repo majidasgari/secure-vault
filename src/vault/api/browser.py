@@ -29,7 +29,6 @@ The bridge never logs a password and never returns one to a caller that did not 
 
 from __future__ import annotations
 
-import contextlib
 import json
 import logging
 import os
@@ -38,7 +37,7 @@ import threading
 import time
 from collections import deque
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any
 
 from .. import __version__
 from ..config import runtime_dir as default_runtime_dir
@@ -51,6 +50,7 @@ from ..core.credentials import (
     match_score,
     normalize_host,
     parse_body,
+    quiet_scan,
     render_body,
     safe_name,
     set_field,
@@ -95,27 +95,6 @@ FILE_NOTE = (
     "ورود «{host}» که از مرورگر ذخیره شده — نام کاربری و گذرواژه. برای دیدن مقدار "
     "(کپی نام کاربری/گذرواژه) همین فایل را باز کن."
 )
-
-
-@contextlib.contextmanager
-def quiet_scan(session: Any) -> Iterator[None]:
-    """Silence the per-file audit rows of the bridge's bulk metadata scan.
-
-    Reading every credential file to build the index is internal bookkeeping: it must not write
-    one access-log row per entry (that is what the reveal is for) nor one activity event per
-    entry. Both flags are already the codebase's mechanism for exactly this (``_suppress_log``
-    is what :meth:`Service.dispatch` sets around its own single row); the reveal runs outside
-    this context and is always audited.
-    """
-    previous_log = bool(getattr(session, "_suppress_log", False))
-    previous_activity = bool(getattr(session, "_suppress_activity", False))
-    session._suppress_log = True
-    session._suppress_activity = True
-    try:
-        yield
-    finally:
-        session._suppress_log = previous_log
-        session._suppress_activity = previous_activity
 
 
 class BrowserBridge:

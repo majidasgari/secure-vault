@@ -45,12 +45,15 @@ def search_filenames(
     *,
     limit: int = 50,
     include_secret: bool = True,
+    only_secret: bool = False,
     path_prefix: str | None = None,
 ) -> list[dict[str, Any]]:
     """Search the whole logical path (names only), newest rows last.
 
     ``path_prefix`` restricts the search to a folder subtree, which keeps results from a
-    small folder from being crowded out by a huge one.
+    small folder from being crowded out by a huge one. ``only_secret`` keeps just the
+    ``secretfile`` rows (credential files), which is the only way to ask "find me that
+    password" without normal notes crowding out the hits.
 
     Raises:
         BadRequest: when the query is empty after normalization.
@@ -65,6 +68,8 @@ def search_filenames(
         level = row["sensitivity"]
         if not include_secret and level != "normal":
             continue
+        if only_secret and level != "secretfile":
+            continue
         if not semantics.path_under(str(row["logical_path"]), scope):
             continue
         name = normalize_fa(row["logical_path"])
@@ -72,6 +77,17 @@ def search_filenames(
             results.append(_result(row, "filename"))
     results.sort(key=lambda item: item["logical_path"])
     return results[: int(limit)]
+
+
+def field_result(row: dict[str, Any], fields: list[str]) -> dict[str, Any]:
+    """Build the result dict for a credential whose *fields* matched ``query``.
+
+    Only the field names travel with the hit — never the value that matched, so a search result
+    can be listed before anything is revealed.
+    """
+    out = _result(row, "field")
+    out["fields"] = list(fields)
+    return out
 
 
 def _snippet(body: str, normalized_query: str) -> str:
@@ -162,4 +178,4 @@ def search_semantic(
     return semantics.search(session, query, limit=limit, path_prefix=path_prefix)
 
 
-__all__ = ["SearchKind", "search_filenames", "search_text", "search_semantic"]
+__all__ = ["SearchKind", "field_result", "search_filenames", "search_text", "search_semantic"]

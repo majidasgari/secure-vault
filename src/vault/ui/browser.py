@@ -2,14 +2,16 @@
 
 from __future__ import annotations
 
+import time
 from typing import Any
 
 from PySide6.QtCore import QSortFilterProxyModel, Qt, QTimer, Signal
-from PySide6.QtGui import QAction
+from PySide6.QtGui import QAction, QPixmap
 from PySide6.QtWidgets import (
     QGroupBox,
     QHBoxLayout,
     QHeaderView,
+    QLabel,
     QLineEdit,
     QPlainTextEdit,
     QTableView,
@@ -19,7 +21,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from . import i18n
+from . import i18n, image_view
 from .models import VaultListModel, VaultTreeModel
 
 _NOTE_DEBOUNCE_MS = 1000
@@ -43,6 +45,9 @@ class BrowserPanel(QWidget):
         self._controller = controller
         self._current_folder = "/"
         self._loading_note = False
+        self._selecting = False
+        self._activated_path = ""
+        self._activated_at = 0.0
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -89,6 +94,15 @@ class BrowserPanel(QWidget):
         self.list.doubleClicked.connect(self._on_file_activated)
         layout.addWidget(self.list, 3)
 
+        # A thumbnail of the picture selected in the list: attachments are hash-named, so the
+        # name alone tells the user nothing about which picture it is.
+        self.preview = QLabel(self)
+        self.preview.setAlignment(Qt.AlignCenter)
+        self.preview.setMaximumHeight(200)
+        self.preview.hide()
+        layout.addWidget(self.preview, 0)
+        self._preview_path: str | None = None
+
         # One adaptive note box: it edits the selected item's note, whether that item is a
         # folder (selected in the tree or list) or a file.
         self.note_box = QGroupBox(self)
@@ -129,8 +143,35 @@ class BrowserPanel(QWidget):
         except Exception:  # noqa: BLE001 - a locked/absent folder shows empty
             entries = []
         self.list_model.set_entries(entries)
+        self._hide_preview()
         self._load_note()
+        # The list can navigate too (a double-click on a folder row), so the tree follows: two
+        # panes showing different folders read as a bug.
+        self.select_in_tree(self._current_folder)
         self.folder_selected.emit(self._current_folder)
+
+    def select_in_tree(self, path: str) -> None:
+        """Point the folder tree at ``path``, expanding the parents it needs."""
+        index = self.tree_model.index_for_path(path)
+        if not index.isValid():
+            return
+        chain = []
+        parent = index.parent()
+        while parent.isValid():
+            chain.append(parent)
+            parent = parent.parent()
+        for item in reversed(chain):
+            self.tree.expand(item)
+        if self.tree.currentIndex() == index:
+            return
+        # Guarded: changing the tree's selection emits ``selectionChanged``, which would call
+        # ``set_folder`` again for the folder we are already in.
+        self._selecting = True
+        try:
+            self.tree.setCurrentIndex(index)
+            self.tree.scrollTo(index)
+        finally:
+            self._selecting = False
 
     def refresh(self) -> None:
         """Reload the tree, the current folder and the note."""
@@ -139,6 +180,8 @@ class BrowserPanel(QWidget):
 
     def _on_tree_selection(self) -> None:
         """Load the folder for the selected tree item."""
+        if self._selecting:
+            return
         indexes = self.tree.selectionModel().selectedIndexes()
         if not indexes:
             return
@@ -148,11 +191,27 @@ class BrowserPanel(QWidget):
         self.set_folder(node.path)
 
     def _on_file_activated(self, index: Any) -> None:
-        """Emit the activated file path."""
+        """Open the activated row: a folder becomes the current folder, a file is shown.
+
+        The list shows folders as well as notes, so a double-click on one has to walk into it —
+        before this it was the only row in the pane that ignored the double-click.
+        """
         entry = self.list_model.entry_at(index)
-        if entry is None or entry.get("is_dir"):
+        if entry is None:
             return
-        self.file_activated.emit(str(entry.get("path", "")))
+        if entry.get("is_dir"):
+            self.set_folder(str(entry.get("path") or "/"))
+            return
+        path = str(entry.get("path", ""))
+        #: One gesture, one open. Some platforms deliver a double-click as two activations (KDE
+        #: turns on single-click activation, so `activated` and `doubleClicked` both arrive): a
+        #: secret file then asked twice and opened twice, and the second window sat exactly on
+        #: the first one — which is why closing one looked like the Close button doing nothing.
+        moment = time.monotonic()
+        if path == self._activated_path and moment - self._activated_at < 1.0:
+            return
+        self._activated_path, self._activated_at = path, moment
+        self.file_activated.emit(path)
 
     def _on_search(self, text: str) -> None:
         """Filter the file list by filename."""
@@ -217,6 +276,52 @@ class BrowserPanel(QWidget):
         else:
             self._note_target = ("file", str(entry.get("path") or ""))
         self._load_note()
+        self.update_image_preview(entry)
+
+    def update_image_preview(self, entry: dict | None) -> None:
+        """Show a thumbnail of the selected picture (nothing for anything else).
+
+        Only `normal` pictures are read here: a `secret`/`secretfile` image opens through the
+        native viewer, which asks first — a listing click must not be an approval.
+        """
+        entry = entry or {}
+        path = str(entry.get("path") or "")
+        is_picture = bool(
+            path and not entry.get("is_dir") and image_view.looks_like_image(path)
+        )
+        if not is_picture:
+            self._hide_preview()
+            return
+        if str(entry.get("sensitivity") or "normal") != "normal":
+            self.preview.setPixmap(QPixmap())
+            self.preview.setText(i18n.tr("browser.preview_locked"))
+            self.preview.show()
+            self._preview_path = None
+            return
+        if path == self._preview_path and not self.preview.pixmap().isNull():
+            self.preview.show()
+            return
+        try:
+            data = self._controller.read_bytes(path)
+        except Exception:  # noqa: BLE001 - unreadable picture: no preview, never an error
+            self._hide_preview()
+            return
+        pixmap = image_view.decode(data)
+        if pixmap is None:
+            self._hide_preview()
+            return
+        self.preview.setPixmap(
+            pixmap.scaled(240, 190, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        )
+        self.preview.setToolTip(path)
+        self.preview.show()
+        self._preview_path = path
+
+    def _hide_preview(self) -> None:
+        """Drop the thumbnail (a folder or a note was selected)."""
+        self._preview_path = None
+        self.preview.clear()
+        self.preview.hide()
 
     # ------------------------------------------------------------------ i18n
     def retranslate(self) -> None:

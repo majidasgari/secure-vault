@@ -17,12 +17,19 @@ Two rules this module exists to keep:
 
 from __future__ import annotations
 
+import contextlib
 import re
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Iterator
+
+from ..util import normalize_fa
 
 #: The vault folder holding the migrated credential entries.
 CREDENTIAL_ROOT = "رمزها"
+
+#: Fields a credential search may match, in the order a hit reports them. The password (and the
+#: OTP secret) are deliberately absent — a :class:`CredentialEntry` never even holds them.
+SEARCHABLE_FIELDS = ("title", "site", "category", "url", "username")
 
 #: Value written for an empty field.
 EMPTY_MARKERS = frozenset({"", "—", "-", "–", "n/a", "none", "null"})
@@ -358,6 +365,7 @@ class CredentialEntry:
     has_password: bool
     has_otp: bool
     hosts: tuple[str, ...] = ()
+    category: str = ""
 
     def to_dict(self, *, score: int = 0) -> dict[str, Any]:
         """Return the caller-facing (password-free) representation."""
@@ -451,6 +459,7 @@ class CredentialIndex:
                     has_password=parsed["has_password"],
                     has_otp=parsed["has_otp"],
                     hosts=tuple(parsed["hosts"]),
+                    category=parsed["category"],
                 )
             )
         entries.sort(key=lambda item: item.path)
@@ -480,6 +489,30 @@ class CredentialIndex:
         scored.sort(key=lambda item: (-item[0], not item[1].username, item[1].title.lower(), item[1].path))
         return [entry.to_dict(score=score) for score, entry in scored[: max(1, int(limit))]]
 
+    def search(self, query: str, *, limit: int = 50) -> list[dict[str, Any]]:
+        """Return ``[{"path", "fields"}]`` for entries whose *fields* match ``query``.
+
+        Only what a :class:`CredentialEntry` keeps is matched — a password can never be found
+        here, which is also why the caller gets field names and a path, never a value.
+        """
+        needle = normalize_fa(query)
+        tokens = [token for token in needle.split(" ") if token]
+        if not tokens:
+            return []
+        hits: list[dict[str, Any]] = []
+        for entry in self.entries():
+            matched = [
+                name
+                for name in SEARCHABLE_FIELDS
+                if (folded := normalize_fa(str(getattr(entry, name) or "")))
+                and (needle in folded or all(token in folded for token in tokens))
+            ]
+            if matched:
+                hits.append({"path": entry.path, "fields": matched})
+            if len(hits) >= max(1, int(limit)):
+                break
+        return hits
+
     def status(self) -> dict[str, Any]:
         """Return a small, honest description of the index state."""
         return {
@@ -499,6 +532,27 @@ def _stem(logical: str) -> str:
     """Return the file stem of a logical path."""
     name = logical.rsplit("/", 1)[-1]
     return name[:-3] if name.lower().endswith(".md") else name
+
+
+@contextlib.contextmanager
+def quiet_scan(session: Any) -> Iterator[None]:
+    """Silence the per-file audit rows of a bulk metadata scan.
+
+    Reading every credential file to build the index is internal bookkeeping: it must not write
+    one access-log row per entry (that is what the reveal is for) nor one activity event per
+    entry. Both flags are already the codebase's mechanism for exactly this (``_suppress_log``
+    is what :meth:`Service.dispatch` sets around its own single row); a reveal runs outside
+    this context and is always audited.
+    """
+    previous_log = bool(getattr(session, "_suppress_log", False))
+    previous_activity = bool(getattr(session, "_suppress_activity", False))
+    session._suppress_log = True
+    session._suppress_activity = True
+    try:
+        yield
+    finally:
+        session._suppress_log = previous_log
+        session._suppress_activity = previous_activity
 
 
 def _browser_source() -> str:
@@ -525,6 +579,7 @@ __all__ = [
     "parse_body",
     "registrable_domain",
     "render_body",
+    "quiet_scan",
     "safe_name",
     "set_field",
     "storable",

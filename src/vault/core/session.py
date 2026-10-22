@@ -11,6 +11,7 @@ from __future__ import annotations
 import base64
 import difflib
 import logging
+import re
 import threading
 import uuid
 from pathlib import Path
@@ -30,9 +31,11 @@ from ..errors import (
     VaultLocked,
 )
 from ..util import is_within, normalize_vault_path, now_ms, sha256_hex, wipe
+from . import credentials
 from . import search as search_mod
 from . import semantics
 from . import retention
+from . import learning
 from .crypto import check_canary, derive_master_key
 from .index import Index
 from .meta import META_FILENAME, VaultMeta
@@ -77,6 +80,8 @@ class VaultSession:
         self._store: SecureStore | None = None
         #: The separate, rebuildable ``semantic.db`` vector index (opened lazily).
         self._semantic_store: SemanticStore | None = None
+        #: The credential-field index (metadata only: title/site/category/url/username).
+        self._credentials: Any | None = None
         #: Serialises semantic-index runs (manual rebuild vs the auto-index worker).
         self._semantic_lock = threading.RLock()
         self._semantic_queue: SemanticIndexQueue | None = None
@@ -417,6 +422,8 @@ class VaultSession:
         if self._fs is not None:
             self._fs.master_key = None
             self._fs = None
+        # The credential index holds decrypted metadata: it dies with the key.
+        self._credentials = None
 
     def close(self) -> None:
         """Lock and release all held files."""
@@ -1189,11 +1196,58 @@ class VaultSession:
         idx.require_file(source_path)
         idx.move(source_path, dest_path)
         self.flush()
+        # The new name has to reach the documents too, or every note that showed the picture now
+        # shows a broken link and nothing tells the user why.
+        updated = self._repoint_references(source_path, dest_path, source=source)
         self._log(source=source, tool="move", target_path=dest_path, outcome="allow")
         self._emit_activity(
             kind="move", tool="move", path=dest_path, sensitivity=None, outcome="allow"
         )
-        return idx.require_file(dest_path)
+        row = idx.require_file(dest_path)
+        row["references_updated"] = updated
+        return row
+
+    #: Characters that make a file name part of a longer word (`data.png` is not `a.png`).
+    _NAME_CHARS = r"\w.\-"
+
+    def _repoint_references(self, old: str, new: str, *, source: str) -> int:
+        """Rewrite the notes that point at a moved file, and return how many changed.
+
+        A reference to a file in this vault is its own path — `vault:/attachments/x.png` in a
+        markdown link, or a relative path ending in the same name — so a rename has to travel
+        through the documents. Only `normal` files are rewritten: their text is the only text
+        this session may read, and a gated note is left alone (its count is not reported).
+        """
+        old_path = "/" + old.strip("/")
+        new_path = "/" + new.strip("/")
+        old_name = old_path.rsplit("/", 1)[-1]
+        new_name = new_path.rsplit("/", 1)[-1]
+        name_pattern = None
+        #: Only a *file* name is rewritten on its own; a folder's name is not a reference, and a
+        #: bare word in prose (a name with no extension) is not a file name.
+        if old_name and old_name != new_name and "." in old_name:
+            name_pattern = re.compile(
+                rf"(?<![{self._NAME_CHARS}]){re.escape(old_name)}(?![{self._NAME_CHARS}])"
+            )
+        changed = 0
+        for row in list(self._require_index().walk("/")):
+            if int(row["is_dir"]) or not row.get("blob_id"):
+                continue
+            path = str(row["logical_path"])
+            if path == new or str(row["sensitivity"]) != "normal":
+                continue
+            try:
+                text = self._read_raw(row).decode("utf-8")
+            except (UnicodeDecodeError, VaultError):
+                continue  # a picture, or a note that cannot be read as text
+            updated = text.replace(old_path, new_path)
+            if name_pattern is not None:
+                updated = name_pattern.sub(new_name, updated)
+            if updated == text:
+                continue
+            self.write_file(path, updated.encode("utf-8"), source=source)
+            changed += 1
+        return changed
 
     def copy(self, src: str, dst: str, *, source: str = SOURCE_UI) -> dict[str, Any]:
         """Copy a file or directory recursively and return the destination row."""
@@ -1398,6 +1452,157 @@ class VaultSession:
             outcome="allow",
         )
         return row
+
+    # ------------------------------------------------------------------ learning
+    def learning_list(self, *, now: int | None = None) -> dict[str, Any]:
+        """Return the cards due now (today and any missed) plus the ones still ahead.
+
+        Metadata only — names, levels and the schedule — so it answers while locked, like a
+        folder listing. A card's content is read by whichever client shows it.
+        """
+        moment = now_ms() if now is None else int(now)
+        entries = [
+            self._learning_entry(row, moment) for row in self._require_index().learning_records()
+        ]
+        due = [entry for entry in entries if entry["due"] and entry["due"] <= moment]
+        upcoming = [entry for entry in entries if entry["due"] and entry["due"] > moment]
+        return {
+            "now": moment,
+            "due": due,
+            "upcoming": upcoming,
+            "count": len(due),
+            "intervals": list(learning.INTERVALS_DAYS),
+        }
+
+    def _learning_entry(self, row: dict[str, Any], now: int) -> dict[str, Any]:
+        """Shape one joined index row into the card both clients render."""
+        logical = str(row["logical_path"])
+        stage = int(row["stage"])
+        due = int(row["due"])
+        return {
+            "name": "/" if logical == "/" else logical.rsplit("/", 1)[-1],
+            "path": "/" + logical.lstrip("/"),
+            "sensitivity": row["sensitivity"],
+            "emoji": row.get("emoji"),
+            "stage": stage,
+            "total": learning.TOTAL_STAGES,
+            "due": due,
+            "started": int(row["started"]),
+            "seen": int(row["seen"]),
+            "completed": learning.is_complete(stage) or not due,
+            "overdue_days": learning.days_overdue(due, now),
+        }
+
+    def _learning_target(self, path: str, tool: str) -> tuple[str, dict[str, Any]]:
+        """Resolve a note for a learning action: unlocked, writable, and not a folder."""
+        logical = normalize_vault_path(path)
+        self._require_unlocked()
+        self._require_writable(tool)
+        row = self._require_index().require_file(logical)
+        if int(row["is_dir"]):
+            raise BadRequest("is_directory", details={"path": logical})
+        return logical, row
+
+    def learning_start(self, path: str, *, source: str = SOURCE_UI) -> dict[str, Any]:
+        """Put a note into its learning cycle (a no-op when it is already there)."""
+        logical, row = self._learning_target(path, "learning_start")
+        idx = self._require_index()
+        moment = now_ms()
+        file_id = int(row["id"])
+        if idx.learning_get(file_id) is None:
+            stage, due = learning.started(moment)
+            idx.learning_set(file_id, stage=stage, due=due, started=moment, seen=0)
+            self.flush()
+            self._log(source=source, tool="learning_start", target_path=logical, outcome="allow")
+            self._emit_activity(
+                kind="write",
+                tool="learning_start",
+                path=logical,
+                sensitivity=str(row["sensitivity"]),
+                outcome="allow",
+            )
+        record = idx.learning_record(file_id) or {}
+        return self._learning_entry(record, moment)
+
+    def learning_seen(self, path: str, *, source: str = SOURCE_UI) -> dict[str, Any]:
+        """Record one review: the card moves to the next interval; the sixth ends the cycle.
+
+        A finished cycle leaves the learning table, so the note stops coming back on its own —
+        re-entering is a deliberate start (or a reset before the cycle ends).
+        """
+        logical, row = self._learning_target(path, "learning_seen")
+        idx = self._require_index()
+        file_id = int(row["id"])
+        current = idx.learning_get(file_id)
+        if current is None:
+            raise NotFound("not_in_learning", details={"path": logical})
+        moment = now_ms()
+        stage, due = learning.reviewed(moment, int(current["stage"]))
+        self._log(source=source, tool="learning_seen", target_path=logical, outcome="allow")
+        self._emit_activity(
+            kind="write",
+            tool="learning_seen",
+            path=logical,
+            sensitivity=str(row["sensitivity"]),
+            outcome="allow",
+        )
+        if not due:
+            idx.learning_delete(file_id)
+            self.flush()
+            return {
+                "path": "/" + logical.lstrip("/"),
+                "stage": stage,
+                "total": learning.TOTAL_STAGES,
+                "due": 0,
+                "completed": True,
+            }
+        idx.learning_set(
+            file_id, stage=stage, due=due, started=int(current["started"]), seen=moment
+        )
+        self.flush()
+        record = idx.learning_record(file_id) or {}
+        return self._learning_entry(record, moment)
+
+    def learning_reset(self, path: str, *, source: str = SOURCE_UI) -> dict[str, Any]:
+        """Restart a card's cycle from the first interval (tomorrow)."""
+        logical, row = self._learning_target(path, "learning_reset")
+        idx = self._require_index()
+        file_id = int(row["id"])
+        if idx.learning_get(file_id) is None:
+            raise NotFound("not_in_learning", details={"path": logical})
+        moment = now_ms()
+        stage, due = learning.started(moment)
+        idx.learning_set(file_id, stage=stage, due=due, started=moment, seen=0)
+        self.flush()
+        self._log(source=source, tool="learning_reset", target_path=logical, outcome="allow")
+        self._emit_activity(
+            kind="write",
+            tool="learning_reset",
+            path=logical,
+            sensitivity=str(row["sensitivity"]),
+            outcome="allow",
+        )
+        record = idx.learning_record(file_id) or {}
+        return self._learning_entry(record, moment)
+
+    def learning_stop(self, path: str, *, source: str = SOURCE_UI) -> dict[str, Any]:
+        """Take a note out of learning (a no-op when it is not in it)."""
+        logical, row = self._learning_target(path, "learning_stop")
+        idx = self._require_index()
+        file_id = int(row["id"])
+        removed = idx.learning_get(file_id) is not None
+        if removed:
+            idx.learning_delete(file_id)
+            self.flush()
+            self._log(source=source, tool="learning_stop", target_path=logical, outcome="allow")
+            self._emit_activity(
+                kind="write",
+                tool="learning_stop",
+                path=logical,
+                sensitivity=str(row["sensitivity"]),
+                outcome="allow",
+            )
+        return {"path": "/" + logical.lstrip("/"), "removed": removed}
 
     def folder_note(self, path: str, *, source: str = SOURCE_UI) -> str | None:
         """Return the note attached to a folder, if any."""
@@ -1625,18 +1830,58 @@ class VaultSession:
         *,
         limit: int = 50,
         path_prefix: str | None = None,
+        only_secret: bool = False,
+        fields: bool = False,
         source: str = SOURCE_UI,
     ) -> list[dict[str, Any]]:
-        """Search filenames (all levels, names only), optionally under ``path_prefix``."""
+        """Search filenames (all levels, names only), optionally under ``path_prefix``.
+
+        ``fields`` also matches the *metadata fields* of credential entries (title, site,
+        category, url, username) — never a password, which the credential index does not hold.
+        That is a UI affordance: the field scan decrypts every credential body once (metadata
+        only, no audit rows), so agent sources are refused it by the service layer.
+        """
         results = search_mod.search_filenames(
-            self, query, limit=limit, path_prefix=path_prefix
+            self, query, limit=limit, path_prefix=path_prefix, only_secret=only_secret
         )
+        if fields:
+            results = self._merge_credential_fields(query, results, int(limit))
         self._emit_activity(
             kind="search", tool="search_filenames", path=None, sensitivity=None,
             outcome="allow", query=query,
         )
         self._log(source=source, tool="search_filenames", outcome="allow")
         return results
+
+    def _merge_credential_fields(
+        self, query: str, results: list[dict[str, Any]], limit: int
+    ) -> list[dict[str, Any]]:
+        """Append the credential entries whose fields match ``query`` (deduplicated)."""
+        try:
+            with credentials.quiet_scan(self):
+                hits = self.credential_index().search(query, limit=limit * 2)
+        except Exception:  # noqa: BLE001 - a field scan must never break a name search
+            return results
+        seen = {str(item.get("logical_path") or "") for item in results}
+        merged = list(results)
+        for hit in hits:
+            logical = str(hit["path"]).lstrip("/")
+            if logical in seen:
+                continue
+            try:
+                row = self._require_index().require_file(logical)
+            except Exception:  # noqa: BLE001 - deleted between the scan and the merge
+                continue
+            seen.add(logical)
+            merged.append(search_mod.field_result(row, hit["fields"]))
+        merged.sort(key=lambda item: str(item.get("logical_path", "")))
+        return merged[: max(1, limit)]
+
+    def credential_index(self) -> Any:
+        """The session's one credential index, built on first use and refreshed when stale."""
+        if self._credentials is None:
+            self._credentials = credentials.CredentialIndex(self)
+        return self._credentials
 
     def search_text(
         self,

@@ -95,7 +95,7 @@ All tools accept a JSON object and return an object. Paths use the vault-absolut
 | `write_file` | `path` (req), `content` (req), `encoding`, `sensitivity` (`normal`/`secret`/`secretfile`) | `{"path","size","sensitivity","created"}` |
 | `write_lines` | `path` (req), `text` (req), `mode` (`append`/`prepend`/`insert`), `at_line` | `{"path","size","lines"}` |
 | `mkdir` | `path` (req) | `{"path","created":true}` |
-| `file_ops` | `op` (`move`/`copy`/`delete`/`mkdir`), `src` (req), `dst`, `recursive` | `{"op","src","dst","affected"}` |
+| `file_ops` | `op` (`move`/`copy`/`delete`/`mkdir`), `src` (req), `dst`, `recursive` | `{"op","src","dst","affected","references_updated"}` — a `move` rewrites the `normal` notes that pointed at the old path (a `vault:/…` link or a relative link ending in the same name) and reports how many |
 | `set_sensitivity` | `path` (req), `level` (req) | `{"path","from","to"}` — agents may only raise; lowering → `SENSITIVITY_DOWNGRADE_FORBIDDEN` |
 | `search_filenames` | `query` (req), `limit` (default 50), `path_prefix` | `{"query","count","results":[{"logical_path","is_dir","sensitivity","size","mtime","match"}]}` |
 | `search_text` | `query` (req), `limit` (default 50), `path_prefix` | same shape plus `snippet` (≤240 chars), `score`, `line` and `offset` (jump straight to the match with `read_lines`); `normal` files only |
@@ -106,6 +106,10 @@ All tools accept a JSON object and return an object. Paths use the vault-absolut
 | `write_file_note` | `path` (req), `text` (req) | `{"path","updated":true}` |
 | `all_tags` | — | `{"tags":[{name,count}]}` (metadata) |
 | `files_by_tag` | `tag` (req) | `{"tag","count","results":[…]}` (metadata) |
+| `learning_list` | — | `{"now","due":[…],"upcoming":[…],"count","intervals":[1,2,4,8,16,32]}`; each card is `{name,path,sensitivity,emoji,stage,total,due,started,seen,completed,overdue_days}` (metadata) |
+| `learning_start` | `path` (req) | the card entry — idempotent: a note already in learning keeps its schedule |
+| `learning_seen` | `path` (req) | the card entry after one review, or `{"path","stage","total","due":0,"completed":true}` when the sixth review ends the cycle |
+| `learning_stop` | `path` (req) | `{"path","removed"}` |
 | `semantic_status` | — | `{"semantic":{enabled,available,reason,model,chunking,chunks,indexed_files,db_path}}` |
 | `semantic_reindex` | `path` (optional subtree), `force` (default true) | `{"indexed","skipped","chunks"}` — re-embed all or just one subtree |
 | `request_open_secret` | `path` (req) | `{"request_id","status":"pending","note":"…"}` — `secretfile` only; content is never returned |
@@ -120,6 +124,9 @@ Agent-facing rules:
 * `request_open_secret` works only for `secretfile`; the user sees a desktop dialog and
   the native viewer, and the agent gets `{"status":"pending"}` with no content.
 * `search_filenames` sees names of **all** levels (names are metadata).
+* The learning schedule (`learning_*`) is plaintext metadata on a path: reading the queue works
+  while locked, but starting a card, recording a review or stopping one is a write and needs an
+  unlocked, writable vault.
 * `search_filenames`/`search_text`/`search_semantic` accept `path_prefix` to scope the
   search to one folder subtree — cheaper and immune to a huge folder crowding out a small
   one.

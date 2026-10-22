@@ -370,3 +370,74 @@ class EmojiLabelTest(unittest.TestCase):
         """Labelling something that does not exist fails loudly."""
         with self.assertRaises(NotFound):
             self.session.set_emoji("ghost", "⭐")
+
+
+class MoveReferencesTest(unittest.TestCase):
+    """A rename travels: the notes that point at the file are rewritten with it."""
+
+    def setUp(self) -> None:
+        self.session = tmp_vault()
+        self.session.mkdir("attachments")
+        self.session.write_file("attachments/old.png", b"\x89PNG\r\n\x1a\n not text")
+        self.session.write_file(
+            "notes/embed.md",
+            "![pic](vault:/attachments/old.png)\n\n![again](<../../assets/old.png>)\n".encode(),
+        )
+        self.session.write_file("notes/other.md", b"no references here\n")
+
+    def tearDown(self) -> None:
+        self.session.close()
+
+    def _text(self, path: str) -> str:
+        return self.session.read_file(path).decode("utf-8")
+
+    def test_the_notes_point_at_the_new_name(self) -> None:
+        """Both the vault path and the relative reference follow the rename."""
+        result = self.session.move("attachments/old.png", "attachments/new.png")
+        self.assertEqual(result["references_updated"], 1)
+        text = self._text("notes/embed.md")
+        self.assertIn("vault:/attachments/new.png", text)
+        self.assertIn("../../assets/new.png", text)
+        self.assertNotIn("old.png", text)
+        # The file itself moved, and an untouched note stayed untouched (and unversioned).
+        self.assertEqual(self.session.index.require_file("attachments/new.png")["is_dir"], 0)
+        self.assertEqual(self.session.index.version_count(
+            int(self.session.index.require_file("notes/other.md")["id"])), 1)
+
+    def test_the_rewritten_note_keeps_a_version_of_its_old_text(self) -> None:
+        """A repointed note is an ordinary edit: the previous text is still recoverable."""
+        file_id = int(self.session.index.require_file("notes/embed.md")["id"])
+        self.session.move("attachments/old.png", "attachments/new.png")
+        self.assertEqual(self.session.index.version_count(file_id), 2)
+        old = self.session.version_text("notes/embed.md", 1)
+        self.assertIn("old.png", old)
+
+    def test_a_name_that_only_ends_the_same_way_is_left_alone(self) -> None:
+        """`data.png` is not a reference to `a.png`."""
+        self.session.write_file("attachments/a.png", b"png")
+        self.session.write_file("notes/lookalike.md", b"see data.png here\n")
+        result = self.session.move("attachments/a.png", "attachments/b.png")
+        self.assertEqual(result["references_updated"], 0)
+        self.assertEqual(self._text("notes/lookalike.md"), "see data.png here\n")
+
+    def test_a_gated_note_is_not_rewritten(self) -> None:
+        """Its text may not be read by this path, so it is left alone — and not counted."""
+        self.session.write_file("notes/hidden.md", b"![x](vault:/attachments/old.png)\n")
+        self.session.set_sensitivity("notes/hidden.md", "secret")
+        result = self.session.move("attachments/old.png", "attachments/new.png")
+        self.assertEqual(result["references_updated"], 1)
+        self.assertIn("old.png", self.session.read_file("notes/hidden.md").decode("utf-8"))
+
+    def test_moving_a_folder_rewrites_the_paths_under_it(self) -> None:
+        """A folder move is the same rule with a longer path."""
+        self.session.write_file("notes/in-folder.md", b"![x](vault:/attachments/old.png)\n")
+        result = self.session.move("attachments", "pics")
+        self.assertEqual(result["references_updated"], 2)
+        self.assertIn("vault:/pics/old.png", self._text("notes/in-folder.md"))
+        self.assertIn("vault:/pics/old.png", self._text("notes/embed.md"))
+
+    def test_a_binary_is_never_decoded(self) -> None:
+        """The scan skips what is not text instead of failing on it."""
+        self.session.write_file("notes/blob.bin", b"\x00\xff\xfe binary old.png")
+        result = self.session.move("attachments/old.png", "attachments/new.png")
+        self.assertEqual(result["references_updated"], 1)
