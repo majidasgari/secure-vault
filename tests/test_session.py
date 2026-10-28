@@ -441,3 +441,33 @@ class MoveReferencesTest(unittest.TestCase):
         self.session.write_file("notes/blob.bin", b"\x00\xff\xfe binary old.png")
         result = self.session.move("attachments/old.png", "attachments/new.png")
         self.assertEqual(result["references_updated"], 1)
+
+
+class VerifyBlobsTest(unittest.TestCase):
+    """The integrity check decrypts the whole vault, so it lives in the session and reports progress."""
+
+    def setUp(self) -> None:
+        self.session = tmp_vault()
+        self.session.write_file("notes/a.md", b"alpha")
+        self.session.write_file("notes/b.md", b"beta")
+
+    def tearDown(self) -> None:
+        self.session.close()
+
+    def test_a_healthy_vault_passes_and_reports_progress(self) -> None:
+        progress: dict = {}
+        result = self.session.verify_blobs(progress=progress)
+        self.assertEqual(result["checked"], 2)
+        self.assertEqual(result["bad"], [])
+        self.assertEqual(progress["total"], 2)
+        self.assertEqual(progress["done"], 2)
+        self.assertTrue(progress["finished"])
+
+    def test_a_missing_blob_is_reported_by_its_path(self) -> None:
+        self.session.index.conn.execute(
+            "UPDATE files SET blob_id='deadbeef' WHERE logical_path='notes/a.md'"
+        )
+        self.session.index.conn.commit()
+        result = self.session.verify_blobs()
+        self.assertEqual(result["bad"], ["/notes/a.md"])
+        self.assertEqual(result["checked"], 2, "the rest is still checked")

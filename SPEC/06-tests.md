@@ -142,12 +142,12 @@ one representative widget retranslates on `set_language` (offscreen).
 ### `test_ui_smoke.py` (`QT_QPA_PLATFORM=offscreen`, skipped with a clear message if PySide6
    is missing)
 import the package · build the app with `--self-test` against a scratch vault: create → unlock →
-main window constructed → tree has the expected folders → open a note in the editor →
-`editor.preview_allowed is True` for `normal` with the preview pane **off** by default (and
-turned on only on request), and both false after the file becomes `secret`
-(and the confirmation hook is stubbed to approve) → the right dock lists search before the
-access log → the saved arrangement (geometry, dock state, active tab, preview, split) is
-restored onto the window → the native viewer path for a `secretfile`
+main window constructed → tree has the expected folders → open a note in the editor, which has
+no preview widget (`not hasattr(editor, "preview")`) and whose short-note field sits below the
+text → the file still loads after the level becomes `secret` (with the confirmation hook stubbed
+to approve) → browser, search, learning and log are four docks that start as one tab group →
+the saved arrangement (geometry, dock state, which panels are open, raised panel) is restored
+onto the window → the native viewer path for a `secretfile`
 (`viewer.last_text` equals the content, and no `QWebEngineView` was created for it) →
 `search_panel` returns results for all three kinds (semantic via `StubProvider`) →
 `log_panel.row_count()` grows after an action → `i18n.set_language("en")` changes a known label
@@ -197,7 +197,7 @@ The exact commands and their real output go into `docs/TESTING.md` (no invented 
    master password (the agent must never create the real vault or store a password).
 2. The GUI on a real screen: fonts/RTL in Persian, icon in the KDE menu/taskbar, tray menu,
    desktop notifications, the secret-request popup arriving while the window is in the tray.
-3. Opening a big real note in the markdown preview; editing + saving; sync behaviour with his
+3. Opening a big real note in the browser; editing + saving; sync behaviour with his
    cloud folder.
 4. The importer against the real mirror **into his real vault** (after creating it).
 5. Registering/enabling the MCP server in Hermes and asking an agent to list/search the vault.

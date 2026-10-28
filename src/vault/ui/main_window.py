@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from PySide6.QtCore import QByteArray, Qt
+from PySide6.QtCore import QByteArray, Qt, QTimer
 from PySide6.QtGui import QAction, QGuiApplication, QKeySequence
 from PySide6.QtWidgets import (
     QDockWidget,
@@ -13,7 +13,6 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QMenu,
     QMessageBox,
-    QTabWidget,
 )
 
 from . import bidi, i18n, image_view
@@ -24,6 +23,16 @@ from .log_panel import LogPanel
 from .search_panel import SearchPanel
 
 _LEVELS = ("normal", "secret", "secretfile")
+
+#: The four side panels, in their default tab order. Each is a dock of its own: any of them can
+#: be dragged to another edge or stacked, and two docks in one place become a tab group.
+PANELS = (
+    ("browser", "browser.title"),
+    ("search", "search.tab"),
+    ("learning", "learn.title"),
+    ("log", "log.tab"),
+)
+
 
 
 def _unhex(value: Any) -> bytes | None:
@@ -46,6 +55,8 @@ class MainWindow(QMainWindow):
         self._current_path: str | None = None
         self._last_read: dict | None = None
         self._quitting = False
+        #: A remembered side-dock width waiting for the window to be shown (see apply_dock_width).
+        self._dock_width: int | None = None
         self.setObjectName("main-window")
         self.resize(1180, 760)
 
@@ -56,7 +67,6 @@ class MainWindow(QMainWindow):
         self.editor.open_text_editor.connect(controller.open_in_text_editor)
         self.setCentralWidget(self.editor)
 
-        self.right_tabs = QTabWidget(self)
         self.browser = BrowserPanel(controller, self)
         self.browser.file_activated.connect(self.open_file)
         self.browser.folder_selected.connect(self._on_folder_selected)
@@ -64,6 +74,9 @@ class MainWindow(QMainWindow):
         self.browser.new_folder_requested.connect(controller.new_folder)
         self.browser.import_requested.connect(controller.import_joplin)
         self.browser.refresh_requested.connect(self.refresh)
+        # «همگام‌سازی» is a toolbar button as well as a Tools item: the one action of the two that
+        # people look for by eye, and it used to be reachable only from the menu.
+        self.browser.sync_requested.connect(controller.sync_now)
         self.browser.lock_requested.connect(controller.lock)
         self.browser.settings_requested.connect(controller.open_settings)
         self.browser.list.setContextMenuPolicy(Qt.CustomContextMenu)
@@ -74,21 +87,51 @@ class MainWindow(QMainWindow):
         self.browser.tree.setContextMenuPolicy(Qt.CustomContextMenu)
         self.browser.tree.customContextMenuRequested.connect(self._show_tree_menu)
 
-        self.log_panel = LogPanel(controller.dispatch_ui, self.right_tabs)
-        self.search_panel = SearchPanel(controller.dispatch_ui, self.right_tabs)
+        self.log_panel = LogPanel(controller.dispatch_ui, self)
+        self.search_panel = SearchPanel(controller.dispatch_ui, self)
         self.search_panel.result_activated.connect(self.open_file)
-        self.learning_panel = LearningPanel(controller.dispatch_ui, self.right_tabs)
+        self.learning_panel = LearningPanel(controller.dispatch_ui, self)
         self.learning_panel.open_requested.connect(self.open_file)
-        # One dock, four tabs: the browser first (the everyday pane), then search, the learning
-        # cards and last the access log — the diagnostic view you go looking for sits at the end.
-        self.right_tabs.addTab(self.browser, "")
-        self.right_tabs.addTab(self.search_panel, "")
-        self.right_tabs.addTab(self.learning_panel, "")
-        self.right_tabs.addTab(self.log_panel, "")
-        self.right_dock = QDockWidget(self)
-        self.right_dock.setObjectName("right-dock")
-        self.right_dock.setWidget(self.right_tabs)
-        self.addDockWidget(Qt.RightDockWidgetArea, self.right_dock)
+        # One dock per panel. They start as one tab group on the right (the everyday pane first,
+        # then search, the learning cards and last the access log), but each is an independent
+        # dock: drag it anywhere, or drop it on another one to get a tab group of just those two.
+        self.dock_panels: dict[str, Any] = {
+            "browser": self.browser,
+            "search": self.search_panel,
+            "learning": self.learning_panel,
+            "log": self.log_panel,
+        }
+        self.docks: dict[str, QDockWidget] = {}
+        #: Which panel's tab is raised (kept here: `saveState` does not record the active tab).
+        self._raised_panel = "browser"
+        self.setDockNestingEnabled(True)
+        self.setDockOptions(
+            QMainWindow.DockOption.AllowNestedDocks
+            | QMainWindow.DockOption.AllowTabbedDocks
+            | QMainWindow.DockOption.AnimatedDocks
+        )
+        first: QDockWidget | None = None
+        for name, _key in PANELS:
+            dock = QDockWidget(self)
+            dock.setObjectName(f"panel-{name}")
+            dock.setWidget(self.dock_panels[name])
+            dock.setAllowedAreas(Qt.AllDockWidgetAreas)
+            dock.setFeatures(
+                QDockWidget.DockWidgetFeature.DockWidgetMovable
+                | QDockWidget.DockWidgetFeature.DockWidgetFloatable
+                | QDockWidget.DockWidgetFeature.DockWidgetClosable
+            )
+            self.addDockWidget(Qt.RightDockWidgetArea, dock)
+            if first is None:
+                first = dock
+            else:
+                self.tabifyDockWidget(first, dock)
+            dock.visibilityChanged.connect(
+                lambda visible, panel=name: self._on_dock_visibility(panel, visible)
+            )
+            self.docks[name] = dock
+        first.setVisible(True)
+        first.raise_()
 
         self._build_status_bar()
         self._build_menus()
@@ -133,6 +176,18 @@ class MainWindow(QMainWindow):
         self.path_label.setText(bidi.ltr_isolate(str(self.controller.vault_home)))
         self.count_label.setText(i18n.tr("status.files", count=status.get("files", 0)))
         sync = status.get("sync") or {}
+        journal = (sync.get("mode") or "legacy") == "journal"
+        # Each mode's actions are meaningless in the other one: no lock or mirror in journal
+        # mode (docs/SYNC.md §11).
+        for name, shown in (
+            ("sync", not journal),
+            ("migrate_sync", not journal),
+            ("take_control", not journal),
+            ("sync_journal", journal),
+            ("conflicts", journal),
+        ):
+            if name in self.actions:
+                self.actions[name].setVisible(shown)
         if not sync.get("configured"):
             sync_text = i18n.tr("status.sync_off")
         elif sync.get("readonly"):
@@ -194,19 +249,12 @@ class MainWindow(QMainWindow):
 
         view_menu = self.menuBar().addMenu("")
         self._menus["view"] = view_menu
-        add(view_menu, "browser_dock", None, self.show_browser)
-        add(view_menu, "right_dock", None,
-            lambda checked: self.right_dock.setVisible(checked), checkable=True)
-        self.actions["right_dock"].setChecked(True)
-        # Closing the dock with its own ✕ must leave the menu check telling the truth.
-        self.right_dock.visibilityChanged.connect(lambda _visible: self._sync_dock_actions())
-        add(view_menu, "learning", None, self.show_learning)
-        add(view_menu, "preview", None,
-            lambda checked: self.editor.set_preview_enabled(checked), checkable=True)
-        # The preview is off unless the user asked for it; the check follows the restored wish.
-        self.actions["preview"].setChecked(self.editor.preview_wanted())
-        # The editor toolbar has its own Preview button; keep the menu check in step with it.
-        self.editor.preview_changed.connect(self._on_preview_changed)
+        # One checkable entry per panel, backed by the dock's own toggle action: closing a panel
+        # with its ✕ unchecks the entry by itself, and the panel can be brought back from here.
+        for name, _key in PANELS:
+            action = self.docks[name].toggleViewAction()
+            view_menu.addAction(action)
+            self.actions[f"{name}_dock"] = action
 
         tools_menu = self.menuBar().addMenu("")
         self._menus["tools"] = tools_menu
@@ -215,6 +263,9 @@ class MainWindow(QMainWindow):
         add(tools_menu, "semantic_index", None, self.controller.semantic_index_now)
         tools_menu.addSeparator()
         add(tools_menu, "sync", None, self.controller.sync_now)
+        add(tools_menu, "sync_journal", None, self.controller.sync_journal_now)
+        add(tools_menu, "migrate_sync", None, self.controller.migrate_sync)
+        add(tools_menu, "conflicts", None, self.controller.show_conflicts)
         add(tools_menu, "take_control", None, self.controller.take_write_access)
 
         help_menu = self.menuBar().addMenu("")
@@ -222,19 +273,10 @@ class MainWindow(QMainWindow):
         add(help_menu, "about", None, self.controller.about)
         add(help_menu, "open_log", None, self.controller.open_log_file)
 
-    def _sync_dock_actions(self) -> None:
-        """Keep the View menu checks in step with the docks' own shown/hidden state.
-
-        Read from ``isHidden()``, never from ``isVisible()``: hiding the whole window (to the
-        tray, or on lock) makes every dock invisible without the user having closed anything.
-        """
-        self.actions["right_dock"].setChecked(not self.right_dock.isHidden())
-
-    def _on_preview_changed(self, enabled: bool) -> None:
-        """Mirror the editor's Preview button state onto the View menu check."""
-        action = self.actions.get("preview")
-        if action is not None and action.isChecked() != bool(enabled):
-            action.setChecked(bool(enabled))
+    def _on_dock_visibility(self, panel: str, visible: bool) -> None:
+        """Remember which panel's tab is raised (the winner of a tab group)."""
+        if visible:
+            self._raised_panel = panel
 
     # ------------------------------------------------------------------ files
     @property
@@ -356,19 +398,28 @@ class MainWindow(QMainWindow):
         self.learning_panel.refresh()
         self.statusBar().showMessage(i18n.tr("learn.added"), 4000)
 
-    def _show_tab(self, widget: Any) -> None:
-        """Reveal the side dock on ``widget``'s tab (and keep the View menu check honest)."""
-        self.right_dock.setVisible(True)
-        self.actions["right_dock"].setChecked(True)
-        self.right_tabs.setCurrentWidget(widget)
+    def show_panel(self, name: str) -> None:
+        """Reveal one panel and raise its tab, wherever the user has put it."""
+        dock = self.docks.get(name)
+        if dock is None:
+            return
+        if dock.isHidden():
+            dock.setVisible(True)
+        dock.raise_()
+        self._raised_panel = name
 
     def show_browser(self) -> None:
-        """Reveal the side dock on the browser tab (the tree, the file list and their notes)."""
-        self._show_tab(self.browser)
+        """Reveal the browser panel (the tree, the file list and their notes)."""
+        self.show_panel("browser")
+
+    def show_search(self) -> None:
+        """Reveal the search panel and put the caret in its query box."""
+        self.show_panel("search")
+        self.search_panel.focus_query()
 
     def show_learning(self) -> None:
-        """Reveal the side dock on the learning tab."""
-        self._show_tab(self.learning_panel)
+        """Reveal the learning panel and refresh its cards."""
+        self.show_panel("learning")
         self.learning_panel.refresh()
 
     def _on_save_requested(self, path: str, text: str) -> None:
@@ -506,27 +557,40 @@ class MainWindow(QMainWindow):
 
     # ------------------------------------------------------------------ layout
     def layout_state(self) -> dict[str, Any]:
-        """Return the arrangement the user has set (geometry, docks, split, preview, tab).
+        """Return the arrangement the user has set (geometry, dock layout, open panels).
 
         Everything the user can rearrange is captured here, so the next start looks the way
         they left it instead of snapping back to a built-in default.
         """
         state: dict[str, Any] = {
-            "preview": self.editor.preview_wanted(),
-            "right_tab": int(self.right_tabs.currentIndex()),
-            # The docks' *own* shown/hidden flag: `isHidden()` is False while the whole window
+            # Each dock's *own* shown/hidden flag: `isHidden()` is False while the whole window
             # is hidden to the tray, which is when this is usually written.
-            "right_dock": not self.right_dock.isHidden(),
+            "docks": {name: not dock.isHidden() for name, dock in self.docks.items()},
+            "dock_raised": self._raised_panel,
         }
-        ratio = self.editor.split_ratio()
-        if ratio:
-            state["editor_split"] = ratio
+        # `saveState()` alone did not bring the side area's width back, and a hidden dock has no
+        # width of its own to remember — so the number is kept only while a panel is on screen.
+        width_dock = self._width_dock()
+        if width_dock is not None and not width_dock.isHidden() and width_dock.width() > 0:
+            state["right_width"] = int(width_dock.width())
+        # The file table's column layout travels as percentages: one arrangement for every folder.
+        ratios = self.browser.column_ratios()
+        if ratios:
+            state["columns"] = ratios
         try:
             state["geometry"] = bytes(self.saveGeometry().data()).hex()
             state["state"] = bytes(self.saveState().data()).hex()
         except Exception:  # noqa: BLE001 - a missing geometry is not worth a failure
             pass
         return state
+
+    def _width_dock(self) -> QDockWidget | None:
+        """Return the panel whose width stands for the side area (browser first)."""
+        for name, _key in PANELS:
+            dock = self.docks[name]
+            if not dock.isHidden():
+                return dock
+        return self.docks.get("browser")
 
     def save_layout(self) -> None:
         """Persist the arrangement into ``ui.json`` (best effort, never raises)."""
@@ -550,23 +614,75 @@ class MainWindow(QMainWindow):
         dock_state = _unhex(saved.get("state"))
         if dock_state and self.restoreState(QByteArray(dock_state)):
             restored = True
-        # ``restoreState`` restores positions and sizes but not whether a dock is closed, so the
-        # two flags are applied here (and the View menu is re-synced from the real state).
-        for key, dock in (("right_dock", self.right_dock),):
-            visible = saved.get(key)
-            if isinstance(visible, bool) and visible != (not dock.isHidden()):
-                dock.setVisible(visible)
-                restored = True
-        self._sync_dock_actions()
-        tab = saved.get("right_tab")
-        if isinstance(tab, int) and 0 <= tab < self.right_tabs.count():
-            self.right_tabs.setCurrentIndex(tab)
+        # ``restoreState`` restores positions, sizes and tab groups but not whether a dock is
+        # closed, so those flags are applied here.
+        flags = saved.get("docks")
+        if isinstance(flags, dict):
+            for name, dock in self.docks.items():
+                visible = flags.get(name)
+                if isinstance(visible, bool) and visible != (not dock.isHidden()):
+                    dock.setVisible(visible)
+                    restored = True
+        elif isinstance(saved.get("right_dock"), bool):
+            # A layout written before the panels became docks: one flag for the whole side area,
+            # one tab index — map both onto the four panels it used to hold.
+            visible = bool(saved["right_dock"])
+            for dock in self.docks.values():
+                if visible != (not dock.isHidden()):
+                    dock.setVisible(visible)
             restored = True
-        # The preview choice and the split belong to the arrangement too.
-        self.editor.set_preview_enabled(bool(saved.get("preview", False)))
-        if self.editor.apply_split_ratio(saved.get("editor_split")):
+            tab = saved.get("right_tab")
+            if isinstance(tab, int) and 0 <= tab < len(PANELS):
+                self.show_panel(PANELS[tab][0])
+        raised = saved.get("dock_raised")
+        if isinstance(raised, str) and raised in self.docks:
+            self.show_panel(raised)
+            restored = True
+        width = saved.get("right_width")
+        if isinstance(width, int) and width > 0:
+            self.apply_dock_width(width)
+            restored = True
+        if self.browser.set_column_ratios(saved.get("columns")):
             restored = True
         return restored
+
+    def apply_dock_width(self, width: int) -> None:
+        """Bring the side area back to a remembered width.
+
+        ``resizeDocks`` is silently ignored until the window has been laid out and shown once, which
+        is why the width used to come back as the dock's own minimum: the value is kept for the
+        first ``showEvent`` and applied there.
+        """
+        width = int(width)
+        if width <= 0:
+            return
+        if self.isVisible():
+            self._apply_dock_width(width)
+        else:
+            #: Read and cleared by showEvent — a later drag must win over a startup width.
+            self._dock_width = width
+
+    def _apply_dock_width(self, width: int) -> None:
+        """The one call that actually resizes the docks (never raises: a width is cosmetic)."""
+        docks = [
+            dock for dock in self.docks.values()
+            if not dock.isHidden() and self.dockWidgetArea(dock) == Qt.RightDockWidgetArea
+        ] or ([self._width_dock()] if self._width_dock() is not None else [])
+        try:
+            self.resizeDocks(docks, [int(width)] * len(docks), Qt.Horizontal)
+        except Exception:  # noqa: BLE001 - a remembered width is cosmetic
+            pass
+
+    def showEvent(self, event: Any) -> None:  # noqa: N802 - Qt API
+        """Apply a remembered dock width once the layout is live, then forget it.
+
+        ``resizeDocks`` does nothing before the first show, so this is the earliest moment the
+        width sticks; the value is dropped afterwards so a later drag by the user wins.
+        """
+        super().showEvent(event)
+        width, self._dock_width = self._dock_width, None
+        if width:
+            QTimer.singleShot(0, lambda: self._apply_dock_width(width))
 
     # ------------------------------------------------------------------ close
     def hideEvent(self, event: Any) -> None:  # noqa: N802 - Qt API
@@ -593,11 +709,13 @@ class MainWindow(QMainWindow):
     def retranslate(self) -> None:
         """Re-apply translated strings to menus, docks and status bar."""
         self.setWindowTitle(i18n.tr("app.title"))
-        self.right_dock.setWindowTitle(i18n.tr("right.title"))
-        self.right_tabs.setTabText(0, i18n.tr("browser.title"))
-        self.right_tabs.setTabText(1, i18n.tr("search.tab"))
-        self.right_tabs.setTabText(2, i18n.tr("learn.title"))
-        self.right_tabs.setTabText(3, i18n.tr("log.tab"))
+        for name, key in PANELS:
+            dock = self.docks[name]
+            dock.setWindowTitle(i18n.tr(key))
+            action = self.actions.get(f"{name}_dock")
+            if action is not None:
+                # The toggle action's text was fixed to the old title when it was created.
+                action.setText(i18n.tr(key))
         self._menus["file"].setTitle(i18n.tr("menu.file"))
         self._menus["edit"].setTitle(i18n.tr("menu.edit"))
         self._menus["view"].setTitle(i18n.tr("menu.view"))
@@ -612,14 +730,13 @@ class MainWindow(QMainWindow):
             "lock": "menu.lock",
             "quit": "menu.quit",
             "find": "menu.find",
-            "browser_dock": "menu.browser_dock",
-            "right_dock": "menu.right_dock",
-            "learning": "learn.title",
-            "preview": "menu.preview",
             "settings": "menu.settings",
             "verify": "menu.verify",
             "semantic_index": "menu.semantic_index",
             "sync": "menu.sync",
+            "sync_journal": "menu.sync_journal",
+            "migrate_sync": "menu.migrate_sync",
+            "conflicts": "menu.conflicts",
             "take_control": "tray.take_control",
             "about": "menu.about",
             "open_log": "menu.open_log",

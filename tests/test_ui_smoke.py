@@ -87,20 +87,20 @@ class UiSmokeTest(unittest.TestCase):
         self.assertGreaterEqual(self.result.window.tree_model.rowCount(), 2)
         self.assertGreater(self.checks["tree_rows"], 0)
 
-    def test_normal_file_preview_enabled(self) -> None:
-        """A normal file opens in the editor; the preview pane is off until it is asked for."""
+    def test_normal_file_opens_in_source_editor(self) -> None:
+        """A normal file opens in the editor, which has no preview pane at all."""
         self.assertTrue(self.checks["open_normal"])
-        self.assertTrue(self.checks["preview_allowed_normal"])
-        self.assertTrue(self.checks["preview_hidden_by_default"])
+        self.assertTrue(self.checks["editor_has_no_preview"])
+        self.assertTrue(self.checks["note_field_below_source"])
         self.assertTrue(self.checks["normal_content"])
-        # Turning it on shows it and the choice is kept for the next file.
-        self.assertTrue(self.checks["preview_on_request"])
-        self.assertTrue(self.checks["preview_kept_for_next_file"])
-        self.assertTrue(self.checks["preview_off_again"])
+        self.assertTrue(self.checks["direction_always_auto"])
 
-    def test_search_tab_precedes_access_log(self) -> None:
-        """The right dock lists search before the access log."""
-        self.assertTrue(self.checks["search_tab_first"])
+    def test_four_panels_are_separate_docks(self) -> None:
+        """Browser, search, learning and log are four docks that start as one tab group."""
+        self.assertTrue(self.checks["four_panel_docks"])
+        self.assertTrue(self.checks["panels_start_tabbed"])
+        self.assertTrue(self.checks["panels_movable"])
+        self.assertTrue(self.checks["view_menu_browser_panel"])
 
     def test_tree_menu_offers_rename_and_delete(self) -> None:
         """The folder tree reaches rename/delete, like the file list already did."""
@@ -125,23 +125,21 @@ class UiSmokeTest(unittest.TestCase):
         window = self.result.window
         controller = self.result.controller
         original = window.layout_state()
-        tabs = window.right_tabs
-        log_index = tabs.indexOf(window.log_panel)
 
-        # 1. Arrange it: a size of its own, the access-log tab, the preview on. The arranged size
-        # must fit the screen — `restoreGeometry` clamps to it, and offscreen runs get 800x600,
-        # which is narrower than this window's own minimum (the side dock has a floor).
+        # 1. Arrange it: a size of its own, the access-log panel raised, one panel closed. The
+        # arranged size must fit the screen — `restoreGeometry` clamps to it, and offscreen runs
+        # get 800x600, which is narrower than this window's own minimum (the docks have a floor).
         available = window.screen().availableGeometry()
         window.resize(min(900, available.width()), min(640, available.height()))
-        tabs.setCurrentIndex(log_index)
-        window.editor.set_preview_enabled(True)
+        window.show_panel("log")
+        window.docks["learning"].setVisible(False)
         window.save_layout()
         saved = dict(controller.config.data.get("window") or {})
         self.assertTrue(saved.get("geometry"), "no window geometry was saved")
         self.assertTrue(saved.get("state"), "no dock state was saved")
-        self.assertEqual(saved.get("right_tab"), log_index)
-        self.assertTrue(saved.get("preview"))
-        self.assertTrue(saved.get("right_dock"))
+        self.assertEqual(saved.get("dock_raised"), "log")
+        self.assertFalse(saved["docks"]["learning"])
+        self.assertTrue(saved["docks"]["browser"])
         arranged_size = (window.width(), window.height())
 
         # 2. Change everything the user can change, then restore the saved arrangement.
@@ -151,26 +149,30 @@ class UiSmokeTest(unittest.TestCase):
             arranged_size,
             "the window did not actually change",
         )
-        tabs.setCurrentIndex(tabs.indexOf(window.search_panel))
-        window.editor.set_preview_enabled(False)
-        window.right_dock.setVisible(False)
+        window.show_panel("browser")
+        window.docks["learning"].setVisible(True)
+        window.docks["browser"].setVisible(False)
         self.assertTrue(window.restore_layout(saved))
-        self.assertEqual(window.right_tabs.currentIndex(), log_index)
-        # The position is the window manager's business; the size is ours.
-        self.assertEqual((window.width(), window.height()), arranged_size)
-        self.assertTrue(window.editor.preview_enabled)
+        self.assertTrue(window.docks["learning"].isHidden())
+        # The position is the window manager's business; the size is ours (a dock splitter handle
+        # can shave a pixel or two off the restored width, so compare with a small tolerance).
+        self.assertLessEqual(
+            abs(window.width() - arranged_size[0]), 4, "the window width did not come back"
+        )
+        self.assertLessEqual(
+            abs(window.height() - arranged_size[1]), 4, "the window height did not come back"
+        )
         # ``isHidden()`` and not ``isVisible()``: the shared window is hidden to the tray at the
         # end of the self-test, which makes every child invisible without anyone closing it.
-        self.assertFalse(window.right_dock.isHidden())
+        self.assertFalse(window.docks["browser"].isHidden())
+        self.assertEqual(window._raised_panel, "log")
 
         # 3. Leave the shared window the way the rest of the class expects to find it.
         window.restore_layout(original)
-        window.editor.set_preview_enabled(False)
 
-    def test_secret_file_preview_disabled(self) -> None:
-        """A secret file opens after confirmation with the preview disabled."""
+    def test_secret_file_opens_in_editor(self) -> None:
+        """A secret file opens after confirmation in the editor (which cannot render anything)."""
         self.assertTrue(self.checks["open_secret"])
-        self.assertTrue(self.checks["preview_disabled_secret"])
         self.assertTrue(self.checks["secret_content"])
 
     def test_secretfile_uses_native_viewer(self) -> None:
@@ -178,7 +180,6 @@ class UiSmokeTest(unittest.TestCase):
         self.assertTrue(self.checks["open_secretfile"])
         self.assertEqual(self.checks["viewer_text"], "token=alpha-secret")
         self.assertFalse(self.checks["viewer_uses_web"])
-        self.assertEqual(self.checks["web_views_for_secretfile"], 0)
         self.assertTrue(self.checks["secretfile_logged"])
 
     def test_secretfile_otp_code_shown(self) -> None:
@@ -188,7 +189,6 @@ class UiSmokeTest(unittest.TestCase):
         self.assertEqual(self.checks["viewer_otp_digits"], 6)
         self.assertTrue(self.checks["viewer_otp_grouped"])
         self.assertTrue(self.checks["viewer_otp_countdown"])
-        self.assertEqual(self.checks["web_views_for_otp"], 0)
 
     def test_search_three_kinds(self) -> None:
         """All three search kinds return results (semantic via the stub)."""
@@ -276,7 +276,6 @@ class EditorBidiTest(unittest.TestCase):
         editor.set_content(
             "/notes/x.md",
             "متن فارسی\n\nEnglish text\n\n```\n# یادداشت\n```",
-            preview_enabled=True,
         )
         document = editor.source.document()
         by_text = {}
@@ -308,47 +307,29 @@ class EditorBidiTest(unittest.TestCase):
         self.assertTrue(colours, "fenced code carries no background colour")
         self.assertFalse(editor.is_dirty())
 
-    def test_cycle_direction_uniform(self) -> None:
-        """Cycling the mode applies one direction to every block."""
+    def test_direction_is_always_automatic(self) -> None:
+        """There is no direction control left: every block follows its own text."""
         from PySide6.QtCore import Qt
 
         from vault.ui.editor import EditorPanel
 
         editor = EditorPanel()
-        editor.set_content("/n.md", "متن فارسی\n\nEnglish", preview_enabled=False)
-        self.assertEqual(editor.cycle_direction(), "rtl")
+        self.assertFalse(hasattr(editor, "direction_combo"), "a direction control still exists")
+        editor.set_content("/n.md", "متن فارسی\n\nEnglish")
+        by_text = {}
         block = editor.source.document().begin()
         while block.isValid():
-            self.assertEqual(_block_direction(block.blockFormat()), Qt.RightToLeft)
+            by_text.setdefault(block.text(), block)
             block = block.next()
-        self.assertEqual(editor.cycle_direction(), "ltr")
-        block = editor.source.document().begin()
-        while block.isValid():
-            self.assertEqual(_block_direction(block.blockFormat()), Qt.LeftToRight)
-            block = block.next()
-
-    def test_preview_dir_attributes(self) -> None:
-        """The preview HTML marks every block from its own text and keeps code LTR."""
-        from vault.ui.editor import render_markdown
-
-        rendered = render_markdown(
-            "متن فارسی\n\nplain english\n\n| گزینه |\n| --- |\n| RotatE |\n\n```\ncode\n```"
-        )
-        self.assertNotIn('dir="auto"', rendered)
-        self.assertIn('<p dir="rtl">متن فارسی</p>', rendered)
-        self.assertIn('<p dir="ltr">plain english</p>', rendered)
-        self.assertIn('<table dir="rtl">', rendered)
-        self.assertIn('<td dir="ltr">RotatE</td>', rendered)
-        self.assertIn('[dir="rtl"] { direction: rtl; text-align: right; }', rendered)
-        self.assertIn('<pre dir="ltr">', rendered)
-        self.assertIn('dir="ltr"', rendered)
+        self.assertEqual(_block_direction(by_text["متن فارسی"].blockFormat()), Qt.RightToLeft)
+        self.assertEqual(_block_direction(by_text["English"].blockFormat()), Qt.LeftToRight)
 
     def test_browser_url(self) -> None:
         """``browser_url`` encodes the note path and is None while locked."""
         from vault.ui.editor import EditorPanel
 
         editor = EditorPanel()
-        editor.set_content("/notes/hello.md", "x", preview_enabled=True)
+        editor.set_content("/notes/hello.md", "x")
         editor.locked = False
         editor.web_port = 8788
         self.assertEqual(
@@ -360,42 +341,42 @@ class EditorBidiTest(unittest.TestCase):
 
 
 @unittest.skipUnless(HAVE_QT, "PySide6 is not installed")
-class EditorPreviewTest(unittest.TestCase):
-    """The preview refreshes on demand, never on every keystroke (large-file fix)."""
+class EditorLayoutTest(unittest.TestCase):
+    """The editor is source-only: no preview widget, the short note on the bottom line."""
 
     @classmethod
     def setUpClass(cls) -> None:
         """Ensure a single offscreen QApplication exists."""
         from PySide6.QtWidgets import QApplication
 
-        cls.app = QApplication.instance() or QApplication(["editor-preview-test"])
+        cls.app = QApplication.instance() or QApplication(["editor-layout-test"])
 
-    def test_typing_does_not_render_the_preview(self) -> None:
-        """An edit schedules the bidi pass but must not re-render the preview."""
+    def test_no_preview_widget_remains(self) -> None:
+        """Every preview leftover is gone (the browser is where a note is read)."""
         from vault.ui.editor import EditorPanel
 
         editor = EditorPanel()
-        editor.set_content("/notes/big.md", "سلام\n\nEnglish\n", preview_enabled=True)
-        calls: list[int] = []
-        editor._render_preview = lambda: calls.append(1)  # type: ignore[method-assign]
-        editor.source.insertPlainText("more")
-        editor._bidi_timer.timeout.emit()
-        self.assertEqual(calls, [])
+        for gone in ("preview", "splitter", "preview_button", "preview_allowed"):
+            self.assertFalse(hasattr(editor, gone), f"{gone} still on the editor")
 
-    def test_preview_button_renders_on_demand(self) -> None:
-        """The toolbar button shows/refreshes the preview when the user asks."""
+    def test_note_field_moved_to_the_bottom(self) -> None:
+        """The file note is a field on the editor's bottom line, not a caption row on top."""
+        from vault.ui import i18n
         from vault.ui.editor import EditorPanel
 
         editor = EditorPanel()
-        editor.set_content("/notes/big.md", "hello", preview_enabled=True)
-        editor.preview_enabled = False
-        calls: list[int] = []
-        editor._render_preview = lambda: calls.append(1)  # type: ignore[method-assign]
-        editor._on_preview_clicked()
-        self.assertTrue(editor.preview_enabled)
-        self.assertEqual(calls, [1])
-        editor._on_preview_clicked()
-        self.assertEqual(calls, [1, 1])
+        editor.resize(600, 400)
+        editor.show()
+        self.app.processEvents()
+        self.assertEqual(
+            editor.note_edit.placeholderText(), i18n.tr("editor.file_note_placeholder")
+        )
+        self.assertFalse(hasattr(editor, "note_label"), "the caption label is still there")
+        self.assertGreater(
+            editor.note_edit.mapTo(editor, editor.note_edit.rect().topLeft()).y(),
+            editor.source.mapTo(editor, editor.source.rect().bottomLeft()).y(),
+        )
+        editor.close()
 
     def test_editing_only_formats_the_current_block(self) -> None:
         """The per-keystroke bidi pass keeps the caret and leaves other blocks alone."""
@@ -407,7 +388,6 @@ class EditorPreviewTest(unittest.TestCase):
         editor.set_content(
             "/notes/x.md",
             "متن فارسی\n\nEnglish text\n\nمتن دیگر",
-            preview_enabled=False,
         )
         document = editor.source.document()
         untouched = document.begin().next().next()

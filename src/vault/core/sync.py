@@ -230,6 +230,13 @@ class SyncManager:
             self.readonly = False
             self.lock_info = None
             return self.status()
+        if self.session.sync_mode() == "journal":
+            # Journal mode has no write lock (docs/SYNC.md §11); a legacy lock left in the
+            # bucket belongs to the old mirror and must not make this device read-only.
+            self.owned = False
+            self.readonly = False
+            self.lock_info = None
+            return self.status()
         try:
             return self.acquire(force=False)
         except (ProviderUnavailable, SyncError) as exc:
@@ -345,6 +352,7 @@ class SyncManager:
             "state_path": str(self.state_path()),
             "syncing": self.syncing,
             "job": self.job(),
+            "mode": self.session.sync_mode(),
         }
 
     def is_write_allowed(self) -> bool:
@@ -418,6 +426,15 @@ class SyncManager:
             SyncError: when sync is not configured.
             SyncReadOnly: when this client does not hold the write lock.
         """
+        mode = "legacy"
+        try:
+            mode = str(self.session.sync_mode())
+        except Exception:  # noqa: BLE001 - an old session object has no mode yet
+            mode = "legacy"
+        if mode == "journal":
+            # The journal owns the index now; mirroring meta.sqlite over it would overwrite the
+            # local projection with another device's file and silently undo applied ops.
+            raise SyncError("sync_mode_journal")
         if not self.config.configured:
             raise SyncError("sync_not_configured")
         if not self.is_write_allowed():

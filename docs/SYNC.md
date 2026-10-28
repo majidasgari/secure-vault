@@ -264,3 +264,58 @@ Both guards report their reason in the notification/status line in the UI langua
 Keep the lock discipline: one writer, the others read-only, sync before you switch
 machines. The built-in S3 sync plus the lock is the supported path; the cloud-drive
 recipe is only a fallback.
+
+## 11. Two clients at once: the operation log (`journal` mode)
+
+Everything above describes **legacy mode**: one writer at a time, the whole folder mirrored. It exists
+because `meta.sqlite` and `secure.store` are single files that cannot be merged — that is what the lock
+protects.
+
+A vault that needs **several devices writing at the same time** switches to **journal mode**. Then:
+
+* each client only ever writes to its own objects in the bucket — `ops/<client>/<seq>.json` (one small
+  operation per object) and `files/<aa>/<blob>.enc` (immutable, content-addressed content). No lock,
+  no shared mutable file;
+* `meta.sqlite` and `secure.store` are **local projections** of that log and are *not* mirrored any
+  more (a legacy sync over them would overwrite applied operations);
+* an operation records one change: `put` (content or a new folder), `delete`, `rename`, `level`,
+  `tag`, `emoji`, `note`, `learning`. Every entry carries a revision, and an operation is applied only
+  when it was written on top of the revision that is still current;
+* **a conflict is never resolved automatically.** Two devices changing the same entry (or one deleting
+  what the other edited) produces a conflict row; the app asks: *this device's version*, *the other
+  device's version*, or *keep both* (the losing version stays beside it as `«<name> (نسخهٔ ۲)»`). Only
+  that path is held back — the rest of the vault keeps syncing;
+* the answer is itself an operation, so the other device learns the decision without a second protocol.
+  A file whose blob is missing in the bucket is **not** applied (the app never shows an entry it cannot
+  read) and is retried on the next sync;
+* notes (folder/file) travel **sealed** inside their operation — the journal lives in plaintext
+  metadata, so only ciphertext with the vault key ever lands there. Learning marks are personal
+  bookkeeping: they apply last-writer-wins and never raise a conflict.
+
+### Upgrading an existing vault
+
+* Desktop: **Tools → ارتقای همگام‌سازی به چنددستگاهی…**
+* Headless: `tools/migrate_journal.py --home <vault home>` (password from `$SV_PW`)
+
+The upgrade records one operation per entry, per note and per learning card, sets `sync.mode=journal`
+and prints how many changes are queued. It is idempotent, and it uploads nothing — the first
+*Multi-device sync* does that, which means **the first sync uploads the whole vault content**. The
+existing mirror objects stay in the bucket, so a device still on legacy mode keeps working; it simply
+does not see journal clients' changes.
+
+Both modes refuse the other's sync (`sync_mode_journal` / `sync_mode_legacy`), so a vault can never
+have its index mirrored over its operation log. The menu, the tray and the settings page only show
+the actions of the current mode: in journal mode the mirror, the upgrade and the write lock are gone.
+
+### Read-only clients (the phone)
+
+A client that only *reads* has no operation log to apply, so once the vault is in journal mode it keeps
+showing the day it was migrated. `VaultSession.publish_reader_snapshot()` (tool:
+`tools/…`/one-off script) uploads a one-way snapshot for it — `meta.sqlite`, `secure.store`,
+`.vault-meta.json`, skipped by ETag when unchanged — which a reader downloads and a writer never does.
+
+It is deliberately **not** part of the sync run: the phone in 1.4 also *writes* (it queues ops in its
+own `journal_out`) and cannot push them yet, so a metadata pull replaces its `meta.sqlite` and takes
+that queue with it. Publish a snapshot only for a phone that has no unpublished edits, or after the
+phone learns to push and pull the op log (the real fix: its `JournalIndex.apply` and `journal_in`
+cursor already exist in `secure-vault-android`).

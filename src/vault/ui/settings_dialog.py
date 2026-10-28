@@ -642,7 +642,12 @@ class SettingsDialog(QDialog):
         if backend:
             state = f"{state} · {backend}"
         self.sync_state.setText(i18n.tr("settings.sync_state", state=state))
+        journal = (sync.get("mode") or "legacy") == "journal"
+        self.sync_hint.setText(
+            i18n.tr("settings.sync_hint_journal" if journal else "settings.sync_hint")
+        )
         readonly = bool(sync.get("readonly"))
+        self.sync_now_button.setVisible(not journal)
         self.sync_acquire_button.setVisible(readonly)
         self.sync_release_button.setVisible(not readonly and bool(sync.get("owned")))
         self.sync_now_button.setEnabled(bool(sync.get("configured")) and not readonly)

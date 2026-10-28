@@ -1,0 +1,290 @@
+{
+  "generated_by": "secure-vault/tools/make_journal_state_fixture.py",
+  "scenarios": [
+    {
+      "name": "create_then_edit",
+      "before": [],
+      "ops": [
+        {
+          "op_id": "desktop-000001",
+          "client": "desktop",
+          "seq": 1,
+          "ts": 1001,
+          "kind": "put",
+          "path": "a.md",
+          "base_rev": 0,
+          "rev": 1,
+          "payload": {
+            "blob_id": "blob-1",
+            "size": 4,
+            "encrypted": 1
+          }
+        },
+        {
+          "op_id": "desktop-000002",
+          "client": "desktop",
+          "seq": 2,
+          "ts": 1002,
+          "kind": "put",
+          "path": "a.md",
+          "base_rev": 1,
+          "rev": 2,
+          "payload": {
+            "blob_id": "blob-2",
+            "size": 4,
+            "encrypted": 1
+          }
+        }
+      ],
+      "after": [
+        {
+          "logical_path": "a.md",
+          "blob_id": "blob-2",
+          "is_dir": 0,
+          "size": 4,
+          "encrypted": 1,
+          "sensitivity": "normal",
+          "mtime": 1792708463230,
+          "emoji": null,
+          "rev": 2,
+          "tags": []
+        }
+      ],
+      "conflicts": 0,
+      "applied": 2
+    },
+    {
+      "name": "conflict_keeps_the_local_row",
+      "before": [
+        {
+          "logical_path": "a.md",
+          "blob_id": "blob-local",
+          "is_dir": 0,
+          "size": 4,
+          "encrypted": 1,
+          "sensitivity": "normal",
+          "mtime": 1,
+          "emoji": null,
+          "rev": 2,
+          "tags": []
+        }
+      ],
+      "ops": [
+        {
+          "op_id": "desktop-000003",
+          "client": "desktop",
+          "seq": 3,
+          "ts": 1003,
+          "kind": "put",
+          "path": "a.md",
+          "base_rev": 1,
+          "rev": 2,
+          "payload": {
+            "blob_id": "blob-theirs",
+            "size": 4,
+            "encrypted": 1
+          }
+        }
+      ],
+      "after": [
+        {
+          "logical_path": "a.md",
+          "blob_id": "blob-local",
+          "is_dir": 0,
+          "size": 4,
+          "encrypted": 1,
+          "sensitivity": "normal",
+          "mtime": 1,
+          "emoji": null,
+          "rev": 2,
+          "tags": []
+        }
+      ],
+      "conflicts": 1,
+      "applied": 0
+    },
+    {
+      "name": "delete_then_resurrect",
+      "before": [
+        {
+          "logical_path": "a.md",
+          "blob_id": "blob-1",
+          "is_dir": 0,
+          "size": 4,
+          "encrypted": 1,
+          "sensitivity": "normal",
+          "mtime": 1,
+          "emoji": null,
+          "rev": 2,
+          "tags": []
+        }
+      ],
+      "ops": [
+        {
+          "op_id": "desktop-000004",
+          "client": "desktop",
+          "seq": 4,
+          "ts": 1004,
+          "kind": "delete",
+          "path": "a.md",
+          "base_rev": 2,
+          "rev": 3,
+          "payload": {}
+        },
+        {
+          "op_id": "desktop-000005",
+          "client": "desktop",
+          "seq": 5,
+          "ts": 1005,
+          "kind": "put",
+          "path": "a.md",
+          "base_rev": 1,
+          "rev": 2,
+          "payload": {
+            "blob_id": "blob-zombie",
+            "size": 4,
+            "encrypted": 1
+          }
+        }
+      ],
+      "after": [],
+      "conflicts": 1,
+      "applied": 1
+    },
+    {
+      "name": "rename_moves_the_row",
+      "before": [
+        {
+          "logical_path": "a.md",
+          "blob_id": "blob-1",
+          "is_dir": 0,
+          "size": 4,
+          "encrypted": 1,
+          "sensitivity": "normal",
+          "mtime": 1,
+          "emoji": null,
+          "rev": 1,
+          "tags": []
+        }
+      ],
+      "ops": [
+        {
+          "op_id": "desktop-000006",
+          "client": "desktop",
+          "seq": 6,
+          "ts": 1006,
+          "kind": "rename",
+          "path": "b.md",
+          "base_rev": 1,
+          "rev": 2,
+          "payload": {
+            "from": "a.md"
+          }
+        }
+      ],
+      "after": [
+        {
+          "logical_path": "b.md",
+          "blob_id": "blob-1",
+          "is_dir": 0,
+          "size": 4,
+          "encrypted": 1,
+          "sensitivity": "normal",
+          "mtime": 1,
+          "emoji": null,
+          "rev": 2,
+          "tags": []
+        }
+      ],
+      "conflicts": 0,
+      "applied": 1
+    },
+    {
+      "name": "tags_and_emoji_bump_the_revision",
+      "before": [
+        {
+          "logical_path": "a.md",
+          "blob_id": "blob-1",
+          "is_dir": 0,
+          "size": 4,
+          "encrypted": 1,
+          "sensitivity": "normal",
+          "mtime": 1,
+          "emoji": null,
+          "rev": 1,
+          "tags": []
+        }
+      ],
+      "ops": [
+        {
+          "op_id": "desktop-000007",
+          "client": "desktop",
+          "seq": 7,
+          "ts": 1007,
+          "kind": "tag",
+          "path": "a.md",
+          "base_rev": 1,
+          "rev": 2,
+          "payload": {
+            "tags": [
+              "کار",
+              "مالی"
+            ]
+          }
+        },
+        {
+          "op_id": "desktop-000008",
+          "client": "desktop",
+          "seq": 8,
+          "ts": 1008,
+          "kind": "emoji",
+          "path": "a.md",
+          "base_rev": 2,
+          "rev": 3,
+          "payload": {
+            "emoji": "📌"
+          }
+        }
+      ],
+      "after": [
+        {
+          "logical_path": "a.md",
+          "blob_id": "blob-1",
+          "is_dir": 0,
+          "size": 4,
+          "encrypted": 1,
+          "sensitivity": "normal",
+          "mtime": 1,
+          "emoji": "📌",
+          "rev": 3,
+          "tags": [
+            "مالی",
+            "کار"
+          ]
+        }
+      ],
+      "conflicts": 0,
+      "applied": 2
+    },
+    {
+      "name": "delete_is_a_noop_when_already_gone",
+      "before": [],
+      "ops": [
+        {
+          "op_id": "desktop-000009",
+          "client": "desktop",
+          "seq": 9,
+          "ts": 1009,
+          "kind": "delete",
+          "path": "ghost.md",
+          "base_rev": 0,
+          "rev": 1,
+          "payload": {}
+        }
+      ],
+      "after": [],
+      "conflicts": 0,
+      "applied": 1
+    }
+  ]
+}

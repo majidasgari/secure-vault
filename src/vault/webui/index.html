@@ -4,6 +4,15 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <meta name="color-scheme" content="dark light">
+  <script>
+    /* The theme is a client preference, not vault data: it lives in localStorage (key shared with
+       app.js: `vault_theme`) so it survives a restart, unlike the session token. Applied here,
+       before the stylesheet paints, so a light-mode user never sees a dark flash. */
+    try {
+      document.documentElement.setAttribute("data-theme",
+        localStorage.getItem("vault_theme") || "dark");
+    } catch (e) { /* private mode: fall back to the markup default */ }
+  </script>
   <title data-i18n="web.title">Secure Vault</title>
   <link rel="stylesheet" href="/static/styles.css">
 </head>
@@ -78,11 +87,6 @@
           <button id="btn-new-note-side" type="button" data-i18n="web.new_note"></button>
           <button id="btn-new-folder" type="button" data-i18n="web.new_folder"></button>
         </div>
-        <button id="btn-learn" type="button" class="learn-open">
-          <span aria-hidden="true">🎓</span>
-          <span data-i18n="learn.title"></span>
-          <span id="learn-count" class="learn-count" hidden></span>
-        </button>
         <div class="panel-section">
           <h3 class="section-title" data-i18n="web.tree_heading"></h3>
           <ul id="folder-tree" class="tree"></ul>
@@ -90,6 +94,15 @@
         <div class="tags">
           <h3 class="section-title" data-i18n="web.tags_heading"></h3>
           <div id="tag-chips" class="chips"></div>
+        </div>
+        <!-- The two actions worth a fixed place: the learning cards, and pulling the bucket now. -->
+        <div class="panel-foot">
+          <button id="btn-learn" type="button" class="learn-open">
+            <span aria-hidden="true">🎓</span>
+            <span data-i18n="learn.title"></span>
+            <span id="learn-count" class="learn-count" hidden></span>
+          </button>
+          <button id="btn-sync-side" type="button" data-i18n="web.sync" data-i18n-title="web.sync_now"></button>
         </div>
       </aside>
 

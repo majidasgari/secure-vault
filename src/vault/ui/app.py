@@ -34,6 +34,7 @@ from ..api.socket_server import VaultSocketServer
 from ..errors import AlreadyExists
 from ..util import now_ms
 from .import_vault import megabytes
+from .conflicts_dialog import ConflictsDialog
 from ..config import runtime_dir, user_config, user_state_dir
 from ..core.meta import DEFAULT_IMPORT_MIRROR
 from ..errors import Unauthorized, VaultError
@@ -70,6 +71,10 @@ AUTO_SCAN_RETRY_MS = 2500
 AUTO_SCAN_RETRY_REASONS = frozenset({"timeout", "no_match"})
 #: How often the external-editor helper looks for changes to save back into the vault.
 EXTERNAL_POLL_MS = 1500
+#: How many journal ops one step of the multi-device sync publishes. The service lock is held for
+#: the whole call, so a first push of thousands of ops runs in slices from the event loop instead of
+#: freezing the window (and blocking every other call) for minutes.
+JOURNAL_SYNC_STEP = 30
 #: How often the import dialog refreshes its percentage from the importer's progress state.
 IMPORT_POLL_MS = 400
 #: How often the GUI polls the background S3 sync job for progress.
@@ -226,6 +231,8 @@ class VaultApplication(QObject):
     reindex_finished = Signal(object)
     # Emitted from the semantic-index worker thread with the ``indexed``/``skipped`` result.
     semantic_finished = Signal(object)
+    # Emitted from the verify worker thread with ``{checked, bad}`` (or an error).
+    verify_finished = Signal(object)
     # Emitted from the fingerprint worker thread with the scan outcome / payload.
     fingerprint_finished = Signal(object)
 
@@ -295,6 +302,16 @@ class VaultApplication(QObject):
         self.import_running = False
         self._import_progress: QProgressDialog | None = None
         # S3 sync runs in the core background thread; the GUI only polls its job state.
+        #: The running multi-device sync (``pushed``/``applied``/``conflicts``) or None. It is driven
+        #: from the event loop in slices, so a first push cannot freeze the window.
+        self._journal_sync: dict[str, Any] | None = None
+        #: The running integrity check's progress dialog/timer (one at a time).
+        self._verify_dialog: QProgressDialog | None = None
+        self._verify_timer: QTimer | None = None
+        self._journal_sync_timer = QTimer(self)
+        self._journal_sync_timer.setSingleShot(True)
+        self._journal_sync_timer.setInterval(0)
+        self._journal_sync_timer.timeout.connect(self._journal_sync_step)
         self._sync_progress: QProgressDialog | None = None
         self._sync_timer: QTimer | None = None
 
@@ -305,6 +322,7 @@ class VaultApplication(QObject):
         self.import_finished.connect(self._on_import_finished)
         self.reindex_finished.connect(self._on_reindex_finished)
         self.semantic_finished.connect(self._on_semantic_finished)
+        self.verify_finished.connect(self._on_verify_finished)
 
         self._auto_lock_timer = QTimer(self)
         self._auto_lock_timer.setInterval(AUTO_LOCK_TICK_MS)
@@ -452,15 +470,11 @@ class VaultApplication(QObject):
             self.hub.subscribe(self.window.browser.refresh)
             self.hub.subscribe(self.window.log_panel.refresh_soon)
             self.window.editor.open_in_browser.connect(self.open_in_browser)
-            self.window.editor.direction_changed.connect(self._on_editor_direction)
             self.window.editor.note_changed.connect(self.set_file_note)
             self.window.editor.history_requested.connect(self.open_versions)
-            # The arrangement the user left behind (dock sizes/positions, window geometry, the
-            # preview and the active tab) is theirs: restore it before the window is shown.
+            # The arrangement the user left behind (window geometry, the four panel docks and
+            # which one is raised) is theirs: restore it before the window is shown.
             self.window.restore_layout(self.config.window)
-            mode = self.config.data.get("editor_direction")
-            if isinstance(mode, str) and mode in ("auto", "rtl", "ltr"):
-                self.window.editor.set_direction_mode(mode)
             if self.start_minimized and self.tray_available():
                 self.window.hide()
             else:
@@ -486,6 +500,8 @@ class VaultApplication(QObject):
             on_recent=self.open_in_browser,
             on_sync=self.sync_now,
             on_take_control=self.take_write_access,
+            on_new_note=self.new_note,
+            on_new_credential=self.new_credential,
             on_quit=self.quit,
         )
         self.tray.set_locked(not (self.session is None or self.session.is_locked))
@@ -511,10 +527,10 @@ class VaultApplication(QObject):
             self.window.raise_()
 
     def _show_search(self) -> None:
-        """Show the main window and focus the search box."""
+        """Show the main window on the search panel and focus its box."""
         self._show_window()
         if self.window is not None:
-            self.window.search_panel.focus_query()
+            self.window.show_search()
 
     # ------------------------------------------------------------------ unlock
     def unlock(self, password: str) -> bool:
@@ -989,7 +1005,9 @@ class VaultApplication(QObject):
                 self._lock_and_show(auto_scan=False)
         except Exception:  # noqa: BLE001 - never let the timer crash the app
             pass
-        if self.window is not None:
+        if self.window is not None and self._journal_sync is None:
+            # A running multi-device sync holds the service lock inside its slice; polling status
+            # here would queue on that lock and stall the window instead of painting it.
             self.window.refresh_status()
         if self.tray is not None:
             self.tray.set_activity(self.activity.events())
@@ -1147,13 +1165,13 @@ class VaultApplication(QObject):
             return True
         if level == "normal":
             content = self.read(api)
-            self.window.editor.set_content(api, content, preview_enabled=True)
+            self.window.editor.set_content(api, content)
             self.window.editor.set_note(note or "")
         elif level == "secret":
             if not self._confirm(level, api):
                 return False
             content = self.read(api)
-            self.window.editor.set_content(api, content, preview_enabled=False)
+            self.window.editor.set_content(api, content)
             self.window.editor.set_note(note or "")
             notifications.notify(
                 i18n.tr("notification.secret_opened"), api, tray=self.tray
@@ -1207,16 +1225,15 @@ class VaultApplication(QObject):
 
     # ------------------------------------------------------------------ actions
     def new_note(self) -> None:
-        """Create a new note in the selected folder."""
-        from PySide6.QtWidgets import QInputDialog
+        """Create a note where the last one was — the same rule as the phone's notification action.
 
-        folder = self.window.browser.current_folder if self.window else "/"
-        name, ok = QInputDialog.getText(
-            self.window, i18n.tr("dialog.new_note"), i18n.tr("dialog.new_note_prompt")
+        No dialog: the name is the first free «یادداشت N» in that folder, so one click (or one tray
+        tap) produces a note you can type into immediately.
+        """
+        folder = self._last_note_folder() or (
+            self.window.browser.current_folder if self.window else "/"
         )
-        if not ok or not name.strip():
-            return
-        path = self._api(folder.rstrip("/") + "/" + name.strip())
+        path = self._free_note_path(folder)
         try:
             self.dispatch_ui(
                 "vault.write_file",
@@ -1225,8 +1242,63 @@ class VaultApplication(QObject):
         except VaultError as exc:
             QMessageBox.warning(self.window, i18n.tr("app.title"), error_message(exc))
             return
+        self._remember_note_folder(folder)
         self.hub.notify()
         self.window.open_file(path)
+
+    def new_credential(self) -> None:
+        """Create a standard credential entry under ``/رمزها`` and open it for filling in."""
+        from .credential_dialog import prompt_credential
+
+        values = prompt_credential(self.window)
+        if values is None:
+            return
+        from ..core.credentials import build_body, credential_path
+
+        folder, name = credential_path(values["site"], values["category"]).rsplit("/", 1)
+        path = folder + "/" + name
+        suffix = 2
+        while self._exists(path):
+            stem = name[:-3] if name.endswith(".md") else name
+            path = f"{folder}/{stem} ({suffix}).md"
+            suffix += 1
+        try:
+            self.dispatch_ui(
+                "vault.write_file",
+                {"path": path, "content": build_body(**values), "sensitivity": "secretfile"},
+            )
+        except VaultError as exc:
+            QMessageBox.warning(self.window, i18n.tr("app.title"), error_message(exc))
+            return
+        self.hub.notify()
+        self.window.open_file(path)
+
+    def _exists(self, path: str) -> bool:
+        try:
+            self.stat(self._api(path))
+            return True
+        except VaultError:
+            return False
+
+    def _free_note_path(self, folder: str) -> str:
+        base = folder.rstrip("/")
+        number = 1
+        while self._exists(f"{base}/یادداشت {number}.md"):
+            number += 1
+        return self._api(f"{base}/یادداشت {number}.md")
+
+    def _last_note_folder(self) -> str:
+        """Where the last note was created, kept in the state directory (never in the vault)."""
+        try:
+            return (user_state_dir() / "last_note_folder").read_text(encoding="utf-8").strip()
+        except OSError:
+            return ""
+
+    def _remember_note_folder(self, folder: str) -> None:
+        try:
+            (user_state_dir() / "last_note_folder").write_text(folder or "/", encoding="utf-8")
+        except OSError:
+            pass
 
     def new_folder(self) -> None:
         """Create a new folder in the selected folder."""
@@ -1584,21 +1656,77 @@ class VaultApplication(QObject):
             self.start_minimized = bool(value)
 
     def verify_integrity(self) -> None:
-        """Run blob verification and report the result."""
-        try:
-            result = self.dispatch_ui("vault.verify_blobs", {})
-        except VaultError as exc:
-            QMessageBox.warning(self.window, i18n.tr("app.title"), error_message(exc))
+        """Verify every blob off the GUI thread: decrypting the whole vault takes minutes.
+
+        A dispatch would hold the service lock for the whole run, so the worker calls the session
+        directly (like the reindex/semantic workers) and the window keeps painting.
+        """
+        if self.self_test or self.session is None or self.session.is_locked:
             return
-        QMessageBox.information(
-            self.window,
-            i18n.tr("menu.verify"),
-            i18n.tr(
-                "settings.verify_result",
-                checked=result.get("checked", 0),
-                bad=len(result.get("bad", [])),
-            ),
+        if self._verify_dialog is not None:
+            return
+        progress: dict[str, Any] = {"done": 0, "total": 0, "finished": False}
+        dialog = QProgressDialog(self.window)
+        dialog.setWindowTitle(i18n.tr("menu.verify"))
+        dialog.setLabelText(i18n.tr("verify.running"))
+        dialog.setRange(0, 0)  # the count is only known once the walk starts
+        dialog.setCancelButton(None)
+        dialog.setMinimumDuration(0)
+        dialog.setWindowModality(Qt.WindowModality.WindowModal)
+        dialog.show()
+        timer = QTimer(self)
+        timer.setInterval(IMPORT_POLL_MS)
+
+        def poll() -> None:
+            total = int(progress.get("total") or 0)
+            if not total:
+                return
+            dialog.setRange(0, total)
+            dialog.setValue(int(progress.get("done") or 0))
+            dialog.setLabelText(
+                i18n.tr(
+                    "verify.progress",
+                    done=int(progress.get("done") or 0),
+                    total=total,
+                )
+            )
+
+        timer.timeout.connect(poll)
+        timer.start()
+        self._verify_dialog = dialog
+        self._verify_timer = timer
+        thread = threading.Thread(
+            target=self._verify_worker, args=(progress,), name="vault-verify", daemon=True
         )
+        thread.start()
+
+    def _verify_worker(self, progress: dict[str, Any]) -> None:
+        """Run the verification off the GUI thread and hand the result back by signal."""
+        try:
+            payload: dict[str, Any] = dict(self.session.verify_blobs(progress=progress) or {})
+        except Exception as exc:  # noqa: BLE001 - report, never crash the UI
+            payload = {"error": error_message(exc)}
+        self.verify_finished.emit(payload)
+
+    def _on_verify_finished(self, payload: Any) -> None:
+        """Close the indicator and report what the check found."""
+        if self._verify_timer is not None:
+            self._verify_timer.stop()
+            self._verify_timer = None
+        if self._verify_dialog is not None:
+            self._verify_dialog.close()
+            self._verify_dialog = None
+        data = dict(payload or {})
+        if data.get("error"):
+            QMessageBox.warning(self.window, i18n.tr("menu.verify"), str(data["error"]))
+            return
+        bad = [str(item) for item in data.get("bad") or []]
+        message = i18n.tr(
+            "settings.verify_result", checked=int(data.get("checked", 0)), bad=len(bad)
+        )
+        if bad:
+            message += "\n\n" + "\n".join(bad[:10])
+        QMessageBox.information(self.window, i18n.tr("menu.verify"), message)
 
     def semantic_index_now(self) -> bool:
         """Rebuild the semantic index in the background (SPEC/01 §11).
@@ -1720,6 +1848,9 @@ class VaultApplication(QObject):
         if self.session is None or self.session.is_locked:
             self._notify_web_problem(i18n.tr("error.VAULT_LOCKED"))
             return False
+        if self.session.sync_mode() == "journal":
+            # Journal mode must not mirror the index; the same click means the op-log sync.
+            return bool(self.sync_journal_now().get("ok"))
         manager = self.session.sync_manager()
         if not manager.config.configured:
             notifications.notify(
@@ -1854,6 +1985,150 @@ class VaultApplication(QObject):
         if conflicts:
             message += " · " + i18n.tr("sync.conflicts", count=len(conflicts))
         notifications.notify(i18n.tr("notification.sync_title"), message, tray=self.tray)
+
+    def migrate_sync(self) -> dict[str, Any]:
+        """Adopt the operation log after telling the user what it uploads the first time."""
+        answer = QMessageBox.question(
+            self.window,
+            i18n.tr("migrate.title"),
+            i18n.tr("migrate.question"),
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if answer != QMessageBox.Yes:
+            return {"ok": False, "cancelled": True}
+        try:
+            result = dict(self.dispatch_ui("vault.migrate_journal", {}).get("result") or {})
+        except Exception as exc:  # noqa: BLE001 - report, never crash the window
+            notifications.notify(
+                i18n.tr("migrate.title"), i18n.tr("conflicts.failed", reason=str(exc)), tray=self.tray
+            )
+            return {"ok": False, "error": str(exc)}
+        message = (
+            i18n.tr("migrate.already")
+            if result.get("already")
+            else i18n.tr(
+                "migrate.done",
+                files=int(result.get("files", 0)),
+                notes=int(result.get("notes", 0)),
+                learning=int(result.get("learning", 0)),
+                pending=int(result.get("pending", 0)),
+            )
+        )
+        notifications.notify(i18n.tr("migrate.title"), message, tray=self.tray)
+        self.hub.notify()
+        return {"ok": True, **result}
+
+    def sync_journal_now(self) -> dict[str, Any]:
+        """Run the lock-free multi-client sync, in slices, then ask about anything that conflicts."""
+        if self._journal_sync is not None:
+            notifications.notify(
+                i18n.tr("notification.sync_title"), i18n.tr("sync.syncing"), tray=self.tray
+            )
+            return {"ok": False, "running": True}
+        if self.session is None or self.session.is_locked:
+            self._notify_web_problem(i18n.tr("error.VAULT_LOCKED"))
+            return {"ok": False, "error": "locked"}
+        self._journal_sync = {"pushed": 0, "applied": 0, "conflicts": 0, "pending": 0, "more": True}
+        self._journal_sync_timer.start()
+        return {"ok": True, "started": True}
+
+    def _journal_sync_step(self) -> None:
+        """Run one slice of the sync (a push or a pull), then schedule the next — or finish."""
+        job = self._journal_sync
+        if job is None:
+            return
+        try:
+            data = dict(
+                self.dispatch_ui(
+                    "vault.sync_journal", {"max_ops": JOURNAL_SYNC_STEP}
+                ).get("result")
+                or {}
+            )
+        except Exception as exc:  # noqa: BLE001 - report, never crash the window
+            self._journal_sync = None
+            notifications.notify(
+                i18n.tr("notification.sync_title"),
+                i18n.tr("notification.sync_failed", reason=i18n.sync_reason(str(exc))),
+                tray=self.tray,
+            )
+            return
+        pushed = int(data.get("pushed", 0) or 0)
+        job["pushed"] += pushed
+        job["applied"] += int(data.get("applied", 0) or 0)
+        job["conflicts"] = int(data.get("conflicts", 0) or 0)
+        job["pending"] = int(data.get("pending", 0) or 0)
+        job["more"] = bool(data.get("more"))
+        if job["more"]:
+            if not pushed and not int(data.get("applied", 0) or 0) and not job["pending"]:
+                # Nothing moved and nothing is queued: report it instead of spinning the timer.
+                self._journal_sync = None
+                if self.window is not None:
+                    self.window.statusBar().clearMessage()
+                notifications.notify(
+                    i18n.tr("notification.sync_title"), i18n.tr("sync.push_failed"), tray=self.tray
+                )
+                return
+            if self.window is not None:
+                self.window.statusBar().showMessage(
+                    i18n.tr(
+                        "sync.step_progress",
+                        pushed=job["pushed"],
+                        remaining=job["pending"],
+                    )
+                )
+            self._journal_sync_timer.start()
+            return
+        self._journal_sync = None
+        if self.window is not None:
+            self.window.statusBar().clearMessage()
+        message = i18n.tr(
+            "notification.sync_journal_done",
+            pushed=job["pushed"],
+            applied=job["applied"],
+        )
+        conflicts = int(job["conflicts"] or 0)
+        if conflicts:
+            message += " · " + i18n.tr("sync.conflicts", count=conflicts)
+        notifications.notify(i18n.tr("notification.sync_title"), message, tray=self.tray)
+        self.hub.notify()
+        if conflicts:
+            self.show_conflicts()
+
+    def show_conflicts(self) -> int:
+        """Ask the user about every pending sync conflict (never answers one for them)."""
+        try:
+            data = self.dispatch_ui("vault.conflicts", {})
+        except Exception as exc:  # noqa: BLE001
+            notifications.notify(
+                i18n.tr("sync.conflicts"), i18n.tr("conflicts.failed", reason=str(exc)), tray=self.tray
+            )
+            return 0
+        pending = list(data.get("conflicts") or [])
+        if not pending:
+            notifications.notify(
+                i18n.tr("sync.conflicts"), i18n.tr("conflicts.none"), tray=self.tray
+            )
+            return 0
+        dialog = ConflictsDialog(pending, self._resolve_conflict, self.window)
+        dialog.exec()
+        if dialog.resolved:
+            self.hub.notify()
+            notifications.notify(
+                i18n.tr("sync.conflicts"),
+                i18n.tr("conflicts.resolved", count=int(dialog.resolved)),
+                tray=self.tray,
+            )
+        return int(dialog.resolved)
+
+    def _resolve_conflict(self, conflict_id: int, choice: str) -> dict[str, Any]:
+        """Answer one conflict through the service (the decision becomes an op)."""
+        return dict(
+            self.dispatch_ui(
+                "vault.resolve_conflict", {"id": int(conflict_id), "choice": choice}
+            ).get("result")
+            or {}
+        )
 
     def test_sync_connection(self) -> dict[str, Any]:
         """Test the S3 connection and show the result (Settings button)."""
@@ -2357,16 +2632,6 @@ class VaultApplication(QObject):
             self._notify_agent_access(event)
         if self.window is not None and event.get("kind") == "read":
             self.window.set_last_read(event)
-
-    def _on_editor_direction(self, mode: str) -> None:
-        """Persist the editor's bidi mode in ``ui.json`` (SPEC/08 §A.3)."""
-        if mode not in ("auto", "rtl", "ltr"):
-            return
-        self.config.data["editor_direction"] = mode
-        try:
-            self.config.save()
-        except Exception:  # noqa: BLE001 - persistence is best effort
-            pass
 
     def set_theme(self, preference: str) -> str:
         """Switch the appearance live and persist it in ``ui.json`` (SPEC/03 §2.1).

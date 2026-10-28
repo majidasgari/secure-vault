@@ -114,7 +114,9 @@
 
   function toggleTheme() {
     state.theme = state.theme === "dark" ? "light" : "dark";
-    try { sessionStorage.setItem(THEME_KEY, state.theme); } catch (e) { /* ignore */ }
+    //: Appearance is a client preference, not vault data, and he picks it once per machine: store
+    //: it where it survives a restart. The session token stays in sessionStorage on purpose.
+    try { localStorage.setItem(THEME_KEY, state.theme); } catch (e) { /* ignore */ }
     applyTheme();
   }
 
@@ -1063,24 +1065,29 @@
     notes.textContent = "";
     files.forEach(function (entry) {
       var li = document.createElement("li");
-      li.className = "note-row";
+      //: `file-row` turns the listing into columns (name flexes, date and note keep fixed tracks);
+      //: see styles.css. Other note rows (search results, learning) stay as they are.
+      li.className = "note-row file-row";
       var emoji = emojiSpan(entry);
       if (emoji) { li.appendChild(emoji); }
       var badge = document.createElement("span");
       badge.className = "badge";
       badge.textContent = levelIcon(entry.sensitivity);
       var name = document.createElement("span");
+      name.className = "col-name";
       name.dir = "auto";
       name.textContent = entry.name;
       var date = document.createElement("span");
-      date.className = "meta";
+      date.className = "meta col-date";
+      //: A timestamp is LTR text; `dir="auto"` inside an RTL row would reorder its parts.
+      date.dir = "ltr";
       date.textContent = formatDate(entry.mtime);
       li.appendChild(badge);
       li.appendChild(name);
       li.appendChild(date);
       if (entry.note) {
         var noteSpan = document.createElement("span");
-        noteSpan.className = "meta note-text";
+        noteSpan.className = "meta note-text col-note";
         noteSpan.dir = "auto";
         noteSpan.textContent = "📝 " + entry.note;
         li.appendChild(noteSpan);
@@ -1766,7 +1773,7 @@
   //: Ctrl+P and the «چاپ» button produce the same clean document. The stylesheet cannot decide the
   //: paper orientation per run, so it is stored here and written into the document as an `@page`
   //: rule: the print preview honours it, and the choice survives a reload of this tab.
-  //: Session storage, like the language and the theme, so the interface leaves nothing on disk.
+  //: Session storage, like the language, so the interface leaves nothing on disk.
   var PRINT_KEY = "vault_print";
 
   function savedPrintOrientation() {
@@ -2851,11 +2858,12 @@
         banner.hidden = true;
       }
     }
-    var button = $("#btn-sync");
-    if (button) {
+    ["#btn-sync", "#btn-sync-side"].forEach(function (selector) {
+      var button = $(selector);
+      if (!button) { return; }
       button.disabled = !sync.configured;
       button.title = sync.configured ? t("web.sync_now") : t("sync.not_configured");
-    }
+    });
     renderSyncProgress(sync.job);
     // Resume polling if a sync is already running (e.g. the tab was reloaded).
     if (sync.job && sync.job.running && !state.syncTimer) {
@@ -2929,6 +2937,10 @@
       showToast(t("web.sync_not_configured"), "warn");
       return;
     }
+    if (state.sync.mode === "journal") {
+      doJournalSync();
+      return;
+    }
     if (state.sync.readonly) {
       showToast(t("error.SYNC_READONLY"), "warn");
       return;
@@ -2940,6 +2952,33 @@
       }
       pollSync();
     }).catch(function (err) { showToast(errorText(err) || t("web.sync_failed"), "error"); });
+  }
+
+  function doJournalSync() {
+    showToast(t("sync.syncing"), "warn");
+    pushBusy();
+    var pushed = 0;
+    var applied = 0;
+    // Slices, not one call: the server holds its lock for a whole sync, so a big first push would
+    // freeze the desktop app that serves this page. 30 per call keeps every wait short.
+    function step(limit) {
+      return call("vault.sync_journal", { max_ops: limit }).then(function (result) {
+        var data = (result && result.result) || {};
+        pushed += data.pushed || 0;
+        applied += data.applied || 0;
+        if (data.more) { return step(limit); }
+        return data;
+      });
+    }
+    step(30).then(function (data) {
+      showToast(t("notification.sync_journal_done", {
+        pushed: pushed, applied: applied || (data.applied || 0)
+      }), "ok");
+      if (data.conflicts) { showToast(t("sync.conflicts", { count: data.conflicts }), "warn"); }
+      loadIndex();
+    }).catch(function (err) {
+      showToast(errorText(err) || t("web.sync_failed"), "error");
+    }).then(popBusy);
   }
 
   function doTakeControl() {
@@ -3260,6 +3299,8 @@
     });
     var syncButton = $("#btn-sync");
     if (syncButton) { syncButton.addEventListener("click", doSync); }
+    var sideSync = $("#btn-sync-side");
+    if (sideSync) { sideSync.addEventListener("click", doSync); }
     var takeButton = $("#btn-take-control");
     if (takeButton) { takeButton.addEventListener("click", doTakeControl); }
     $("#btn-theme").addEventListener("click", toggleTheme);
@@ -3463,7 +3504,7 @@
 
   function init() {
     try { state.lang = sessionStorage.getItem(LANG_KEY) || "fa"; } catch (e) { state.lang = "fa"; }
-    try { state.theme = sessionStorage.getItem(THEME_KEY) || "dark"; } catch (e) { state.theme = "dark"; }
+    try { state.theme = localStorage.getItem(THEME_KEY) || "dark"; } catch (e) { state.theme = "dark"; }
     applyDirection();
     applyTheme();
     readTokenFromHash();

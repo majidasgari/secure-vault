@@ -1,0 +1,459 @@
+{
+  "generated_by": "secure-vault/tools/make_journal_fixture.py",
+  "cases": [
+    {
+      "name": "put_on_current",
+      "op": {
+        "op_id": "desktop-25347",
+        "client": "desktop",
+        "seq": 7,
+        "ts": 1,
+        "kind": "put",
+        "path": "note.md",
+        "base_rev": 3,
+        "rev": 4,
+        "payload": {
+          "blob_id": "blob-incoming",
+          "size": 6,
+          "encrypted": 1,
+          "sensitivity": "normal"
+        }
+      },
+      "state": {
+        "current_rev": 3,
+        "tombstone_rev": 0,
+        "target_exists": false,
+        "source_exists": true,
+        "source_rev": 0
+      },
+      "expected": "apply"
+    },
+    {
+      "name": "put_on_stale",
+      "op": {
+        "op_id": "desktop-36256",
+        "client": "desktop",
+        "seq": 7,
+        "ts": 1,
+        "kind": "put",
+        "path": "note.md",
+        "base_rev": 3,
+        "rev": 4,
+        "payload": {
+          "blob_id": "blob-incoming",
+          "size": 6,
+          "encrypted": 1,
+          "sensitivity": "normal"
+        }
+      },
+      "state": {
+        "current_rev": 4,
+        "tombstone_rev": 0,
+        "target_exists": false,
+        "source_exists": true,
+        "source_rev": 0
+      },
+      "expected": "conflict"
+    },
+    {
+      "name": "put_new_file",
+      "op": {
+        "op_id": "desktop-05211",
+        "client": "desktop",
+        "seq": 7,
+        "ts": 1,
+        "kind": "put",
+        "path": "note.md",
+        "base_rev": 0,
+        "rev": 1,
+        "payload": {
+          "blob_id": "blob-incoming",
+          "size": 6,
+          "encrypted": 1,
+          "sensitivity": "normal"
+        }
+      },
+      "state": {
+        "current_rev": 0,
+        "tombstone_rev": 0,
+        "target_exists": false,
+        "source_exists": false,
+        "source_rev": 0
+      },
+      "expected": "apply"
+    },
+    {
+      "name": "put_after_our_delete",
+      "op": {
+        "op_id": "desktop-59212",
+        "client": "desktop",
+        "seq": 7,
+        "ts": 1,
+        "kind": "put",
+        "path": "note.md",
+        "base_rev": 3,
+        "rev": 4,
+        "payload": {
+          "blob_id": "blob-incoming",
+          "size": 6,
+          "encrypted": 1,
+          "sensitivity": "normal"
+        }
+      },
+      "state": {
+        "current_rev": 0,
+        "tombstone_rev": 5,
+        "target_exists": false,
+        "source_exists": false,
+        "source_rev": 0
+      },
+      "expected": "conflict"
+    },
+    {
+      "name": "put_after_older_delete",
+      "op": {
+        "op_id": "desktop-79916",
+        "client": "desktop",
+        "seq": 7,
+        "ts": 1,
+        "kind": "put",
+        "path": "note.md",
+        "base_rev": 4,
+        "rev": 5,
+        "payload": {
+          "blob_id": "blob-incoming",
+          "size": 6,
+          "encrypted": 1,
+          "sensitivity": "normal"
+        }
+      },
+      "state": {
+        "current_rev": 0,
+        "tombstone_rev": 2,
+        "target_exists": false,
+        "source_exists": false,
+        "source_rev": 0
+      },
+      "expected": "apply"
+    },
+    {
+      "name": "put_resolution",
+      "op": {
+        "op_id": "desktop-38690",
+        "client": "desktop",
+        "seq": 7,
+        "ts": 1,
+        "kind": "put",
+        "path": "note.md",
+        "base_rev": 3,
+        "rev": 4,
+        "payload": {
+          "blob_id": "blob-incoming",
+          "size": 6,
+          "encrypted": 1,
+          "sensitivity": "normal"
+        },
+        "resolution_of": "desktop-000001"
+      },
+      "state": {
+        "current_rev": 9,
+        "tombstone_rev": 0,
+        "target_exists": false,
+        "source_exists": true,
+        "source_rev": 0
+      },
+      "expected": "apply"
+    },
+    {
+      "name": "delete_on_current",
+      "op": {
+        "op_id": "desktop-88455",
+        "client": "desktop",
+        "seq": 7,
+        "ts": 1,
+        "kind": "delete",
+        "path": "note.md",
+        "base_rev": 2,
+        "rev": 3,
+        "payload": {}
+      },
+      "state": {
+        "current_rev": 2,
+        "tombstone_rev": 0,
+        "target_exists": false,
+        "source_exists": true,
+        "source_rev": 0
+      },
+      "expected": "apply"
+    },
+    {
+      "name": "delete_on_stale",
+      "op": {
+        "op_id": "desktop-60776",
+        "client": "desktop",
+        "seq": 7,
+        "ts": 1,
+        "kind": "delete",
+        "path": "note.md",
+        "base_rev": 2,
+        "rev": 3,
+        "payload": {}
+      },
+      "state": {
+        "current_rev": 5,
+        "tombstone_rev": 0,
+        "target_exists": false,
+        "source_exists": true,
+        "source_rev": 0
+      },
+      "expected": "conflict"
+    },
+    {
+      "name": "delete_missing",
+      "op": {
+        "op_id": "desktop-32948",
+        "client": "desktop",
+        "seq": 7,
+        "ts": 1,
+        "kind": "delete",
+        "path": "note.md",
+        "base_rev": 0,
+        "rev": 1,
+        "payload": {}
+      },
+      "state": {
+        "current_rev": 0,
+        "tombstone_rev": 0,
+        "target_exists": false,
+        "source_exists": false,
+        "source_rev": 0
+      },
+      "expected": "apply"
+    },
+    {
+      "name": "rename_free_target",
+      "op": {
+        "op_id": "desktop-79834",
+        "client": "desktop",
+        "seq": 7,
+        "ts": 1,
+        "kind": "rename",
+        "path": "target.md",
+        "base_rev": 4,
+        "rev": 5,
+        "payload": {
+          "from": "note.md"
+        }
+      },
+      "state": {
+        "current_rev": 0,
+        "tombstone_rev": 0,
+        "target_exists": false,
+        "source_exists": true,
+        "source_rev": 4
+      },
+      "expected": "apply"
+    },
+    {
+      "name": "rename_taken_target",
+      "op": {
+        "op_id": "desktop-66504",
+        "client": "desktop",
+        "seq": 7,
+        "ts": 1,
+        "kind": "rename",
+        "path": "target.md",
+        "base_rev": 4,
+        "rev": 5,
+        "payload": {
+          "from": "note.md"
+        }
+      },
+      "state": {
+        "current_rev": 0,
+        "tombstone_rev": 0,
+        "target_exists": true,
+        "source_exists": true,
+        "source_rev": 4
+      },
+      "expected": "conflict"
+    },
+    {
+      "name": "rename_stale_source",
+      "op": {
+        "op_id": "desktop-16815",
+        "client": "desktop",
+        "seq": 7,
+        "ts": 1,
+        "kind": "rename",
+        "path": "target.md",
+        "base_rev": 4,
+        "rev": 5,
+        "payload": {
+          "from": "note.md"
+        }
+      },
+      "state": {
+        "current_rev": 0,
+        "tombstone_rev": 0,
+        "target_exists": false,
+        "source_exists": true,
+        "source_rev": 6
+      },
+      "expected": "conflict"
+    },
+    {
+      "name": "rename_missing_source",
+      "op": {
+        "op_id": "desktop-83350",
+        "client": "desktop",
+        "seq": 7,
+        "ts": 1,
+        "kind": "rename",
+        "path": "target.md",
+        "base_rev": 4,
+        "rev": 5,
+        "payload": {
+          "from": "note.md"
+        }
+      },
+      "state": {
+        "current_rev": 0,
+        "tombstone_rev": 0,
+        "target_exists": false,
+        "source_exists": false,
+        "source_rev": 0
+      },
+      "expected": "apply"
+    },
+    {
+      "name": "note_on_current",
+      "op": {
+        "op_id": "desktop-56402",
+        "client": "desktop",
+        "seq": 7,
+        "ts": 1,
+        "kind": "note",
+        "path": "note.md",
+        "base_rev": 1,
+        "rev": 2,
+        "payload": {
+          "scope": "file",
+          "id": "6cb673986e8e4e3e3182b124bf3f6b7d",
+          "enc": "U1ZMVAEBAAAI38ePs3SQ7FiauGoNuKIozmPzBTq0j1Nl84CJn1c5z2PK2dyWNpdcM22Cy/Jj7k/aMIhp+IEKWFCNrzKi"
+        }
+      },
+      "state": {
+        "current_rev": 1,
+        "tombstone_rev": 0,
+        "target_exists": false,
+        "source_exists": true,
+        "source_rev": 0
+      },
+      "expected": "apply"
+    },
+    {
+      "name": "note_on_stale",
+      "op": {
+        "op_id": "desktop-90617",
+        "client": "desktop",
+        "seq": 7,
+        "ts": 1,
+        "kind": "note",
+        "path": "note.md",
+        "base_rev": 1,
+        "rev": 2,
+        "payload": {
+          "scope": "file",
+          "id": "104aecea4c4be200ebda09ba232fa0c4",
+          "enc": "U1ZMVAEBAADorgCNNNPVywWrXqP/tMsJN5OTYn9aTTou8XkLgfWd2SVDoET1bRntjAbEFoG56no96INL5x2FZwhLvIUC"
+        }
+      },
+      "state": {
+        "current_rev": 3,
+        "tombstone_rev": 0,
+        "target_exists": false,
+        "source_exists": true,
+        "source_rev": 0
+      },
+      "expected": "conflict"
+    },
+    {
+      "name": "tag_always_applies",
+      "op": {
+        "op_id": "desktop-92478",
+        "client": "desktop",
+        "seq": 7,
+        "ts": 1,
+        "kind": "tag",
+        "path": "note.md",
+        "base_rev": 1,
+        "rev": 2,
+        "payload": {
+          "tags": [
+            "کار"
+          ]
+        }
+      },
+      "state": {
+        "current_rev": 7,
+        "tombstone_rev": 0,
+        "target_exists": false,
+        "source_exists": true,
+        "source_rev": 0
+      },
+      "expected": "apply"
+    },
+    {
+      "name": "emoji_always_applies",
+      "op": {
+        "op_id": "desktop-63589",
+        "client": "desktop",
+        "seq": 7,
+        "ts": 1,
+        "kind": "emoji",
+        "path": "note.md",
+        "base_rev": 0,
+        "rev": 1,
+        "payload": {
+          "emoji": "📌"
+        }
+      },
+      "state": {
+        "current_rev": 2,
+        "tombstone_rev": 0,
+        "target_exists": false,
+        "source_exists": true,
+        "source_rev": 0
+      },
+      "expected": "apply"
+    },
+    {
+      "name": "learning_always_applies",
+      "op": {
+        "op_id": "desktop-35071",
+        "client": "desktop",
+        "seq": 7,
+        "ts": 1,
+        "kind": "learning",
+        "path": "note.md",
+        "base_rev": 1,
+        "rev": 2,
+        "payload": {
+          "stage": 2,
+          "due": 5,
+          "started": 1,
+          "seen": 4
+        }
+      },
+      "state": {
+        "current_rev": 5,
+        "tombstone_rev": 0,
+        "target_exists": false,
+        "source_exists": true,
+        "source_rev": 0
+      },
+      "expected": "apply"
+    }
+  ]
+}

@@ -54,7 +54,7 @@ vault home for known plaintext markers after writes.
 
 | level | see name (any source) | MCP read content | UI read content | content search | MCP request-open | UI viewer |
 |---|---|---|---|---|---|---|
-| `normal` | yes | **yes** | yes (no confirmation) | yes | yes | markdown/web preview |
+| `normal` | yes | **yes** | yes (no confirmation) | yes | yes | source editor; rendered view is the web UI in a browser |
 | `secret` | yes (+ label) | **no** | yes, **only after an explicit approval** | no | **no** | plain-text modal (web) / editor without preview (desktop) |
 | `secretfile` | yes (+ label) | **no** | **only after an explicit approval** | no | **yes** (`request_open_secret`; the user sees it, the agent never does) | native viewer (desktop) / plain-text modal (web) |
 

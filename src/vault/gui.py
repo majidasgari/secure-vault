@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Any
 
 from PySide6.QtCore import Qt, QTimer
-from PySide6.QtWidgets import QApplication, QDialogButtonBox, QMessageBox
+from PySide6.QtWidgets import QApplication, QDockWidget, QDialogButtonBox, QMessageBox
 
 from . import __version__
 from .config import DEFAULT_VAULT_HOME, runtime_dir, user_config
@@ -26,7 +26,6 @@ from .core import fingerprint, semantics
 from .core.session import VaultSession
 from .errors import Unauthorized
 from .util import now_ms
-from .ui import editor as editor_module
 from .ui import i18n, image_view, theme, viewer
 from .ui.app import VaultApplication
 from .ui.settings_dialog import SettingsDialog
@@ -247,29 +246,27 @@ def run_self_test(
     checks["tree_has_notes"] = window.tree_model.rowCount() > 0
 
     checks["open_normal"] = bool(window.open_file("/notes/hello.md"))
-    # The preview pane is off by default: a normal file *may* preview, but the pane appears only
-    # when the user asks for it (the View menu / the toolbar button), and that choice is kept for
-    # the next file instead of being reset by every open.
-    checks["preview_allowed_normal"] = bool(window.editor.preview_allowed)
-    checks["preview_hidden_by_default"] = window.editor.preview_enabled is False
+    # The editor is source-only now: no preview widget and no web view of a note (the rendered
+    # note is a browser matter), and the short note is one field on the editor's bottom line.
+    checks["editor_has_no_preview"] = not hasattr(window.editor, "preview")
+    checks["note_field_below_source"] = window.editor.note_edit.mapTo(
+        window.editor, window.editor.note_edit.rect().topLeft()
+    ).y() > window.editor.source.mapTo(
+        window.editor, window.editor.source.rect().bottomLeft()
+    ).y()
     checks["normal_content"] = "alpha world" in window.editor.source.toPlainText()
-    window.editor.set_preview_enabled(True)
-    checks["preview_on_request"] = window.editor.preview_enabled is True
-    checks["preview_kept_for_next_file"] = bool(window.open_file("/notes/hello.md")) and (
-        window.editor.preview_enabled is True
+    checks["direction_always_auto"] = (
+        not hasattr(window.editor, "direction_combo")
+        and window.editor._block_direction("متن فارسی", False) == "rtl"
+        and window.editor._block_direction("plain english", False) == "ltr"
     )
-    window.editor.set_preview_enabled(False)
-    checks["preview_off_again"] = window.editor.preview_enabled is False
 
     checks["open_secret"] = bool(window.open_file("/notes/secret.md"))
-    checks["preview_disabled_secret"] = window.editor.preview_enabled is False
     checks["secret_content"] = "secret alpha body" in window.editor.source.toPlainText()
 
-    web_before = editor_module.web_views_created
     checks["open_secretfile"] = bool(controller.open_path("/secrets/key.txt"))
     checks["viewer_text"] = viewer.last_text
     checks["viewer_uses_web"] = viewer.uses_web_engine
-    checks["web_views_for_secretfile"] = editor_module.web_views_created - web_before
     # A plain secret note carries no credential fields, so no copy button is offered for one.
     checks["viewer_actions_absent_for_note"] = not any((viewer.last_actions or {}).values())
 
@@ -282,7 +279,6 @@ def run_self_test(
         "کد یکبارمصرف (otp): otpauth://totp/demo?secret=JBSWY3DPEHPK3PXP\n".encode("utf-8"),
     )
     session.set_sensitivity("secrets/cred.md", "secretfile")
-    web_before = editor_module.web_views_created
     checks["open_secretfile_otp"] = bool(controller.open_path("/secrets/cred.md"))
     checks["viewer_otp_live"] = bool(viewer.last_otp and viewer.last_otp["live"])
     checks["viewer_otp_digits"] = len(viewer.last_otp["code"]) if viewer.last_otp else 0
@@ -298,7 +294,6 @@ def run_self_test(
         and viewer.last_otp["remaining"] is not None
         and 0 < viewer.last_otp["remaining"] <= viewer.last_otp["period"]
     )
-    checks["web_views_for_otp"] = editor_module.web_views_created - web_before
 
     # Pictures go to the native image viewer, not the editor or a web engine (SPEC/03 §2.4).
     picture = _png_bytes()
@@ -307,11 +302,11 @@ def run_self_test(
     session.set_sensitivity("secrets/scan.png", "secret")
     checks["image_suffix_yes"] = image_view.looks_like_image("/notes/shot.png")
     checks["image_suffix_no"] = image_view.looks_like_image("/notes/hello.md")
-    web_before = editor_module.web_views_created
+    web_before = image_view.web_views_created
     checks["open_image"] = bool(window.open_file("/notes/shot.png"))
     checks["image_size"] = image_view.last_size
     checks["image_bytes_roundtrip"] = controller.read_bytes("/notes/shot.png") == picture
-    checks["image_uses_web"] = editor_module.web_views_created - web_before
+    checks["image_uses_web"] = image_view.web_views_created - web_before
     checks["image_viewer_open"] = bool(getattr(window, "image_viewer", None))
     checks["open_secret_image"] = bool(controller.open_path("/secrets/scan.png"))
     checks["secret_image_shown"] = image_view.last_path == "/secrets/scan.png"
@@ -412,24 +407,22 @@ def run_self_test(
     checks["log_rows"] = window.log_panel.row_count()
     checks["log_grows"] = window.log_panel.row_count() > log_before
 
-    # Search sits before the access log (the everyday action first), and the arrangement the
-    # user sets — geometry, dock state, active tab, preview, split — is written to ui.json so
-    # the next start looks the way they left it instead of snapping back to a default.
-    checks["search_tab_first"] = (
-        window.right_tabs.indexOf(window.browser) == 0
-        and window.right_tabs.indexOf(window.search_panel) == 1
-        and window.right_tabs.indexOf(window.learning_panel) == 2
-        and window.right_tabs.indexOf(window.log_panel) == 3
+    # Each of the four side panels is a dock of its own, and they start as one tab group: two
+    # panels in the same place *are* a tab group, which is the only way tabs appear here.
+    checks["four_panel_docks"] = len(window.docks) == 4
+    checks["panels_start_tabbed"] = all(
+        window.tabifiedDockWidgets(dock) for dock in window.docks.values()
     )
-    # The browser is a tab of the side dock now, not a dock of its own.
-    checks["browser_in_side_dock"] = window.right_tabs.widget(0) is window.browser
-    checks["no_browser_dock"] = not hasattr(window, "browser_dock")
-    window.right_dock.setVisible(False)
+    checks["panels_movable"] = all(
+        bool(dock.features() & QDockWidget.DockWidgetFeature.DockWidgetMovable)
+        and bool(dock.features() & QDockWidget.DockWidgetFeature.DockWidgetFloatable)
+        for dock in window.docks.values()
+    )
+    window.docks["browser"].setVisible(False)
     window.actions["browser_dock"].trigger()
     qapp.processEvents()
-    checks["view_menu_browser_tab"] = (
-        not window.right_dock.isHidden()
-        and window.right_tabs.currentWidget() is window.browser
+    checks["view_menu_browser_panel"] = (
+        not window.docks["browser"].isHidden() and window._raised_panel == "browser"
     )
 
     # The centre list is not a dead end: a double-click on a folder row walks into it, and the
@@ -470,18 +463,16 @@ def run_self_test(
         panel.due_list.count() == 0 and panel.ahead_list.count() == 1
     )
     window._toggle_learning("/notes/hello.md", True)
-    checks["learning_menu_shows_tab"] = window.right_tabs.currentWidget() is panel
+    checks["learning_menu_shows_panel"] = window._raised_panel == "learning"
     session.learning_stop("notes/hello.md")
-    window.right_tabs.setCurrentIndex(window.right_tabs.indexOf(window.log_panel))
+    window.show_panel("log")
     window.save_layout()
     saved_layout = dict(controller.config.data.get("window") or {})
     checks["layout_saved"] = all(
-        key in saved_layout for key in ("geometry", "state", "right_tab", "preview")
+        key in saved_layout for key in ("geometry", "state", "docks", "dock_raised")
     )
-    checks["layout_tab_saved"] = (
-        saved_layout.get("right_tab") == window.right_tabs.currentIndex()
-    )
-    window.right_tabs.setCurrentIndex(window.right_tabs.indexOf(window.search_panel))
+    checks["layout_raised_saved"] = saved_layout.get("dock_raised") == "log"
+    window.show_panel("search")
 
     controller.set_language("en")
     window.retranslate()
@@ -534,15 +525,14 @@ def run_self_test(
         bool(value)
         for key, value in checks.items()
         if key not in ("tree_rows", "viewer_text", "viewer_uses_web",
-                       "web_views_for_secretfile", "search_filename", "search_text",
+                       "search_filename", "search_text",
                        "search_semantic", "last_results_filename", "log_rows",
-                       "image_suffix_no", "image_uses_web", "image_size",
-                       "web_views_for_otp")
+                       "image_suffix_no", "image_uses_web", "image_size")
     )
 
-    # The preview falls back to a text browser when the engine cannot render headlessly, and the
-    # abandoned web view is removed with `deleteLater()`: a pending deletion left to the
-    # application teardown segfaults in QtWebEngine, so run the queue once while Qt is healthy.
+    # Web views left behind by a viewer/image teardown are removed with `deleteLater()`: a pending
+    # deletion left to the application teardown segfaults in QtWebEngine, so run the queue once
+    # while Qt is healthy.
     qapp.processEvents()
 
     return SelfTestResult(

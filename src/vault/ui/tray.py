@@ -58,6 +58,8 @@ class TrayIcon(QObject):
         on_search: Callable[[], None] | None = None,
         on_sync: Callable[[], None] | None = None,
         on_take_control: Callable[[], None] | None = None,
+        on_new_note: Callable[[], None] | None = None,
+        on_new_credential: Callable[[], None] | None = None,
         parent: Any = None,
     ) -> None:
         """Try to install a tray icon; degrade silently when unavailable."""
@@ -80,6 +82,10 @@ class TrayIcon(QObject):
             self.tray = QSystemTrayIcon(icon, parent)
             menu = QMenu()
             for name, callback in (
+                # The same two actions the phone's notification carries: a note where the last one
+                # was, and a standard credential entry.
+                ("new_note", on_new_note),
+                ("new_credential", on_new_credential),
                 ("show", on_show),
                 ("open_web", on_open_web),
                 ("copy_link", on_copy_link),
@@ -235,6 +241,8 @@ class TrayIcon(QObject):
     def retranslate(self) -> None:
         """Re-apply translated menu labels and tooltip."""
         labels = {
+            "new_note": "tray.new_note",
+            "new_credential": "tray.new_credential",
             "show": "tray.show",
             "open_web": "tray.open_web",
             "copy_link": "tray.copy_link",

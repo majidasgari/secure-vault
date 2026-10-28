@@ -290,7 +290,7 @@ The matrix that must hold (design §4 + §7.3):
 
 | level | see name (any source) | MCP read content | UI read content | content search | MCP request-open | UI viewer |
 |---|---|---|---|---|---|---|
-| `normal` | yes | yes | yes (no confirm) | yes | yes | web preview |
+| `normal` | yes | yes | yes (no confirm) | yes | yes | source editor (rendered: browser) |
 | `secret` | yes (+label) | **no** | yes, **after a confirmation dialog + tray notification** | no | **no** | native viewer (via UI confirm) |
 | `secretfile` | yes (+label) | **no** | **native plain-text viewer only**, confirmation required | no | **yes** (`request_open_secret` → the UI window opens; the agent never receives content) | native viewer |
 

@@ -1,241 +1,41 @@
-"""Markdown editor with a side preview (SPEC/03 §2.3, SPEC/08 §A).
+"""Markdown source editor (SPEC/03 §2.3, SPEC/08 §A).
 
-The preview is a :class:`QWebEngineView` when QtWebEngine imports, otherwise a
-:class:`QTextBrowser`. ``preview_enabled`` is False for ``secret``/``secretfile`` files
-and secret text is never handed to the preview widget.
+There is no preview pane: the rendered note lives in the web UI (the browser), which is where
+the user goes when they want to read the output. The editor is the source plus the version
+history and the two "work on this file elsewhere" buttons.
 
-The preview is refreshed **on demand** (the toolbar Preview button, the View menu or when a
-file is opened) instead of after every keystroke: re-rendering a large note on each edit was
-slow and stole the caret.
-
-SPEC/08 adds bidi-correct editing: every block gets its own text direction/alignment
-(``auto`` follows :mod:`vault.ui.bidi`, ``rtl``/``ltr`` force the whole document) and
-fenced code is rendered monospace. Editing only reformats the block under the caret — a full
-document pass on every keystroke re-laid out (and janked) large notes. The formatting pass
+SPEC/08 adds bidi-correct editing: every block gets its own text direction/alignment, decided
+per block from :mod:`vault.ui.bidi` — there is no manual override, the direction is always
+automatic. Fenced code is rendered monospace. Editing only reformats the block under the caret —
+a full document pass on every keystroke re-laid out (and janked) large notes. The formatting pass
 never marks the document dirty.
 """
 
 from __future__ import annotations
 
-import html
 import logging
-import re
-from html.parser import HTMLParser
 from typing import Any
 from urllib.parse import quote
 
 from PySide6.QtCore import Qt, QTimer, Signal
-from PySide6.QtGui import QKeySequence, QShortcut, QTextBlockFormat, QTextCursor
+from PySide6.QtGui import QTextBlockFormat, QTextCursor
 from PySide6.QtWidgets import (
-    QComboBox,
     QHBoxLayout,
     QLabel,
     QLineEdit,
     QPushButton,
-    QSplitter,
-    QTextBrowser,
     QTextEdit,
     QVBoxLayout,
     QWidget,
 )
 
-from . import bidi, i18n, theme
-from .highlight import MarkdownHighlighter, pick_palette
+from . import bidi, i18n
+from .highlight import MarkdownHighlighter
 
 _LOG = logging.getLogger(__name__)
 
-web_views_created = 0
-"""Count of :class:`QWebEngineView` instances created (used by the smoke test)."""
-
 _BIDI_DEBOUNCE_MS = 150
-_MONOSPACE = "ui-monospace, DejaVu Sans Mono, Consolas, monospace"
-_DIRECTIONS = ("auto", "rtl", "ltr")
-#: How long to wait before checking that the web preview actually painted something.
-_PREVIEW_CHECK_MS = 1500
-#: A rendered page shorter than this means the engine produced nothing usable.
-_PREVIEW_MIN_HTML = 200
-#: How often to read a web preview's scroll position (it has no Qt scrollbar).
-_SCROLL_POLL_MS = 180
-#: Ignore the other pane's scroll events for this long after driving it.
-_SCROLL_LOCK_MS = 120
-_MODE_KEYS = {"auto": "editor.mode_auto", "rtl": "editor.mode_rtl", "ltr": "editor.mode_ltr"}
 _DIRECTION_KEYS = {"rtl": "editor.direction_rtl", "ltr": "editor.direction_ltr"}
-
-_DIRECTION_TAGS = ("p", "li", "td", "th", "dd", "dt", "blockquote", "ul", "ol", "table",
-                   "h1", "h2", "h3", "h4", "h5", "h6")
-_BLOCK_TAG = re.compile(r"<(" + "|".join(_DIRECTION_TAGS) + r")(\s|>)", re.IGNORECASE)
-_CODE_TAG = re.compile(r"<(code)(\s|>)")
-
-
-_RTL_LETTERS = re.compile(r"[\u0590-\u05ff\u0600-\u06ff\u0750-\u077f\ufb50-\ufdff\ufe70-\ufeff]")
-_LATIN_LETTERS = re.compile(r"[A-Za-z]")
-
-
-class _BlockDirections(HTMLParser):
-    """Direction of every block element, decided from that element's own text.
-
-    Max's rule for displayed content: even one Persian/Arabic letter makes the block RTL *and*
-    right-aligned, a block without one is LTR and left-aligned (the alignment comes from the
-    stylesheet, keyed on the ``dir`` attribute). Text inside ``pre``/``code`` never decides a
-    direction — code is always left to right — but a block that contains code still follows the
-    text around it. Container elements (``ul``/``ol``/``table``/``blockquote``) see the text of
-    their descendants, so one RTL item puts the markers of the whole list on the right.
-    """
-
-    def __init__(self) -> None:
-        super().__init__(convert_charrefs=True)
-        self.nodes: list[tuple[str, list[str]]] = []
-        self._open: list[tuple[str, list[str]]] = []
-        self._code = 0
-
-    def handle_starttag(self, tag: str, attrs: list) -> None:  # noqa: ARG002 - parser API
-        if tag in ("pre", "code"):
-            self._code += 1
-            return
-        if tag in _DIRECTION_TAGS:
-            node: tuple[str, list[str]] = (tag, [])
-            self._open.append(node)
-            self.nodes.append(node)
-
-    def handle_endtag(self, tag: str) -> None:
-        if tag in ("pre", "code"):
-            self._code = max(0, self._code - 1)
-            return
-        for index in range(len(self._open) - 1, -1, -1):
-            if self._open[index][0] == tag:
-                node = self._open.pop(index)
-                for ancestor in self._open:      # ancestors see their descendants' text
-                    ancestor[1].append("".join(node[1]))
-                return
-
-    def handle_data(self, data: str) -> None:
-        if self._code:
-            return
-        for node in self._open:
-            node[1].append(data)
-
-    def directions(self) -> list[tuple[str, str]]:
-        """``[(tag, "rtl"|"ltr"), …]`` in document order (open-tag order)."""
-        return [(tag, "rtl" if _RTL_LETTERS.search("".join(text)) else "ltr")
-                for tag, text in self.nodes]
-
-
-def is_rtl_text(text: str) -> bool:
-    """True when ``text`` contains at least one RTL letter (the user's rule).
-
-    Any Persian/Arabic character makes the document RTL; every block inside it carries its own
-    ``dir`` as well, so Latin blocks stay left-aligned. Text with no letters at all follows the UI
-    language.
-    """
-    rtl = len(_RTL_LETTERS.findall(text))
-    latin = len(_LATIN_LETTERS.findall(text))
-    if rtl == latin == 0:
-        return i18n.lang == "fa"
-    return rtl > 0
-
-
-def preview_css(direction: str, palette: dict[str, str] | None = None) -> str:
-    """Return the Kate-like stylesheet used by the preview, for ``direction``."""
-    colors = dict(palette or pick_palette())
-    mono = _MONOSPACE
-    return f"""
-    html, body {{ margin: 0; padding: 10px 14px; }}
-    body {{
-      direction: {direction};
-      background: {colors['bg']};
-      color: {colors['text']};
-      font-family: "Vazirmatn", "Noto Sans Arabic", sans-serif;
-      font-size: 15px; line-height: 1.8;
-    }}
-    h1, h2, h3, h4, h5, h6 {{ color: {colors['heading']}; margin: 1.1em 0 .45em; line-height: 1.4; }}
-    h1 {{ font-size: 1.65em; border-bottom: 1px solid {colors['border']}; padding-bottom: .2em; }}
-    h2 {{ font-size: 1.35em; }}
-    h3 {{ font-size: 1.15em; }}
-    [dir="rtl"] {{ direction: rtl; text-align: right; }}
-    [dir="ltr"] {{ direction: ltr; text-align: left; }}
-    strong {{ color: {colors['text']}; font-weight: 700; }}
-    em {{ color: {colors['quote']}; }}
-    a {{ color: {colors['link']}; text-decoration: none; }}
-    a:hover {{ text-decoration: underline; }}
-    code {{
-      background: {colors['code_bg']}; color: {colors['code']}; border-radius: 4px;
-      padding: 1px 4px; font-family: {mono}; font-size: .92em;
-      direction: ltr; unicode-bidi: embed;
-    }}
-    pre {{
-      background: {colors['code_bg']}; border: 1px solid {colors['border']};
-      border-radius: 6px; padding: 10px 12px; overflow-x: auto;
-      direction: ltr; text-align: left;
-    }}
-    pre code {{ background: none; padding: 0; font-size: .9em; }}
-    blockquote {{
-      margin: .8em 0; padding: .1em .9em; color: {colors['quote']};
-      border-{ 'right' if direction == 'rtl' else 'left' }: 3px solid {colors['accent']};
-    }}
-    hr {{ border: 0; border-top: 1px solid {colors['border']}; margin: 1.2em 0; }}
-    ul, ol {{ padding-{ 'right' if direction == 'rtl' else 'left' }: 1.6em; }}
-    ul[dir="rtl"], ol[dir="rtl"] {{ padding-left: 0; padding-right: 1.6em; }}
-    ul[dir="ltr"], ol[dir="ltr"] {{ padding-right: 0; padding-left: 1.6em; }}
-    li {{ margin: .18em 0; }}
-    li.task-list-item {{ list-style: none; margin-{ 'right' if direction == 'rtl' else 'left' }: -1.2em; }}
-    input[type=checkbox] {{ margin-{ 'left' if direction == 'rtl' else 'right' }: .45em; }}
-    table {{ border-collapse: collapse; margin: .8em 0; }}
-    th, td {{ border: 1px solid {colors['border']}; padding: 5px 9px; }}
-    th {{ background: {colors['code_bg']}; color: {colors['heading']}; }}
-    img {{ max-width: 100%; }}
-    """
-
-
-def _apply_block_directions(body: str) -> str:
-    """Give every block an explicit ``dir`` taken from that block's own text (Max's rule)."""
-    parser = _BlockDirections()
-    fallback = "rtl" if _RTL_LETTERS.search(body) else "ltr"
-    try:
-        parser.feed(body)
-        parser.close()
-        directions: Any = iter(parser.directions())
-    except Exception:  # noqa: BLE001 - never fail to show something
-        directions = iter(())
-
-    def annotate(match: re.Match) -> str:
-        try:
-            tag, direction = next(directions)
-        except StopIteration:
-            tag, direction = match.group(1), fallback
-        return f'<{tag} dir="{direction}"{match.group(2)}'
-
-    return _BLOCK_TAG.sub(annotate, body)
-
-
-def render_markdown(text: str) -> str:
-    """Render ``text`` as safe HTML (raw HTML disabled), with per-block direction.
-
-    Every block element carries its own ``dir`` (``rtl`` when it holds even one Persian/Arabic
-    letter, else ``ltr``) and ``pre``/``code`` are always ``ltr``, so a mixed document renders
-    correctly (SPEC/08 §A.5). The stylesheet follows the application theme and turns that attribute
-    into alignment, and gives markdown the colour coding the user liked in Kate (headings, inline
-    code, fenced code blocks, quotes, tables, links).
-    """
-    try:
-        from markdown_it import MarkdownIt
-
-        md = MarkdownIt("commonmark", {"html": False})
-        # GFM tables and strikethrough: commonmark alone renders ``|---|`` as plain text.
-        md.enable("table")
-        md.enable("strikethrough")
-        body = md.render(text)
-    except Exception:  # noqa: BLE001 - never fail to show something
-        body = "<pre>" + html.escape(text) + "</pre>"
-    body = _apply_block_directions(body)
-    body = body.replace("<pre>", '<pre dir="ltr">')
-    body = _CODE_TAG.sub(lambda m: f'<code dir="ltr"{m.group(2)}', body)
-    direction = "rtl" if is_rtl_text(text) else "ltr"
-    lang = "fa" if direction == "rtl" else "en"
-    return (
-        "<!doctype html><html dir='{}' lang='{}'><head><meta charset='utf-8'/>"
-        "<style>{}</style></head><body>{}</body></html>"
-    ).format(direction, lang, preview_css(direction), body)
-
 
 def _fence_flags(lines: list[str]) -> list[bool]:
     """Return a per-line flag marking fence delimiter lines and fence content."""
@@ -253,84 +53,44 @@ def _fence_flags(lines: list[str]) -> list[bool]:
 
 
 class EditorPanel(QWidget):
-    """The markdown source editor plus its preview pane."""
+    """The markdown source editor (no preview pane — the browser renders the note)."""
 
     save_requested = Signal(str, str)
     content_changed = Signal()
     open_in_browser = Signal(str)
     open_text_editor = Signal(str)
-    direction_changed = Signal(str)
     #: ``(path, note)`` when the user edits the short note of the open file.
     note_changed = Signal(str, str)
     #: Emitted with the current path when the user asks for the version history.
     history_requested = Signal(str)
-    #: Emitted when the preview pane is shown/hidden, so the View menu can follow the button.
-    preview_changed = Signal(bool)
 
     def __init__(self, parent: Any = None) -> None:
         """Create an empty editor."""
         super().__init__(parent)
         self.current_path: str | None = None
-        # The preview pane is OFF until the user asks for it (View menu / the toolbar button);
-        # `_preview_preference` is that wish, remembered across files and across restarts.
-        self.preview_enabled = False
-        self._preview_preference = False
-        self.preview_allowed = True
-        self.preview_kind = "text"
         self.web_port: int | None = None
         self.locked = True
         self._dirty = False
         self._loading = False
         self._formatting = False
-        self._direction_mode = "auto"
         self._loading_note = False
-        self._scroll_lock = False
-        self._last_preview_fraction = 0.0
-        self._preview_poll: QTimer | None = None
-        self._preview_checked = False
-        self._split_applied = False
-        #: The user's own source/preview split, as ratios, plus whether a restored one still has
-        #: to be applied (the preview may be hidden at the moment the layout is restored).
-        self._split_ratio: list[float] | None = None
-        self._split_pending = False
-        self._preview_load_ok: bool | None = None
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
 
         toolbar = QHBoxLayout()
-        self.direction_combo = QComboBox(self)
-        for mode in _DIRECTIONS:
-            self.direction_combo.addItem("", mode)
-        self.direction_combo.currentIndexChanged.connect(self._on_direction_changed)
-        self.direction_label = QLabel(self)
-        self.preview_button = QPushButton(self)
-        self.preview_button.clicked.connect(self._on_preview_clicked)
         self.browser_button = QPushButton(self)
         self.browser_button.clicked.connect(self._on_browser_clicked)
         self.text_editor_button = QPushButton(self)
         self.text_editor_button.clicked.connect(self._on_text_editor_clicked)
         self.history_button = QPushButton(self)
         self.history_button.clicked.connect(self._on_history_clicked)
-        toolbar.addWidget(self.direction_label)
-        toolbar.addWidget(self.direction_combo)
         toolbar.addStretch(1)
-        toolbar.addWidget(self.preview_button)
         toolbar.addWidget(self.history_button)
         toolbar.addWidget(self.text_editor_button)
         toolbar.addWidget(self.browser_button)
         layout.addLayout(toolbar)
 
-        note_row = QHBoxLayout()
-        self.note_label = QLabel(self)
-        self.note_edit = QLineEdit(self)
-        self.note_edit.setClearButtonEnabled(True)
-        self.note_edit.editingFinished.connect(self._on_note_edited)
-        note_row.addWidget(self.note_label)
-        note_row.addWidget(self.note_edit, 1)
-        layout.addLayout(note_row)
-
-        self.splitter = QSplitter(Qt.Horizontal, self)
         self.source = QTextEdit(self)
         # ``QTextEdit`` and not ``QPlainTextEdit``: the plain-text layout engine
         # (``QPlainTextDocumentLayout``) ignores a block's alignment, so Persian lines stayed
@@ -341,28 +101,20 @@ class EditorPanel(QWidget):
         self.source.setPlaceholderText(i18n.tr("editor.placeholder"))
         # Kate-like markdown colours (character formats) — the bidi pass owns block formats.
         self.highlighter = MarkdownHighlighter(self.source.document())
-        self.preview = self._create_preview()
-        self.preview.setMinimumWidth(260)
-        self.splitter.addWidget(self.source)
-        self.splitter.addWidget(self.preview)
-        self.splitter.setStretchFactor(0, 1)
-        self.splitter.setStretchFactor(1, 1)
-        # Without an explicit split the web view is handed 0 px and the whole lower area looks
-        # empty (the "wasted space" bug): give both panes half of the width, and never let a
-        # child collapse to nothing.
-        self.splitter.setChildrenCollapsible(False)
-        self.splitter.setSizes([1, 1])
-        layout.addWidget(self.splitter, 1)
-        # The preview pane is off by default, but it is hidden on the panel's first *show* rather
-        # than here: a QWebEngineView that is hidden before it was ever shown tears down inside Qt
-        # Quick's render control and crashes the process on exit (measured: 3 of 4 offscreen test
-        # runs with the hide in __init__, 0 of 4 with it in showEvent, where nothing flickers).
-        self._preview_visibility_applied = False
-        self._setup_scroll_sync()
-        self.splitter.splitterMoved.connect(self._on_splitter_moved)
+        layout.addWidget(self.source, 1)
 
+        # The short note of the open file used to be a caption row above the text; it lives on the
+        # bottom line now, next to the status, as one quiet field with only its placeholder.
         self.status_label = QLabel(self)
-        layout.addWidget(self.status_label)
+        self.note_edit = QLineEdit(self)
+        self.note_edit.setClearButtonEnabled(True)
+        self.note_edit.setPlaceholderText(i18n.tr("editor.file_note_placeholder"))
+        self.note_edit.editingFinished.connect(self._on_note_edited)
+        bottom = QHBoxLayout()
+        bottom.addWidget(self.status_label)
+        bottom.addSpacing(12)
+        bottom.addWidget(self.note_edit, 1)
+        layout.addLayout(bottom)
 
         self._bidi_timer = QTimer(self)
         self._bidi_timer.setSingleShot(True)
@@ -371,307 +123,14 @@ class EditorPanel(QWidget):
 
         self.source.textChanged.connect(self._on_text_changed)
         self.source.cursorPositionChanged.connect(self._update_status)
-        self._direction_shortcut = QShortcut(QKeySequence("Ctrl+Shift+D"), self)
-        self._direction_shortcut.setContext(Qt.WidgetWithChildrenShortcut)
-        self._direction_shortcut.activated.connect(self.cycle_direction)
         i18n.bind(self, self.retranslate)
         self.retranslate()
         self._refresh_actions()
 
-    # ------------------------------------------------------------------ preview
-    def _create_preview(self) -> QWidget:
-        """Create a web preview when possible, falling back to a text browser."""
-        global web_views_created
-        try:
-            from PySide6.QtWebEngineWidgets import QWebEngineView
-
-            self.preview_kind = "web"
-            web_views_created += 1
-            view = QWebEngineView(self)
-            self._paint_preview_background(view)
-            # A failed load means the engine cannot render here: swap to a text browser.
-            view.loadFinished.connect(self._on_preview_loaded)
-            return view
-        except Exception:  # noqa: BLE001 - offscreen/no-engine fallback
-            self.preview_kind = "text"
-            return QTextBrowser(self)
-
-    def _paint_preview_background(self, view: Any) -> None:
-        """Tint the web view itself, not just the page it loads (SPEC/03 §10).
-
-        The HTML body is themed, but a web view still paints the area around a short document
-        — and every frame before the document arrives — in its own white. That white slab is
-        what shows up in the middle of a dark window, so the widget gets the theme colour too.
-        """
-        try:
-            from PySide6.QtGui import QColor
-
-            view.setBackgroundColor(QColor(theme.colors()["code_bg"]))
-        except Exception:  # noqa: BLE001 - text fallback has no such method
-            pass
-
-    def apply_theme(self) -> None:
-        """Re-apply the theme to the preview (called when the appearance changes)."""
-        if self.preview_kind == "web":
-            self._paint_preview_background(self.preview)
-        self._render_preview()
-
-    def refresh_theme(self) -> None:
-        """Alias kept for the window-level theme refresh."""
-        self.apply_theme()
-
-    def _on_preview_loaded(self, ok: bool) -> None:
-        """Remember whether the web engine managed to load the page."""
-        self._preview_load_ok = bool(ok)
-        if not ok:
-            self._fallback_preview("load failed")
-
-    def showEvent(self, event: Any) -> None:  # noqa: N802 - Qt API
-        """Show the panes and apply the preview's own visibility (off by default)."""
-        super().showEvent(event)
-        if not self._preview_visibility_applied:
-            self._preview_visibility_applied = True
-            self.preview.setVisible(self.preview_enabled)
-        self._balance_split()
-
-    def resizeEvent(self, event: Any) -> None:  # noqa: N802 - Qt API
-        """Keep the initial 50/50 split when the panel is first laid out."""
-        super().resizeEvent(event)
-        if not self._split_applied:
-            self._balance_split()
-
-    def _balance_split(self) -> None:
-        """Split the width evenly once (the web view otherwise collapses to 0 px)."""
-        if self._split_applied:
-            return
-        self._split_applied = True
-        half = max(self.splitter.width() or self.width(), 400) // 2
-        QTimer.singleShot(0, lambda: self.splitter.setSizes([half, half]))
-
-    # -------------------------------------------------------------- split layout
-    def _on_splitter_moved(self, *_args: Any) -> None:
-        """Remember the split the user just dragged, as ratios (width-independent)."""
-        sizes = [int(value) for value in self.splitter.sizes()]
-        total = sum(sizes)
-        if len(sizes) == 2 and total > 0 and min(sizes) > 0:
-            self._split_ratio = [sizes[0] / total, sizes[1] / total]
-            self._split_pending = False
-
-    def split_ratio(self) -> list[float] | None:
-        """Return the user's source/preview split as ratios (None when never changed)."""
-        return list(self._split_ratio) if self._split_ratio else None
-
-    def apply_split_ratio(self, ratios: Any) -> bool:
-        """Restore a saved split; it is applied when the preview next becomes visible."""
-        values: list[float] = []
-        if isinstance(ratios, (list, tuple)) and len(ratios) == 2:
-            try:
-                values = [float(value) for value in ratios]
-            except (TypeError, ValueError):
-                values = []
-        if len(values) != 2 or min(values) <= 0 or max(values) >= 1:
-            return False
-        self._split_ratio = values
-        self._split_pending = True
-        return True
-
-    def _apply_saved_split(self) -> None:
-        """Give the panes the user's own split (a saved one wins over the 50/50 default)."""
-        if not self._split_pending or not self._split_ratio:
-            return
-        self._split_pending = False
-        self._split_applied = True
-        total = max(self.splitter.width(), self.width(), 400)
-        self.splitter.setSizes([max(1, int(total * value)) for value in self._split_ratio])
-
-    def _render_preview(self) -> None:
-        """Render the source into the preview (only when preview is enabled)."""
-        if not self.preview_enabled:
-            return
-        self.preview.setHtml(render_markdown(self.source.toPlainText()))
-        # Re-rendering resets the preview to the top; keep it aligned with the source.
-        if self.preview_kind == "web":
-            QTimer.singleShot(60, lambda: self._on_source_scroll(0))
-        else:
-            self._on_source_scroll(0)
-        if not self._preview_checked:
-            self._preview_checked = True
-            # A web view that fails to paint (no GPU / broken sandbox) looks like a blank grey
-            # panel: verify once and fall back to a text browser so the preview always shows.
-            QTimer.singleShot(_PREVIEW_CHECK_MS, self._verify_preview)
-
-    def _verify_preview(self) -> None:
-        """Swap in a :class:`QTextBrowser` when the web engine never rendered anything."""
-        if self.preview_kind != "web":
-            return
-        if self._preview_load_ok is None:
-            # No loadFinished at all: the engine is not working here (no GPU/sandbox), so the
-            # pane would stay blank forever. Do not wait for a callback that never comes.
-            self._fallback_preview("no loadFinished")
-            return
-        if not self._preview_load_ok:
-            self._fallback_preview("load failed")
-            return
-        view: Any = self.preview
-        try:
-            page = view.page()
-        except Exception:  # noqa: BLE001 - defensive
-            self._fallback_preview("no page")
-            return
-
-        def done(body: str) -> None:
-            if len(body or "") < _PREVIEW_MIN_HTML:
-                self._fallback_preview("empty render")
-
-        try:
-            page.toHtml(done)
-        except Exception:  # noqa: BLE001
-            self._fallback_preview("toHtml failed")
-
-    def _fallback_preview(self, reason: str) -> None:
-        """Replace the web view with a text browser and re-render the current document."""
-        if self.preview_kind != "web":
-            return
-        _LOG.warning("preview web view produced nothing (%s); using a text browser", reason)
-        index = self.splitter.indexOf(self.preview)
-        old: Any = self.preview
-        browser = QTextBrowser(self)
-        browser.setOpenExternalLinks(False)
-        try:
-            old.page().deleteLater()
-        except Exception:  # noqa: BLE001 - defensive
-            pass
-        # Keep the dead view as a child and hide it: `setParent(None)` made it a top-level
-        # window, and a parentless web view is destroyed *after* the engine's profile at exit —
-        # which is the QtWebEngine teardown segfault. As a child, the deletion is ordered.
-        old.hide()
-        old.deleteLater()
-        self.preview = browser
-        self.preview_kind = "text"
-        self.preview.setMinimumWidth(260)
-        if self._preview_poll is not None:
-            self._preview_poll.stop()
-            self._preview_poll = None
-        self.preview.verticalScrollBar().valueChanged.connect(self._on_preview_scroll)
-        self._last_preview_fraction = 0.0
-        if index >= 0:
-            self.splitter.insertWidget(index, browser)
-        else:
-            self.splitter.addWidget(browser)
-        self.splitter.setSizes([1, 1])
-        browser.setVisible(self.preview_enabled)
-        if self.preview_enabled:
-            self.preview.setHtml(render_markdown(self.source.toPlainText()))
-
-    def _clear_preview(self) -> None:
-        """Blank the preview without ever passing secret content to it."""
-        try:
-            self.preview.setHtml("")
-        except Exception:  # noqa: BLE001 - defensive
-            pass
-
-    # -------------------------------------------------------------- scroll sync
-    def _setup_scroll_sync(self) -> None:
-        """Keep the source and the preview at roughly the same scroll position."""
-        self.source.verticalScrollBar().valueChanged.connect(self._on_source_scroll)
-        if self.preview_kind == "text":
-            self.preview.verticalScrollBar().valueChanged.connect(
-                self._on_preview_scroll
-            )
-        else:
-            self._preview_poll = QTimer(self)
-            self._preview_poll.setInterval(_SCROLL_POLL_MS)
-            self._preview_poll.timeout.connect(self._poll_preview_scroll)
-            self._preview_poll.start()
-
-    def _source_fraction(self) -> float:
-        """Return the source scrollbar position as a 0..1 fraction."""
-        bar = self.source.verticalScrollBar()
-        span = bar.maximum() - bar.minimum()
-        return (bar.value() - bar.minimum()) / span if span > 0 else 0.0
-
-    def _scroll_source_to(self, fraction: float) -> None:
-        """Move the source scrollbar to ``fraction`` (clamped to 0..1)."""
-        bar = self.source.verticalScrollBar()
-        span = bar.maximum() - bar.minimum()
-        bar.setValue(int(bar.minimum() + max(0.0, min(1.0, fraction)) * span))
-
-    def _release_scroll_lock(self) -> None:
-        """Allow the other pane to drive again after a programmatic sync."""
-        self._scroll_lock = False
-
-    def _on_source_scroll(self, _value: int) -> None:
-        """Source scrolled: move the preview to the same fraction."""
-        if self._scroll_lock:
-            return
-        fraction = self._source_fraction()
-        self._scroll_lock = True
-        self._last_preview_fraction = fraction
-        if self.preview_kind == "text":
-            bar = self.preview.verticalScrollBar()
-            span = bar.maximum() - bar.minimum()
-            bar.setValue(int(bar.minimum() + fraction * span))
-        else:
-            try:
-                #: The document can still be about:blank here (a preview that is loading,
-                #: or one being replaced) — touching ``documentElement`` then threw.
-                self.preview.page().runJavaScript(
-                    "if(document.documentElement)window.scrollTo(0, %f * Math.max(0, "
-                    "document.documentElement.scrollHeight - window.innerHeight));"
-                    % fraction
-                )
-            except Exception:  # noqa: BLE001 - sync is best effort
-                pass
-        QTimer.singleShot(_SCROLL_LOCK_MS, self._release_scroll_lock)
-
-    def _on_preview_scroll(self, _value: int) -> None:
-        """Text-browser preview scrolled: move the source to the same fraction."""
-        if self._scroll_lock:
-            return
-        bar = self.preview.verticalScrollBar()
-        span = bar.maximum() - bar.minimum()
-        fraction = (bar.value() - bar.minimum()) / span if span > 0 else 0.0
-        self._scroll_lock = True
-        self._scroll_source_to(fraction)
-        QTimer.singleShot(_SCROLL_LOCK_MS, self._release_scroll_lock)
-
-    def _poll_preview_scroll(self) -> None:
-        """Read the web preview's scroll fraction (it has no Qt scrollbar)."""
-        if self._scroll_lock or self.preview_kind != "web":
-            return
-        try:
-            self.preview.page().runJavaScript(
-                "(function(){if(!document.documentElement)return 0;"
-                "var h=document.documentElement.scrollHeight-"
-                "window.innerHeight;return h>0?window.scrollY/h:0;})()",
-                self._on_preview_fraction,
-            )
-        except Exception:  # noqa: BLE001 - sync is best effort
-            pass
-
-    def _on_preview_fraction(self, value: Any) -> None:
-        """Web preview scrolled (polled): move the source to the same fraction."""
-        if self._scroll_lock or not isinstance(value, (int, float)):
-            return
-        fraction = max(0.0, min(1.0, float(value)))
-        if abs(fraction - self._last_preview_fraction) < 0.002:
-            return
-        self._last_preview_fraction = fraction
-        self._scroll_lock = True
-        self._scroll_source_to(fraction)
-        QTimer.singleShot(_SCROLL_LOCK_MS, self._release_scroll_lock)
-
     # ------------------------------------------------------------------ content
-    def set_content(self, path: str, text: str, *, preview_enabled: bool) -> None:
-        """Load ``text`` for ``path``.
-
-        ``preview_enabled`` is the *permission* for this level of the file: False for
-        ``secret``/``secretfile``. Whether the pane is actually shown is the user's own
-        choice (:meth:`preview_wanted`), which is off until they turn it on.
-        """
+    def set_content(self, path: str, text: str) -> None:
+        """Load ``text`` for ``path`` into the source editor."""
         self.current_path = path
-        self.preview_allowed = bool(preview_enabled)
-        self.preview_enabled = self.preview_allowed and self._preview_preference
         self._loading = True
         try:
             self.source.setPlainText(text)
@@ -682,16 +141,8 @@ class EditorPanel(QWidget):
             self._apply_bidi()
         except Exception as exc:  # noqa: BLE001 - a formatting problem must not hide content
             _LOG.warning("bidi pass failed while loading %s: %s", path, exc)
-        if self.preview_enabled:
-            self.preview.setVisible(True)
-            self._apply_saved_split()
-            self._render_preview()
-        else:
-            self._clear_preview()
-            self.preview.setVisible(False)
         self._refresh_actions()
         self._update_status()
-        self.preview_changed.emit(self.preview_enabled)
 
     def set_note(self, text: str) -> None:
         """Show the short note of the currently open file."""
@@ -720,85 +171,13 @@ class EditorPanel(QWidget):
         finally:
             self._loading = False
         self.current_path = None
-        self.preview_allowed = True
         self._dirty = False
         self.set_note("")
-        self._clear_preview()
         self._refresh_actions()
 
-    def preview_wanted(self) -> bool:
-        """Return the user's own preview choice (off until they turn it on).
-
-        It is remembered across files and across restarts, so the pane stays the way the user
-        left it instead of popping open with every note.
-        """
-        return bool(self._preview_preference)
-
-    def set_preview_enabled(self, enabled: bool) -> None:
-        """Toggle the preview pane (the View menu and the toolbar button).
-
-        The choice is remembered for the next file as well. ``preview_allowed`` is False for
-        ``secret``/``secretfile`` files: the View menu must never be able to hand secret text
-        to the preview widget, so a toggle on such a file changes nothing.
-        """
-        if self.preview_allowed:
-            self._preview_preference = bool(enabled)
-        self.preview_enabled = bool(enabled) and self.preview_allowed
-        self.preview.setVisible(self.preview_enabled)
-        if self.preview_enabled:
-            self._apply_saved_split()
-            self._render_preview()
-        else:
-            self._clear_preview()
-        self.preview_changed.emit(self.preview_enabled)
-
-    def _on_preview_clicked(self) -> None:
-        """Show and re-render the preview on demand (edits no longer refresh it live)."""
-        if not self.preview_allowed:
-            return
-        if not self.preview_enabled:
-            self.set_preview_enabled(True)
-        else:
-            self._render_preview()
-
     # ------------------------------------------------------------------- bidi
-    def direction_mode(self) -> str:
-        """Return the active bidi mode (``auto``/``rtl``/``ltr``)."""
-        return self._direction_mode
-
-    def set_direction_mode(self, mode: str) -> None:
-        """Set the bidi mode and re-apply the per-block formatting."""
-        if mode not in _DIRECTIONS:
-            mode = "auto"
-        self._direction_mode = mode
-        index = self.direction_combo.findData(mode)
-        if index >= 0 and self.direction_combo.currentIndex() != index:
-            self.direction_combo.blockSignals(True)
-            self.direction_combo.setCurrentIndex(index)
-            self.direction_combo.blockSignals(False)
-        self._apply_bidi()
-
-    def _on_direction_changed(self) -> None:
-        """Handle a mode change from the combo and notify listeners."""
-        mode = str(self.direction_combo.currentData() or "auto")
-        self._direction_mode = mode
-        self._apply_bidi()
-        self.direction_changed.emit(mode)
-
-    def cycle_direction(self) -> str:
-        """Cycle auto → rtl → ltr (``Ctrl+Shift+D``) and return the new mode."""
-        order = {"auto": "rtl", "rtl": "ltr", "ltr": "auto"}
-        mode = order.get(self._direction_mode, "auto")
-        self.set_direction_mode(mode)
-        self.direction_changed.emit(mode)
-        return mode
-
     def _block_direction(self, text: str, in_fence: bool, previous: str | None = None) -> str:
-        """Resolve the direction for one block under the active mode."""
-        if self._direction_mode == "rtl":
-            return "rtl"
-        if self._direction_mode == "ltr":
-            return "ltr"
+        """Resolve the direction for one block — always automatic, never overridden."""
         return bidi.block_direction(text, in_fence=in_fence, previous=previous)
 
     def _format_block(
@@ -950,7 +329,6 @@ class EditorPanel(QWidget):
         enabled = self.current_path is not None and not self.locked
         for button in (self.browser_button, self.text_editor_button, self.history_button):
             button.setEnabled(enabled)
-        self.preview_button.setEnabled(enabled and self.preview_allowed)
 
     # ------------------------------------------------------------------ signals
     def _on_text_changed(self) -> None:
@@ -979,14 +357,8 @@ class EditorPanel(QWidget):
     def retranslate(self) -> None:
         """Re-apply translated strings."""
         self.source.setPlaceholderText(i18n.tr("editor.placeholder"))
-        self.note_label.setText(i18n.tr("editor.file_note"))
         self.note_edit.setPlaceholderText(i18n.tr("editor.file_note_placeholder"))
         self.history_button.setText(i18n.tr("editor.history"))
-        self.direction_label.setText(i18n.tr("editor.direction"))
-        for index, mode in enumerate(_DIRECTIONS):
-            self.direction_combo.setItemText(index, i18n.tr(_MODE_KEYS[mode]))
-        self.preview_button.setText(i18n.tr("editor.preview"))
-        self.preview_button.setToolTip(i18n.tr("editor.preview_tooltip"))
         self.browser_button.setText(i18n.tr("editor.edit_in_browser"))
         self.text_editor_button.setText(i18n.tr("editor.open_text_editor"))
         # The highlighter rewrites character formats and Qt reports that as a text
@@ -997,4 +369,4 @@ class EditorPanel(QWidget):
         self._update_status()
 
 
-__all__ = ["EditorPanel", "render_markdown", "web_views_created"]
+__all__ = ["EditorPanel"]

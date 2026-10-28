@@ -71,9 +71,10 @@ what `requirements.txt` lists; the app must never import anything else at runtim
     implement that service layer in-process for the UI (decision 5) *and* expose the same
     surface over the Unix socket for agents; this is strictly safer than a UI-over-socket API
     and is documented in `docs/SECURITY.md` and `docs/ARCHITECTURE.md`.
-12. **Deviation, recorded**: the design's Qt UI uses QtWebEngine for markdown. We use
-    QtWebEngine **only** for rendering `normal` files' preview (never `secret`/`secretfile`
-    content) and the native plain-text viewer for secret content, exactly as designed.
+12. **Deviation, recorded**: the design's Qt UI uses QtWebEngine for markdown. The desktop
+    editor does not render markdown at all (reading the rendered note happens in the web UI, in
+    the system browser); QtWebEngine stays for the native image viewer only, and secret content
+    uses the native plain-text viewer, exactly as designed.
 
 ## 4. Data-leak model (must be stated in docs/SECURITY.md and honoured by the code)
 

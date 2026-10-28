@@ -89,8 +89,17 @@ class Translator:
         self._callbacks.append(callback)
 
     def bind(self, widget: object, refresh: RefreshCallback) -> None:
-        """Register ``refresh`` to be re-applied to ``widget`` on language changes."""
+        """Register ``refresh`` and apply it once now.
+
+        Applying immediately is what gives a panel built *after* the language was chosen its strings:
+        registering alone left every later widget blank until the next language switch (the search
+        tab's button and its «فقط فایل‌های رمز» box had no captions for exactly that reason).
+        """
         self._bindings.append((weakref.ref(widget), refresh))
+        try:
+            refresh()
+        except Exception:  # noqa: BLE001 - a half-built widget must not break binding
+            pass
 
     def reload(self) -> None:
         """Re-apply strings to every live registered widget."""

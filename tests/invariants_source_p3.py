@@ -6,10 +6,10 @@
 
 Assertions focus on the security-relevant UI rules and the i18n contract — the things a
 reviewer would check by hand:
-  * a 'secret' file never enables the markdown preview (no web engine),
+  * the editor has no preview/web view at all, so no note — secret or not — can reach one,
   * a 'secretfile' file is shown ONLY in the native plain-text viewer, never in the editor,
   * opening a confidential file without confirmation does nothing,
-  * the editor content for a normal file is fine; the preview is allowed but off by default,
+  * the editor content for a normal file is fine,
   * i18n: language switch flips every label and the layout direction, catalogues match,
   * no user-visible literal strings in the UI modules,
   * locking from the controller returns to the unlock screen and locks the session.
@@ -26,7 +26,6 @@ from PySide6.QtWidgets import QApplication
 from PySide6.QtCore import Qt
 
 from vault.core.session import VaultSession
-from vault.ui import editor as editor_mod
 from vault.ui import viewer as viewer_mod
 from vault.ui import i18n
 from vault.ui.app import VaultApplication
@@ -60,37 +59,33 @@ def check(name, fn):
         FAIL.append((name, e)); print(f"FAIL  {name}: {type(e).__name__}: {e}")
         traceback.print_exc(limit=4)
 
-def t01_normal_file_preview_ok():
+def t01_normal_file_loads_in_editor():
     assert app.open_path("/notes/normal.md") is True
-    assert window.editor.preview_allowed is True, "a normal file must allow the preview"
-    assert window.editor.preview_enabled is False, "the preview pane must be off by default"
+    assert not hasattr(window.editor, "preview"), "the editor must have no preview widget"
     assert "normal-body-marker" in window.editor.source.toPlainText(), "normal content not loaded in the editor"
-check("01 normal file -> editor, preview allowed but hidden by default", t01_normal_file_preview_ok)
+check("01 normal file -> source editor, no preview widget at all", t01_normal_file_loads_in_editor)
 
 def t02_secret_needs_confirmation():
     seen = []
     app.confirm_hook = lambda level, path: (seen.append((level, path)), False)[1]
-    before = editor_mod.web_views_created
     assert app.open_path("/notes/secret.md") is False, "opening a secret file must require confirmation"
     assert seen and seen[0][0] == "secret", f"confirmation not requested: {seen}"
-    assert editor_mod.web_views_created == before, "a web view was created for a refused secret file"
+    assert not hasattr(window.editor, "preview"), "the editor must have no preview widget"
     assert "secret-body-marker" not in window.editor.source.toPlainText(), "refused secret content reached the editor"
 check("02 'secret' file refuses to open without confirmation", t02_secret_needs_confirmation)
 
-def t03_secret_preview_disabled():
+def t03_secret_never_reaches_a_web_view():
     app.confirm_hook = lambda level, path: True
-    before = editor_mod.web_views_created
     assert app.open_path("/notes/secret.md") is True, "confirmed secret file should open"
-    assert window.editor.preview_enabled is False, "preview must be disabled for a secret file"
-    assert editor_mod.web_views_created == before, "web view created for a secret file"
-check("03 'secret' file -> editor with the preview DISABLED and no web view", t03_secret_preview_disabled)
+    assert not hasattr(window.editor, "preview"), "the editor must have no preview widget"
+    assert "secret-body-marker" in window.editor.source.toPlainText(), "the confirmed secret did not open"
+check("03 'secret' file -> plain source editor, never a web view", t03_secret_never_reaches_a_web_view)
 
 def t04_secretfile_native_viewer_only():
-    before = editor_mod.web_views_created
     editor_before = window.editor.source.toPlainText()
     assert app.open_path("/secrets/creds.md") is True, "secretfile should open in the native viewer"
     assert viewer_mod.last_text == "password: hunter2-zzz", f"native viewer got {viewer_mod.last_text!r}"
-    assert editor_mod.web_views_created == before, "web view created for a secretfile"
+    assert not hasattr(window.editor, "preview"), "the editor must have no preview widget"
     assert "hunter2-zzz" not in window.editor.source.toPlainText(), "secretfile content reached the editor"
     assert window.editor.source.toPlainText() == editor_before, "editor content changed for a secretfile"
 check("04 'secretfile' -> native viewer only, never the editor/web view", t04_secretfile_native_viewer_only)
@@ -206,12 +201,39 @@ def t08b_credentials_only_filter():
     assert opened == ["/secrets/creds.md"], opened
 check("08b filename search filters to credential files and opens once", t08b_credentials_only_filter)
 
+def t09_conflict_dialog_asks_and_answers():
+    """A sync conflict is answered by the user, one at a time, never picked automatically."""
+    from vault.ui.conflicts_dialog import ConflictsDialog
+
+    answered = []
+    dialog = ConflictsDialog(
+        [
+            {"id": 7, "path": "bank.md", "kind": "put", "their_client": "phone",
+             "my_rev": 3, "their_rev": 2},
+            {"id": 8, "path": "old.md", "kind": "delete", "their_client": "phone",
+             "my_rev": 5, "their_rev": 4},
+        ],
+        lambda cid, choice: answered.append((cid, choice)) or {"resolved": cid},
+    )
+    assert dialog.path.text() == "bank.md", dialog.path.text()
+    assert "۲" not in dialog.kind.text() and dialog.kind.text().strip(), "kind line is empty"
+    dialog.mine_button.click()
+    assert answered == [(7, "mine")], answered
+    assert dialog.path.text() == "old.md", "the dialog must move to the next conflict"
+    dialog.both_button.click()
+    assert answered == [(7, "mine"), (8, "both")], answered
+    assert dialog.resolved == 2, dialog.resolved
+    from PySide6.QtWidgets import QDialog
+
+    assert dialog.result() == int(QDialog.DialogCode.Accepted), "an exhausted list closes"
+check("09 conflict dialog asks and records the answer", t09_conflict_dialog_asks_and_answers)
+
 def t09_lock_returns_to_unlock():
     app.lock()
     assert session.is_locked, "controller lock() did not lock the session"
     assert app.current_screen == "unlock", f"screen after lock: {app.current_screen}"
     assert app.window is None or not app.window.isVisible(), "main window still visible after lock"
-check("09 lock() returns to the unlock screen", t09_lock_returns_to_unlock)
+check("09b lock() returns to the unlock screen", t09_lock_returns_to_unlock)
 
 # Stop the in-process socket/web servers before leaving: an interpreter that finalises while a
 # server thread sits in a socket select faults on Windows (access violation) even though every

@@ -152,6 +152,19 @@ class LockTest(SyncTestBase):
         with self.assertRaises(SyncReadOnly):
             self.session.set_tags("notes/a.md", ["x"])
 
+    def test_journal_mode_has_no_write_lock(self) -> None:
+        """Journal mode ignores the legacy lock: a stale one must not make the vault read-only."""
+        self.fake.objects[self.lock_key()] = json.dumps(
+            {"owner": "someone-else", "host": "other-host"}
+        ).encode("utf-8")
+        self.manager.acquire()
+        self.assertTrue(self.manager.readonly, "legacy mode still honours the lock")
+        self.session.set_sync_mode("journal")
+        self.assertEqual(self.manager.status()["mode"], "journal")
+        self.assertFalse(self.manager.startup()["readonly"], "journal mode takes no lock")
+        row = self.session.write_file("notes/a.md", b"hello")
+        self.assertEqual(row["logical_path"], "notes/a.md")
+
     def test_write_allowed_when_owned(self) -> None:
         """After acquiring, normal writes go through."""
         self.manager.acquire()
@@ -352,6 +365,14 @@ class AsyncSyncTest(SyncTestBase):
 
 class SyncServiceTest(SyncTestBase):
     """The public service surface for sync."""
+
+    def test_the_snapshot_for_reading_clients_is_published_once(self) -> None:
+        """A reader mirrors meta.sqlite, so a finished journal sync leaves a current copy there."""
+        first = self.session.publish_reader_snapshot(client=self.fake)
+        self.assertIn("meta.sqlite", first["uploaded"])
+        self.assertIn("vault/meta.sqlite", self.fake.objects)
+        second = self.session.publish_reader_snapshot(client=self.fake)
+        self.assertEqual(second["uploaded"], [], "an unchanged snapshot is not re-sent")
 
     def test_sync_status_route(self) -> None:
         """``vault.sync_status`` reports the configured state."""

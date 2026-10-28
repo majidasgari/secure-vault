@@ -12,6 +12,7 @@ import base64
 import difflib
 import logging
 import re
+import secrets
 import threading
 import uuid
 from pathlib import Path
@@ -32,11 +33,13 @@ from ..errors import (
 )
 from ..util import is_within, normalize_vault_path, now_ms, sha256_hex, wipe
 from . import credentials
+from . import journal as journal_mod
 from . import search as search_mod
+from . import sync_ops
 from . import semantics
 from . import retention
 from . import learning
-from .crypto import check_canary, derive_master_key
+from .crypto import check_canary, decrypt_blob, derive_master_key, encrypt_blob
 from .index import Index
 from .meta import META_FILENAME, VaultMeta
 from .security import (
@@ -49,7 +52,7 @@ from .security import (
 )
 from .semantic_queue import SemanticIndexQueue
 from .semantic_store import SemanticStore
-from .store import SecureStore
+from .store import STORE_FILENAME, SecureStore
 from .vaultfs import VaultFS
 
 SecretRequestCallback = Callable[[dict[str, Any]], Any]
@@ -82,6 +85,10 @@ class VaultSession:
         self._semantic_store: SemanticStore | None = None
         #: The credential-field index (metadata only: title/site/category/url/username).
         self._credentials: Any | None = None
+        #: This machine's id for the vault (machine-local; created on first mutation).
+        self._journal_client: str | None = None
+        #: True while remote ops are being applied — those must never be re-recorded as ours.
+        self._applying_remote = False
         #: Serialises semantic-index runs (manual rebuild vs the auto-index worker).
         self._semantic_lock = threading.RLock()
         self._semantic_queue: SemanticIndexQueue | None = None
@@ -532,7 +539,8 @@ class VaultSession:
                 "sync_in_progress", details={"hint": "wait for the sync to finish"}
             )
         manager = self._sync_manager
-        if manager is None or not manager.readonly:
+        # Journal mode syncs by operation log, so the legacy write lock does not gate it.
+        if manager is None or not manager.readonly or self.sync_mode() == "journal":
             return
         self._log(
             source=SOURCE_UI,
@@ -1091,6 +1099,7 @@ class VaultSession:
                 raise DowngradeForbidden("downgrade_forbidden")
         if create_parents:
             self._ensure_parents(logical, source)
+        base_rev = journal_mod.current_rev(idx, logical)
         blob_id, size, encrypted = self.fs.write_blob(data, sensitivity=desired)
         file_id = idx.upsert_file(
             logical,
@@ -1119,6 +1128,15 @@ class VaultSession:
             sensitivity=desired,
             outcome="allow",
             bytes=size,
+        )
+        self._journal_op(
+            "put",
+            logical,
+            base_rev=base_rev,
+            blob_id=blob_id,
+            size=size,
+            encrypted=encrypted,
+            sensitivity=desired,
         )
         return new_row
 
@@ -1166,6 +1184,7 @@ class VaultSession:
             prefix = f"{prefix}/{part}" if prefix else part
             if idx.get_file(prefix) is None:
                 idx.upsert_file(prefix, is_dir=True, sensitivity="normal", source=source)
+                self._journal_op("put", prefix, base_rev=0, is_dir=True)
 
     def mkdir(self, path: str, *, source: str = SOURCE_UI) -> dict[str, Any]:
         """Create a directory (and any missing parents) and return its row."""
@@ -1179,6 +1198,7 @@ class VaultSession:
             raise AlreadyExists("path_exists", details={"path": logical})
         self._ensure_parents(logical, source)
         idx.upsert_file(logical, is_dir=True, sensitivity="normal", source=source)
+        self._journal_op("put", logical, base_rev=0, is_dir=True)
         self.flush()
         self._log(source=source, tool="mkdir", target_path=logical, outcome="allow")
         self._emit_activity(
@@ -1194,7 +1214,9 @@ class VaultSession:
         self._require_writable("move")
         idx = self._require_index()
         idx.require_file(source_path)
+        base_rev = journal_mod.current_rev(idx, source_path)
         idx.move(source_path, dest_path)
+        self._journal_op("rename", dest_path, base_rev=base_rev, **{"from": source_path})
         self.flush()
         # The new name has to reach the documents too, or every note that showed the picture now
         # shows a broken link and nothing tells the user why.
@@ -1261,6 +1283,7 @@ class VaultSession:
             raise AlreadyExists("destination_exists", details={"path": dest_path})
         if int(row["is_dir"]):
             idx.upsert_file(dest_path, is_dir=True, sensitivity="normal", source=source)
+            self._journal_op("put", dest_path, base_rev=0, is_dir=True)
             prefix = source_path + "/"
             for child in list(idx.walk(source_path)):
                 if child["logical_path"] == source_path:
@@ -1269,6 +1292,7 @@ class VaultSession:
                 target = f"{dest_path}/{suffix}"
                 if int(child["is_dir"]):
                     idx.upsert_file(target, is_dir=True, sensitivity="normal", source=source)
+                    self._journal_op("put", target, base_rev=0, is_dir=True)
                 else:
                     self._copy_file(child, target, source)
         else:
@@ -1294,6 +1318,15 @@ class VaultSession:
             source=source,
         )
         new_row = idx.require_file(dest_path)
+        self._journal_op(
+            "put",
+            dest_path,
+            base_rev=0,
+            blob_id=blob_id,
+            size=int(new_row["size"]),
+            encrypted=int(new_row["encrypted"]),
+            sensitivity=str(new_row["sensitivity"]),
+        )
         idx.record_version(
             file_id,
             blob_id=blob_id,
@@ -1322,12 +1355,15 @@ class VaultSession:
                 blobs.append(str(candidate["blob_id"]))
             for version in idx.list_versions(int(candidate["id"])):
                 blobs.append(str(version.get("blob_id") or ""))
+        base_rev = journal_mod.current_rev(idx, logical)
         removed = idx.delete_file(logical, recursive=recursive)
         for blob_id in blobs:
             self.fs.delete_blob(blob_id)
         for row in removed:
             self._store.remove_file(int(row["id"]))
             self._forget_semantic(int(row["id"]))
+        if removed:
+            self._journal_delete(logical, base_rev=base_rev)
         self.flush()
         self._log(source=source, tool="delete", target_path=logical, outcome="allow")
         self._emit_activity(
@@ -1353,6 +1389,7 @@ class VaultSession:
         old_level = row["sensitivity"]
         if level == old_level:
             return row
+        base_rev = journal_mod.current_rev(idx, logical)
         if rank(level) > rank(old_level):
             if not Policy.can_raise(old_level, level, source):
                 raise DowngradeForbidden("raise_forbidden")
@@ -1390,6 +1427,18 @@ class VaultSession:
             else:
                 self._store.remove_file(int(new_row["id"]))
                 self._forget_semantic(int(new_row["id"]))
+        if int(new_row["is_dir"]):
+            self._journal_op("level", logical, base_rev=base_rev, sensitivity=level)
+        else:
+            self._journal_op(
+                "put",
+                logical,
+                base_rev=base_rev,
+                blob_id=new_row.get("blob_id"),
+                size=int(new_row["size"]),
+                encrypted=int(new_row["encrypted"]),
+                sensitivity=level,
+            )
         self.flush()
         self._log(source=source, tool="set_sensitivity", target_path=logical, outcome="allow")
         self._emit_activity(
@@ -1409,7 +1458,9 @@ class VaultSession:
         self._require_unlocked()
         self._require_writable("set_tags")
         idx = self._require_index()
+        base_rev = journal_mod.current_rev(idx, logical)
         idx.set_tags(logical, tags)
+        self._journal_op("tag", logical, base_rev=base_rev, tags=list(tags))
         self.flush()
         self._log(source=source, tool="set_tags", target_path=logical, outcome="allow")
         row = idx.require_file(logical)
@@ -1440,7 +1491,9 @@ class VaultSession:
         self._require_unlocked()
         self._require_writable("set_emoji")
         idx = self._require_index()
+        base_rev = journal_mod.current_rev(idx, logical)
         idx.set_emoji(logical, label)
+        self._journal_op("emoji", logical, base_rev=base_rev, emoji=label)
         self.flush()
         self._log(source=source, tool="set_emoji", target_path=logical, outcome="allow")
         row = idx.require_file(logical)
@@ -1454,6 +1507,26 @@ class VaultSession:
         return row
 
     # ------------------------------------------------------------------ learning
+    def _learning_op(self, logical: str, file_id: int) -> None:
+        """Record a learning mark for the peers (never moves the entry's revision).
+
+        A study schedule is personal bookkeeping: it must not turn a note edit on another device
+        into a conflict, so these ops are metadata that apply last-writer-wins.
+        """
+        record = self._require_index().learning_record(file_id)
+        if record is None:
+            self._journal_op("learning", logical, bump=False, removed=True)
+            return
+        self._journal_op(
+            "learning",
+            logical,
+            bump=False,
+            stage=int(record["stage"]),
+            due=int(record["due"]),
+            started=int(record["started"]),
+            seen=int(record["seen"]),
+        )
+
     def learning_list(self, *, now: int | None = None) -> dict[str, Any]:
         """Return the cards due now (today and any missed) plus the ones still ahead.
 
@@ -1512,6 +1585,7 @@ class VaultSession:
         if idx.learning_get(file_id) is None:
             stage, due = learning.started(moment)
             idx.learning_set(file_id, stage=stage, due=due, started=moment, seen=0)
+            self._learning_op(logical, file_id)
             self.flush()
             self._log(source=source, tool="learning_start", target_path=logical, outcome="allow")
             self._emit_activity(
@@ -1548,6 +1622,7 @@ class VaultSession:
         )
         if not due:
             idx.learning_delete(file_id)
+            self._learning_op(logical, file_id)
             self.flush()
             return {
                 "path": "/" + logical.lstrip("/"),
@@ -1559,6 +1634,7 @@ class VaultSession:
         idx.learning_set(
             file_id, stage=stage, due=due, started=int(current["started"]), seen=moment
         )
+        self._learning_op(logical, file_id)
         self.flush()
         record = idx.learning_record(file_id) or {}
         return self._learning_entry(record, moment)
@@ -1573,6 +1649,7 @@ class VaultSession:
         moment = now_ms()
         stage, due = learning.started(moment)
         idx.learning_set(file_id, stage=stage, due=due, started=moment, seen=0)
+        self._learning_op(logical, file_id)
         self.flush()
         self._log(source=source, tool="learning_reset", target_path=logical, outcome="allow")
         self._emit_activity(
@@ -1593,6 +1670,7 @@ class VaultSession:
         removed = idx.learning_get(file_id) is not None
         if removed:
             idx.learning_delete(file_id)
+            self._learning_op(logical, file_id)
             self.flush()
             self._log(source=source, tool="learning_stop", target_path=logical, outcome="allow")
             self._emit_activity(
@@ -1616,6 +1694,13 @@ class VaultSession:
         self._require_unlocked()
         self._require_writable("set_folder_note")
         self._store.set_folder_note(logical, text)
+        self._journal_op(
+            "note",
+            logical,
+            base_rev=journal_mod.current_rev(self._require_index(), logical),
+            scope="folder",
+            **self._seal_note(text),
+        )
         self.flush()
         self._log(
             source=source, tool="set_folder_note", target_path=logical, outcome="allow"
@@ -1645,7 +1730,9 @@ class VaultSession:
         if int(row["is_dir"]):
             raise BadRequest("is_directory", details={"path": logical})
         file_id = int(row["id"])
+        base_rev = journal_mod.current_rev(self._require_index(), logical)
         self._store.set_file_note(file_id, text)
+        self._journal_op("note", logical, base_rev=base_rev, scope="file", **self._seal_note(text))
         if row["sensitivity"] == "normal":
             try:
                 data = self._read_raw(row)
@@ -1882,6 +1969,438 @@ class VaultSession:
         if self._credentials is None:
             self._credentials = credentials.CredentialIndex(self)
         return self._credentials
+
+    # ------------------------------------------------------------------ journal
+    @property
+    def client_id(self) -> str:
+        """This machine's id for this vault (machine-local, never inside the vault)."""
+        if self._journal_client is None:
+            try:
+                vault_id = str(self._require_meta().vault_id or "")
+            except Exception:  # noqa: BLE001 - a vault without metadata still gets an id
+                vault_id = ""
+            self._journal_client = journal_mod.client_id(vault_id)
+        return self._journal_client
+
+    def _journal_op(
+        self, kind: str, path: str, *, base_rev: int | None = None, bump: bool = True, **payload: Any
+    ) -> None:
+        """Record the op for a mutation that just happened here.
+
+        Called *after* the local change: if recording fails, the change is already in the index and
+        raising would tell the caller the write failed. A lost op cannot lose data silently either —
+        the path's revision still moves, so a peer edit of the same path arrives as a conflict and
+        the user is asked (see journal.apply_ops).
+        """
+        if self._applying_remote:
+            return
+        try:
+            idx = self._require_index()
+            base = journal_mod.current_rev(idx, path) if base_rev is None else int(base_rev)
+            op = journal_mod.record(
+                idx, kind, path, client=self.client_id, payload=payload or None, base_rev=base
+            )
+            if bump:
+                self._set_rev(path, int(op["rev"]))
+        except Exception:  # noqa: BLE001 - never turn a successful write into a failure
+            LOG.warning("journal: could not record %s for %s", kind, path)
+
+    def _journal_delete(self, path: str, *, base_rev: int) -> None:
+        """Record a deletion (the row is already gone, so the revision becomes a tombstone)."""
+        if self._applying_remote:
+            return
+        try:
+            idx = self._require_index()
+            op = journal_mod.record(
+                idx, "delete", path, client=self.client_id, base_rev=int(base_rev)
+            )
+            idx.conn.execute(
+                "INSERT INTO tombstones(path, rev, writer, at) VALUES(?,?,?,?) "
+                "ON CONFLICT(path) DO UPDATE SET rev=excluded.rev, writer=excluded.writer, "
+                "at=excluded.at",
+                (normalize_vault_path(path), int(op["rev"]), self.client_id, now_ms()),
+            )
+            idx.conn.commit()
+        except Exception:  # noqa: BLE001
+            LOG.warning("journal: could not record the deletion of %s", path)
+
+    def _set_rev(self, path: str, rev: int) -> None:
+        """Move a path's local revision to what its op claims (so the next edit bases on it)."""
+        idx = self._require_index()
+        idx.conn.execute(
+            "UPDATE files SET rev=?, last_writer=? WHERE logical_path=? COLLATE NOCASE",
+            (int(rev), self.client_id, normalize_vault_path(path)),
+        )
+        idx.conn.commit()
+
+    # ---------------------------------------------------- sealed note text in ops
+    def _seal_note(self, text: str) -> dict[str, str]:
+        """Seal note text for an op: the journal sits in plaintext metadata, so text is ciphertext."""
+        key = self._master_key
+        if key is None:
+            raise VaultLocked("vault_locked")
+        token = secrets.token_hex(16)
+        blob = encrypt_blob(bytes(key), token, text.encode("utf-8"), sensitivity="normal")
+        return {"id": token, "enc": base64.b64encode(blob).decode("ascii")}
+
+    def _open_note(self, payload: dict[str, Any]) -> str:
+        """Open a sealed note payload from an op (peer or own)."""
+        key = self._master_key
+        if key is None:
+            raise VaultLocked("vault_locked")
+        token = str(payload.get("id") or "")
+        raw = base64.b64decode(str(payload.get("enc") or ""))
+        return decrypt_blob(bytes(key), token, raw, sensitivity="normal").decode("utf-8")
+
+    def apply_journal_op(self, op: dict[str, Any]) -> str | None:
+        """Apply the op kinds that live in the encrypted store (notes and learning marks).
+
+        Returns ``"applied"``/``"conflict"`` when it handled the op, ``None`` to let the index layer
+        take it. A note edit is treated like any other change to that entry (it has a revision and can
+        conflict); a learning mark is personal study bookkeeping, so it never conflicts.
+        """
+        kind = str(op.get("kind") or "")
+        if kind not in ("note", "learning"):
+            return None
+        index = self._require_index()
+        path = normalize_vault_path(str(op.get("path") or ""))
+        row = index.get_file(path)
+        if row is None:
+            return "applied"  # the entry is gone here; nothing to annotate
+        payload = dict(op.get("payload") or {})
+        if kind == "learning":
+            file_id = int(row["id"])
+            if payload.get("removed"):
+                index.learning_delete(file_id)
+            else:
+                index.learning_set(
+                    file_id,
+                    stage=int(payload.get("stage", 0)),
+                    due=int(payload.get("due", 0)),
+                    started=int(payload.get("started", 0)),
+                    seen=int(payload.get("seen", 0)),
+                )
+            self.flush()
+            return "applied"
+        current = journal_mod.current_rev(index, path)
+        if not op.get("resolution_of") and int(op.get("base_rev", 0)) != current:
+            journal_mod.conflict_record(index, op, current)
+            index.conn.commit()
+            return "conflict"
+        text = self._open_note(payload)
+        if str(payload.get("scope")) == "file":
+            self._store.set_file_note(int(row["id"]), text)
+        else:
+            self._store.set_folder_note(path, text)
+        self.flush()
+        self._set_rev(path, int(op.get("rev", current + 1)))
+        return "applied"
+
+    def pending_ops(self) -> int:
+        """How many local operations are still waiting to be published."""
+        try:
+            row = self._require_index().conn.execute(
+                "SELECT COUNT(*) AS n FROM journal_out WHERE published=0"
+            ).fetchone()
+            return int(row["n"] or 0) if row is not None else 0
+        except Exception:  # noqa: BLE001 - a locked/absent index has nothing pending
+            return 0
+
+    # ------------------------------------------------------- multi-client sync
+    #: ``legacy`` = the whole-folder mirror with the single-writer lock; ``journal`` = the op log.
+    SYNC_MODES = ("legacy", "journal")
+
+    def sync_mode(self) -> str:
+        """Return the vault's sync mode (``legacy`` until it is migrated)."""
+        try:
+            value = str((self._require_meta().settings.get("sync") or {}).get("mode") or "legacy")
+        except Exception:  # noqa: BLE001 - a brand-new vault has no settings yet
+            return "legacy"
+        return value if value in self.SYNC_MODES else "legacy"
+
+    def set_sync_mode(self, mode: str) -> None:
+        """Persist ``sync.mode`` in the vault settings (travels with the vault)."""
+        if mode not in self.SYNC_MODES:
+            raise BadRequest("unknown_sync_mode", details={"mode": mode})
+        meta = self._require_meta()
+        settings = dict(meta.settings.get("sync") or {})
+        settings["mode"] = mode
+        meta.settings["sync"] = settings
+        meta.save()
+
+    def migrate_to_journal(self) -> dict[str, Any]:
+        """Adopt the operation log: seed one op per existing entry, note and learning card.
+
+        Idempotent — a second run changes nothing. The old mirror objects stay in the bucket, so a
+        legacy client keeps working while this one switches (docs/SYNC.md §11).
+        """
+        self._require_unlocked()
+        self._require_writable("migrate_to_journal")
+        index = self._require_index()
+        if index.kv_get("sync.journal_seeded") == "1":
+            self.set_sync_mode("journal")
+            return {"already": True, "files": 0, "notes": 0, "learning": 0}
+
+        files = 0
+        for row in list(index.walk("/")):
+            path = str(row["logical_path"])
+            if int(row.get("is_dir", 0)):
+                self._journal_op("put", path, base_rev=0, is_dir=True)
+            elif row.get("blob_id"):
+                self._journal_op(
+                    "put",
+                    path,
+                    base_rev=0,
+                    blob_id=str(row["blob_id"]),
+                    size=int(row.get("size") or 0),
+                    encrypted=int(row.get("encrypted") or 1),
+                    sensitivity=str(row.get("sensitivity") or "normal"),
+                    mtime=int(row.get("mtime") or 0),
+                )
+            files += 1
+
+        notes = 0
+        for note in self._store.all_folder_notes():
+            folder = str(note.get("folder_path") or "")
+            text = str(note.get("note_text") or "")
+            if not folder:
+                continue
+            self._journal_op(
+                "note",
+                folder,
+                base_rev=journal_mod.current_rev(index, folder),
+                scope="folder",
+                **self._seal_note(text),
+            )
+            notes += 1
+        rows_with_notes = [row for row in index.walk("/") if not int(row.get("is_dir", 0))]
+        for file_id, text in self._store.get_file_notes(
+            [int(row["id"]) for row in rows_with_notes]
+        ).items():
+            row = index.get_file_by_id(file_id)
+            if row is None:
+                continue
+            self._journal_op(
+                "note",
+                str(row["logical_path"]),
+                base_rev=journal_mod.current_rev(index, str(row["logical_path"])),
+                scope="file",
+                **self._seal_note(str(text)),
+            )
+            notes += 1
+
+        learning = 0
+        for record in index.learning_records():
+            # learning_records() returns the file row joined with its schedule (``id`` is the file).
+            self._journal_op(
+                "learning",
+                str(record["logical_path"]),
+                bump=False,
+                stage=int(record.get("stage") or 0),
+                due=int(record.get("due") or 0),
+                started=int(record.get("started") or 0),
+                seen=int(record.get("seen") or 0),
+            )
+            learning += 1
+
+        index.kv_set("sync.journal_seeded", "1")
+        self.set_sync_mode("journal")
+        self.flush()
+        self._log(source=SOURCE_UI, tool="migrate_to_journal", outcome="allow")
+        return {
+            "already": False,
+            "files": files,
+            "notes": notes,
+            "learning": learning,
+            "pending": self.pending_ops(),
+        }
+
+    def sync_journal(self, *, client: Any | None = None, max_ops: int | None = None) -> dict[str, Any]:
+        """Publish this client's ops and apply every peer's, without a write lock.
+
+        ``max_ops`` publishes at most that many and skips the pull: a caller with a long first push
+        (thousands of ops) drives it in slices so its own event loop is never held for minutes.
+
+        Raises:
+            VaultLocked: when the session is locked.
+            BadRequest: when S3 is not configured.
+        """
+        self._require_unlocked()
+        if self.sync_mode() != "journal":
+            raise BadRequest("sync_mode_legacy")
+        from .s3 import S3Client, S3Config  # noqa: PLC0415 - keep the core import graph light
+
+        config = S3Config.from_session(self)
+        if not config.configured:
+            raise BadRequest("sync_not_configured")
+        s3 = client if client is not None else S3Client(config)
+        transport = sync_ops.OpsTransport(
+            s3,
+            prefix=config.normalized_prefix(),
+            vault_id=str(self._require_meta().vault_id or ""),
+            client_id=self.client_id,
+            blob_path=lambda blob_id: self.fs.blob_path(blob_id),
+            handler=self.apply_journal_op,
+            log=LOG.debug,
+        )
+        index = self._require_index()
+        pushed = transport.push(index, max_ops=max_ops)
+        pending = self.pending_ops()
+        if max_ops is not None and pending:
+            # Still sending: the peer side waits for a call that finds nothing left to publish.
+            self.flush()
+            self._log(source=SOURCE_UI, tool="sync_journal", outcome="allow")
+            return {
+                "pushed": int(pushed["pushed"]),
+                "push_failed": int(pushed["failed"]),
+                "applied": 0,
+                "duplicates": 0,
+                "gaps": [],
+                "conflicts": len(journal_mod.unresolved(index)),
+                "pending": pending,
+                "more": True,
+            }
+        self._applying_remote = True
+        try:
+            pulled = transport.pull(index, max_ops=max_ops)
+        finally:
+            self._applying_remote = False
+        self.flush()
+        more = bool(pulled.get("more"))
+        self._log(source=SOURCE_UI, tool="sync_journal", outcome="allow")
+        return {
+            "pushed": int(pushed["pushed"]),
+            "push_failed": int(pushed["failed"]),
+            "applied": int(pulled["applied"]),
+            "duplicates": int(pulled["duplicates"]),
+            "gaps": list(pulled["gaps"]),
+            "conflicts": len(journal_mod.unresolved(index)),
+            "pending": self.pending_ops(),
+            "more": more,
+        }
+
+    def publish_reader_snapshot(self, *, client: Any | None = None) -> dict[str, Any]:
+        """Publish the metadata a *reading* client mirrors, after a journal sync (best effort).
+
+        Multi-device mode never mirrors ``meta.sqlite``/``secure.store`` — they are projections of
+        the op log — but a read-only client (the phone) has no op log to apply. Uploading the current
+        index next to the blobs is what lets it show the vault as it is. Nothing here reads them
+        back, and an unchanged file is skipped by its ETag.
+        """
+        from .s3 import S3Client, S3Config, md5_hex  # noqa: PLC0415 - keep the core import graph light
+        from .sync import INDEX_FILENAME  # noqa: PLC0415 - the filename the legacy mirror uses
+
+        config = S3Config.from_session(self)
+        if not config.configured:
+            return {"uploaded": []}
+        s3 = client if client is not None else S3Client(config)
+        prefix = config.normalized_prefix()
+        home = Path(self.home)
+        try:
+            # Fold the WAL back so ``meta.sqlite`` is self-contained when read from the bucket.
+            self._require_index().checkpoint()
+        except Exception:  # noqa: BLE001 - a checkpoint failure only makes the copy older
+            LOG.warning("meta.sqlite checkpoint before the snapshot failed", exc_info=True)
+        try:
+            remote = {str(entry.get("key")): entry for entry in s3.list(prefix)}
+        except Exception:  # noqa: BLE001 - without a listing every file is simply re-sent
+            remote = {}
+        uploaded: list[str] = []
+        for name in (INDEX_FILENAME, STORE_FILENAME, META_FILENAME):
+            path = home / name
+            try:
+                data = path.read_bytes()
+            except OSError:
+                continue
+            entry = remote.get(prefix + name) or {}
+            if entry.get("etag") and str(entry["etag"]) == md5_hex(data):
+                continue  # the reader already has this exact file
+            s3.put(prefix + name, data)
+            uploaded.append(name)
+        return {"uploaded": uploaded}
+
+    def verify_blobs(self, *, progress: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Check that every blob decrypts cleanly, reporting into ``progress`` as it goes.
+
+        Slow by nature — it decrypts the whole vault — so the desktop runs it off the GUI thread and
+        this loop keeps ``progress["done"]``/``["total"]`` up to date for the indicator.
+
+        shortcut: verified against a snapshot of the index, so a write made from another client
+        mid-run can show up as a false failure; upgrade when several clients write while the user
+        verifies.
+        """
+        self._require_unlocked()
+        rows = [row for row in self._require_index().walk("/") if row.get("blob_id")]
+        if progress is not None:
+            progress.update({"done": 0, "total": len(rows), "finished": False})
+        bad: list[str] = []
+        for index, row in enumerate(rows, start=1):
+            if not self.fs.verify_blob(row):
+                bad.append("/" + str(row["logical_path"]).lstrip("/"))
+            if progress is not None:
+                progress["done"] = index
+        if progress is not None:
+            progress["finished"] = True
+        return {"checked": len(rows), "bad": bad}
+
+    def conflicts(self) -> list[dict[str, Any]]:
+        """Every conflict still waiting for the user's answer."""
+        return journal_mod.unresolved(self._require_index())
+
+    def _answer_note(self, theirs: dict[str, Any], choice: str) -> dict[str, Any]:
+        """Answer a conflict about a *note*: mine, theirs, or both texts kept side by side."""
+        index = self._require_index()
+        path = normalize_vault_path(str(theirs.get("path") or ""))
+        payload = dict(theirs.get("payload") or {})
+        their_text = self._open_note(payload)
+        scope = str(payload.get("scope") or "folder")
+        row = index.get_file(path)
+        mine_text = ""
+        if row is not None:
+            mine_text = (
+                self._store.get_file_note(int(row["id"]))
+                if scope == "file"
+                else self._store.get_folder_note(path)
+            ) or ""
+        if choice == "mine":
+            text = mine_text
+        elif choice == "both":
+            # A note is one field: keeping both means keeping both texts, mine first.
+            text = (mine_text + "\n\n" + their_text).strip()
+        else:
+            text = their_text
+        current = journal_mod.current_rev(index, path)
+        if row is not None:
+            if scope == "file":
+                self._store.set_file_note(int(row["id"]), text)
+            else:
+                self._store.set_folder_note(path, text)
+        self.flush()
+        self._set_rev(path, current + 1)
+        return journal_mod.record(
+            index,
+            "note",
+            path,
+            client=self.client_id,
+            base_rev=current,
+            payload={"scope": scope, **self._seal_note(text)},
+            resolution_of=str(theirs.get("op_id") or ""),
+        )
+
+    def resolve_conflict(self, conflict_id: int, choice: str) -> dict[str, Any]:
+        """Answer one conflict (``mine``/``theirs``/``both``) and queue the decision as an op."""
+        self._require_unlocked()
+        answer = journal_mod.resolve(
+            self._require_index(),
+            int(conflict_id),
+            choice,
+            client=self.client_id,
+            handler=self.apply_journal_op,
+            answer_builder=self._answer_note,
+        )
+        self.flush()
+        self._log(source=SOURCE_UI, tool="resolve_conflict", outcome="allow")
+        return {"resolved": int(conflict_id), "choice": choice, "op": answer.get("op_id")}
 
     def search_text(
         self,

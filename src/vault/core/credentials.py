@@ -180,6 +180,52 @@ def match_score(page_host: str, candidate: str) -> int:
     return 0
 
 
+#: Every credential entry lives under this root; the credential index only looks inside it.
+CREDENTIAL_ROOT = "/رمزها"
+
+
+def build_body(
+    *,
+    site: str,
+    category: str = "",
+    username: str = "",
+    password: str = "",
+    url: str = "",
+    otp: str = "",
+    notes: str = "",
+) -> str:
+    """Build a standard credential entry body — the format :func:`parse_body` reads back.
+
+    Empty fields are left out instead of written blank: a blank ``گذرواژه:`` line would read as "this
+    entry has no password", which is exactly what a half-filled form must not claim.
+    """
+    title = (site or "").strip() or "ورودی رمز"
+    head = [f"سایت: {title}"]
+    if category.strip():
+        head.append(f"دسته: {category.strip()}")
+    lines = [f"# {title}", " | ".join(head)]
+    if username.strip():
+        lines.append(f"نام کاربری: {username.strip()}")
+    if password:
+        lines.append(f"گذرواژه: {password}")
+    if url.strip():
+        lines.append(f"آدرس: {url.strip()}")
+    if otp.strip():
+        lines.append(f"کد یکبارمصرف: {otp.strip()}")
+    lines.append("")
+    lines.append("## یادداشت")
+    if notes.strip():
+        lines.append(notes.strip())
+    return "\n".join(lines) + "\n"
+
+
+def credential_path(site: str, category: str = "") -> str:
+    """Where a new entry goes: ``/رمزها/<دسته>/<سایت>.md``, with no path separators smuggled in."""
+    folder = (category or "").strip() or "عمومی"
+    name = (site or "").strip() or "ورودی رمز"
+    return f"{CREDENTIAL_ROOT}/{folder.replace('/', '-')}/{name.replace('/', '-')}.md"
+
+
 def parse_body(text: str, *, fallback_title: str = "", fallback_site: str = "") -> dict[str, Any]:
     """Parse one credential body into its fields.
 

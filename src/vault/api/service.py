@@ -982,6 +982,26 @@ class Service:
         """Test the S3 connection/credentials without starting a sync."""
         return {"connection": self.session.sync_manager().test_connection()}
 
+    def _h_sync_journal(self, params: dict, role: str, session_id: str) -> dict:
+        """Push this client's ops and apply every peer's (the lock-free sync)."""
+        max_ops = int(params.get("max_ops") or 0)
+        return {"result": self.session.sync_journal(max_ops=max_ops or None)}
+
+    def _h_migrate_journal(self, params: dict, role: str, session_id: str) -> dict:
+        """Adopt the operation log for this vault (idempotent; the legacy mirror stays readable)."""
+        return {"result": self.session.migrate_to_journal()}
+
+    def _h_conflicts(self, params: dict, role: str, session_id: str) -> dict:
+        """List the conflicts waiting for the user's decision (never resolved automatically)."""
+        items = self.session.conflicts()
+        return {"count": len(items), "conflicts": items, "pending": self.session.pending_ops()}
+
+    def _h_resolve_conflict(self, params: dict, role: str, session_id: str) -> dict:
+        """Answer one conflict: ``mine``, ``theirs`` or ``both``."""
+        cid = int(self._require(params, "id"))
+        choice = self._text(self._require(params, "choice"), param="choice")
+        return {"result": self.session.resolve_conflict(cid, choice)}
+
     def _h_sync_acquire(self, params: dict, role: str, session_id: str) -> dict:
         """Acquire the write lock; ``force`` takes it from another client."""
         force = bool(params.get("force", False))
@@ -1001,15 +1021,7 @@ class Service:
         }
 
     def _h_verify_blobs(self, params: dict, role: str, session_id: str) -> dict:
-        self.session._require_unlocked()
-        checked = 0
-        bad: list[str] = []
-        for row in self.session.index.walk("/"):
-            if row.get("blob_id"):
-                checked += 1
-                if not self.session.fs.verify_blob(row):
-                    bad.append(_api_path(row["logical_path"]))
-        return {"checked": checked, "bad": bad}
+        return self.session.verify_blobs()
 
     def _h_recent(self, params: dict, role: str, session_id: str) -> dict:
         limit = int(params.get("limit", 20))
@@ -1165,6 +1177,10 @@ class Service:
         "vault.sync_status": (_h_sync_status, _BOTH),
         "vault.sync_test": (_h_sync_test, _UI_ONLY),
         "vault.sync_now": (_h_sync_now, _UI_ONLY),
+        "vault.sync_journal": (_h_sync_journal, _UI_ONLY),
+        "vault.migrate_journal": (_h_migrate_journal, _UI_ONLY),
+        "vault.conflicts": (_h_conflicts, _BOTH),
+        "vault.resolve_conflict": (_h_resolve_conflict, _UI_ONLY),
         "vault.sync_acquire": (_h_sync_acquire, _UI_ONLY),
         "vault.sync_release": (_h_sync_release, _UI_ONLY),
         "vault.stats": (_h_stats, _BOTH),

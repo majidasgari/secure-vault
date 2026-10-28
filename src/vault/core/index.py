@@ -18,7 +18,7 @@ from ..errors import AlreadyExists, BadRequest, NotFound
 from ..util import atomic_write_bytes, normalize_logical_path, now_ms
 from .security import LEVELS
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS schema_meta(key TEXT PRIMARY KEY, value TEXT);
@@ -34,9 +34,48 @@ CREATE TABLE IF NOT EXISTS files(
   mtime INTEGER NOT NULL,
   created INTEGER NOT NULL,
   source TEXT NOT NULL DEFAULT 'ui',
-  emoji TEXT
+  emoji TEXT,
+  rev INTEGER NOT NULL DEFAULT 0,
+  last_writer TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_files_parent ON files(logical_path);
+CREATE TABLE IF NOT EXISTS journal_out(
+  seq INTEGER PRIMARY KEY AUTOINCREMENT,
+  op_id TEXT NOT NULL UNIQUE,
+  created INTEGER NOT NULL,
+  json TEXT NOT NULL,
+  published INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_journal_out_unpublished ON journal_out(published, seq);
+CREATE TABLE IF NOT EXISTS journal_in(
+  op_id TEXT PRIMARY KEY,
+  client TEXT NOT NULL,
+  seq INTEGER NOT NULL,
+  ts INTEGER NOT NULL,
+  applied INTEGER NOT NULL,
+  at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_journal_in_client ON journal_in(client, seq);
+CREATE TABLE IF NOT EXISTS conflicts(
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  path TEXT NOT NULL,
+  kind TEXT NOT NULL,
+  mine TEXT,
+  theirs TEXT NOT NULL,
+  their_client TEXT NOT NULL,
+  my_rev INTEGER NOT NULL,
+  their_rev INTEGER NOT NULL,
+  created INTEGER NOT NULL,
+  resolved INTEGER NOT NULL DEFAULT 0,
+  their_json TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_conflicts_open ON conflicts(resolved, id);
+CREATE TABLE IF NOT EXISTS tombstones(
+  path TEXT PRIMARY KEY COLLATE NOCASE,
+  rev INTEGER NOT NULL,
+  writer TEXT,
+  at INTEGER NOT NULL
+);
 CREATE TABLE IF NOT EXISTS file_versions(
   id INTEGER PRIMARY KEY,
   file_id INTEGER NOT NULL,
@@ -112,6 +151,12 @@ class Index:
         if "emoji" not in columns:
             # An emoji label on a path (SPEC/01 §6). NULL = no label.
             self._conn.execute("ALTER TABLE files ADD COLUMN emoji TEXT")
+        if "rev" not in columns:
+            # Per-path revision, bumped by every op that lands on it (core/journal.py).
+            self._conn.execute("ALTER TABLE files ADD COLUMN rev INTEGER NOT NULL DEFAULT 0")
+        if "last_writer" not in columns:
+            # Which client wrote the current revision — shown in the conflict dialog.
+            self._conn.execute("ALTER TABLE files ADD COLUMN last_writer TEXT")
         self._conn.execute(
             "INSERT INTO schema_meta(key, value) VALUES('schema_version', ?) "
             "ON CONFLICT(key) DO UPDATE SET value=excluded.value",

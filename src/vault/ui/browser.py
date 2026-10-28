@@ -5,7 +5,7 @@ from __future__ import annotations
 import time
 from typing import Any
 
-from PySide6.QtCore import QSortFilterProxyModel, Qt, QTimer, Signal
+from PySide6.QtCore import QEvent, QSortFilterProxyModel, Qt, QTimer, Signal
 from PySide6.QtGui import QAction, QPixmap
 from PySide6.QtWidgets import (
     QGroupBox,
@@ -24,6 +24,25 @@ from PySide6.QtWidgets import (
 from . import i18n, image_view
 from .models import VaultListModel, VaultTreeModel
 
+#: Narrowest the name column may get: below this the rows turn into a single word per line.
+_MIN_NAME_WIDTH = 96
+
+def _clean_ratios(value: Any) -> tuple[float, ...] | None:
+    """Validate a remembered column layout: one positive fraction per column, normalised to one."""
+    if not isinstance(value, (list, tuple)) or len(value) != VaultListModel.COLUMN_NOTE + 1:
+        return None
+    try:
+        fractions = [float(item) for item in value]
+    except (TypeError, ValueError):
+        return None
+    if any(fraction <= 0 for fraction in fractions):
+        return None
+    total = sum(fractions)
+    if total <= 0:
+        return None
+    return tuple(fraction / total for fraction in fractions)
+
+
 _NOTE_DEBOUNCE_MS = 1000
 
 
@@ -36,6 +55,7 @@ class BrowserPanel(QWidget):
     new_folder_requested = Signal()
     import_requested = Signal()
     refresh_requested = Signal()
+    sync_requested = Signal()
     lock_requested = Signal()
     settings_requested = Signal()
 
@@ -44,6 +64,10 @@ class BrowserPanel(QWidget):
         super().__init__(parent)
         self._controller = controller
         self._current_folder = "/"
+        self._fitting = False
+        self._fitting_again = False
+        #: Column widths as fractions of the table's width — ONE layout for every folder.
+        self._column_ratios: tuple[float, ...] | None = None
         self._loading_note = False
         self._selecting = False
         self._activated_path = ""
@@ -62,6 +86,7 @@ class BrowserPanel(QWidget):
             ("new_folder", self.new_folder_requested),
             ("import", self.import_requested),
             ("refresh", self.refresh_requested),
+            ("sync", self.sync_requested),
             ("lock", self.lock_requested),
             ("settings", self.settings_requested),
         ):
@@ -89,8 +114,23 @@ class BrowserPanel(QWidget):
         self.list.setSelectionBehavior(QTableView.SelectRows)
         self.list.setEditTriggers(QTableView.NoEditTriggers)
         self.list.verticalHeader().setVisible(False)
-        self.list.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
-        self.list.horizontalHeader().setStretchLastSection(True)
+        # A row is allowed to be several lines: the name and the note wrap into the room that is
+        # left and the table never scrolls sideways, so every cell of a row stays readable instead
+        # of a wide column pushing the rest out of view.
+        header = self.list.horizontalHeader()
+        header.setSectionResizeMode(QHeaderView.Interactive)
+        header.setStretchLastSection(False)
+        self.list.setWordWrap(True)
+        self.list.setTextElideMode(Qt.ElideNone)
+        self.list.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        # Row heights follow the wrapped text, and are recomputed when the panel changes width.
+        self.list.verticalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
+        # A drag on a column boundary is the user setting the layout by hand: remember it as
+        # fractions, so the same proportions come back for this folder and every other one.
+        header.sectionResized.connect(self._on_section_resized)
+        # The table's own viewport, not just the panel: a vertical scrollbar appearing narrows it
+        # by ~14 px and the columns have to fit again.
+        self.list.viewport().installEventFilter(self)
         self.list.doubleClicked.connect(self._on_file_activated)
         layout.addWidget(self.list, 3)
 
@@ -143,12 +183,123 @@ class BrowserPanel(QWidget):
         except Exception:  # noqa: BLE001 - a locked/absent folder shows empty
             entries = []
         self.list_model.set_entries(entries)
+        self._fit_columns()
         self._hide_preview()
         self._load_note()
         # The list can navigate too (a double-click on a folder row), so the tree follows: two
         # panes showing different folders read as a bug.
         self.select_in_tree(self._current_folder)
         self.folder_selected.emit(self._current_folder)
+
+    def resizeEvent(self, event: Any) -> None:  # noqa: N802 - Qt API
+        """Re-split the two wrapping columns whenever the panel changes width."""
+        super().resizeEvent(event)
+        self._fit_columns()
+
+    def eventFilter(self, watched: Any, event: Any) -> bool:  # noqa: N802 - Qt API
+        """Refit when the table's viewport changes width on its own (a scrollbar appearing)."""
+        if watched is self.list.viewport() and event.type() == QEvent.Resize:
+            self._fit_columns()
+        return super().eventFilter(watched, event)
+
+    def _fit_columns(self) -> None:
+        """Fit every column inside the viewport, so the table never scrolls sideways.
+
+        The short columns (level, size, date) keep the width their content asks for; the name and
+        the note share what is left — name first — and wrap, which is why a row may be several
+        lines. When even that does not fit, nothing is clipped or hidden: every column is scaled
+        down in proportion and the cells wrap into the narrower width.
+        """
+        if self._fitting:
+            # A vertical scrollbar appearing narrows the viewport mid-fit; ask for one more pass
+            # rather than looping straight into ourselves.
+            self._fitting_again = True
+            return
+        header = self.list.horizontalHeader()
+        available = self.list.viewport().width()
+        if available <= 0:
+            return
+        count = self.list.model().columnCount()
+        if not count:
+            return
+        if self._column_ratios and len(self._column_ratios) == count:
+            # A remembered layout is authoritative: re-deriving it from rounded pixels would let
+            # the proportions drift a little on every restart.
+            widths = [max(1, int(round(available * ratio))) for ratio in self._column_ratios]
+            self._apply_widths(header, widths, available)
+            return
+        widths = self._content_widths(header, count, available)
+        if widths is None:
+            return
+        self._apply_widths(header, widths, available, learn=True)
+
+    def _content_widths(self, header: Any, count: int, available: int) -> list[int] | None:
+        """First-run widths: short columns by content, the name and the note share the rest."""
+        hints = [max(1, header.sectionSizeHint(column)) for column in range(count)]
+        text = (VaultListModel.COLUMN_NAME, VaultListModel.COLUMN_NOTE)
+        fixed = sum(hint for column, hint in enumerate(hints) if column not in text)
+        rest = available - fixed
+        if rest >= 2 * _MIN_NAME_WIDTH:
+            name = int(rest * 0.6)
+            widths = list(hints)
+            widths[VaultListModel.COLUMN_NAME] = name
+            widths[VaultListModel.COLUMN_NOTE] = rest - name
+        else:
+            # Too narrow for the content widths: scale everything, wide cells wrap instead.
+            total = sum(hints)
+            widths = [max(1, int(hint * available / total)) for hint in hints]
+            widths[VaultListModel.COLUMN_NAME] += available - sum(widths)
+        return widths
+
+    def _apply_widths(
+        self, header: Any, widths: list[int], available: int, *, learn: bool = False
+    ) -> None:
+        """Set the sections so they add up to the viewport exactly, and keep them as fractions."""
+        # A vertical scrollbar appearing narrows the viewport, which fires resizeEvent again; the
+        # guard keeps that from turning into a loop.
+        widths = list(widths)
+        widths[-1] += available - sum(widths)
+        self._fitting = True
+        try:
+            for column, width in enumerate(widths):
+                header.resizeSection(column, width)
+            self.list.resizeRowsToContents()
+        finally:
+            self._fitting = False
+        if learn:
+            self._column_ratios = tuple(width / available for width in widths)
+        if self._fitting_again:
+            self._fitting_again = False
+            QTimer.singleShot(0, self._fit_columns)
+
+    def column_ratios(self) -> list[float] | None:
+        """The column layout as fractions of the table's width (None before the first fit)."""
+        return list(self._column_ratios) if self._column_ratios else None
+
+    def set_column_ratios(self, ratios: Any) -> bool:
+        """Adopt a remembered column layout; every folder then uses the same proportions."""
+        fractions = _clean_ratios(ratios)
+        if fractions is None:
+            return False
+        self._column_ratios = fractions
+        self._fit_columns()
+        return True
+
+    def _on_section_resized(self, column: int, old: int, new: int) -> None:
+        """Learn a hand-dragged layout as fractions (the fit itself is guarded, so it is not one)."""
+        if self._fitting:
+            return
+        header = self.list.horizontalHeader()
+        count = self.list.model().columnCount()
+        widths = [header.sectionSize(index) for index in range(count)]
+        available = sum(widths)
+        if available <= 0:
+            return
+        self._column_ratios = tuple(width / available for width in widths)
+        self.list.resizeRowsToContents()
+        # A programmatic resize (not a boundary drag) can leave the total short of the viewport;
+        # one deferred fit renormalises it and keeps the "never scrolls sideways" promise.
+        QTimer.singleShot(0, self._fit_columns)
 
     def select_in_tree(self, path: str) -> None:
         """Point the folder tree at ``path``, expanding the parents it needs."""
@@ -332,6 +483,7 @@ class BrowserPanel(QWidget):
             "new_folder": "browser.new_folder",
             "import": "browser.import",
             "refresh": "browser.refresh",
+            "sync": "menu.sync",
             "lock": "browser.lock",
             "settings": "browser.settings",
         }

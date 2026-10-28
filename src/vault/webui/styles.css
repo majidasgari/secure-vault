@@ -382,6 +382,14 @@ input[type="checkbox"] { min-height: auto; width: 18px; height: 18px; }
   flex: 1 1 0; min-height: 36px; font-size: 0.88rem; padding: 4px 8px;
 }
 .panel-left { gap: 10px; }
+/* The bottom row of the left panel: the learning cards, and a sync button you can find by eye. */
+.panel-foot {
+  display: flex; align-items: stretch; gap: 6px;
+  border-top: 1px solid var(--border); padding-top: 8px; flex: 0 0 auto;
+}
+.panel-foot .learn-open { flex: 1 1 auto; width: auto; }
+.panel-foot #btn-sync-side { flex: 0 0 auto; min-height: 36px; }
+
 /* The learning entry is a destination of its own, not a sibling of the two create buttons. */
 .learn-open {
   display: flex; align-items: center; gap: 8px;
@@ -657,6 +665,30 @@ button.primary.danger { background: var(--panel2); }
 /* File note shown inline in the folder list */
 .note-text { max-width: 46ch; overflow: hidden; text-overflow: ellipsis;
   white-space: nowrap; opacity: 0.85; }
+
+/* The folder listing reads as columns: the name takes the slack, the date and the file note keep
+   fixed tracks and the actions hold the far edge, so rows line up instead of drifting with the
+   length of a name. The emoji and the level badge get their own narrow tracks (empty when absent)
+   so a row without a label still starts its name at the same place as the others. */
+.file-row {
+  display: grid; align-items: center; column-gap: 10px;
+  grid-template-columns: 1.2em 1.1em minmax(0, 1fr) 16ch minmax(0, 42ch) auto;
+}
+.file-row > span { min-width: 0; }
+.file-row .row-emoji { grid-column: 1; }
+.file-row .badge { grid-column: 2; }
+.file-row .col-name { grid-column: 3; }
+.file-row .col-date {
+  grid-column: 4; margin: 0; font-variant-numeric: tabular-nums; direction: ltr; text-align: start;
+}
+.file-row .col-note { grid-column: 5; margin: 0; }
+.file-row .row-actions { grid-column: 6; margin-inline-start: 0; }
+/* Narrow screens: the file note drops to a second line under the row and the date keeps its track. */
+@media (max-width: 860px) {
+  .file-row { grid-template-columns: 1.2em 1.1em minmax(0, 1fr) 16ch auto; row-gap: 2px; }
+  .file-row .col-note { grid-column: 3 / -1; grid-row: 2; max-width: none; }
+  .file-row .row-actions { grid-column: 5; }
+}
 
 /* The file note as it appears on paper (see the print block at the end of this file). */
 #file-note-print { display: none; }
