@@ -110,6 +110,7 @@ All tools accept a JSON object and return an object. Paths use the vault-absolut
 | `learning_start` | `path` (req) | the card entry — idempotent: a note already in learning keeps its schedule |
 | `learning_seen` | `path` (req) | the card entry after one review, or `{"path","stage","total","due":0,"completed":true}` when the sixth review ends the cycle |
 | `learning_stop` | `path` (req) | `{"path","removed"}` |
+| `show_learning_card` | — | opens the learning-card window on the desktop and returns `{"displayed","due","cards":[{path,stage,total,overdue_days}],"pid"}` (plus `already_open` / `display_error`) |
 | `semantic_status` | — | `{"semantic":{enabled,available,reason,model,chunking,chunks,indexed_files,db_path}}` |
 | `semantic_reindex` | `path` (optional subtree), `force` (default true) | `{"indexed","skipped","chunks"}` — re-embed all or just one subtree |
 | `request_open_secret` | `path` (req) | `{"request_id","status":"pending","note":"…"}` — `secretfile` only; content is never returned |

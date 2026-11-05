@@ -23,6 +23,7 @@ EXPECTED_TOOLS = {
     "learning_start",
     "learning_seen",
     "learning_stop",
+    "show_learning_card",
     "search_filenames",
     "search_text",
     "search_semantic",

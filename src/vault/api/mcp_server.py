@@ -59,6 +59,13 @@ def _vault_status(client: VaultClient, arguments: dict) -> dict:
     return payload
 
 
+def _show_learning_card(client: VaultClient, arguments: dict) -> dict:
+    """Open the learning-card window on the desktop (lazy import: no Qt in this process)."""
+    from ..learning_card import ensure_window
+
+    return ensure_window(client)
+
+
 def _tool(
     name: str,
     description: str,
@@ -300,6 +307,17 @@ _TOOL_SPECS: list[dict[str, Any]] = [
         {"path": {"type": "string"}},
         ["path"],
         _forward("vault.learning_stop"),
+    ),
+    _tool(
+        "show_learning_card",
+        "Open the learning-card window on the desktop: it shows the cards due now one at a time, "
+        "its «کافی» button records the review (vault.learning_seen) and moves to the next card, "
+        "and it congratulates and closes itself when nothing is left. Use it when the user asks "
+        "for his learning card or wants to review. Returns what is due (paths and stages) and "
+        "whether the window opened.",
+        {},
+        [],
+        _show_learning_card,
     ),
     _tool(
         "digest",
