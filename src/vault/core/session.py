@@ -2215,11 +2215,20 @@ class VaultSession:
             "pending": self.pending_ops(),
         }
 
-    def sync_journal(self, *, client: Any | None = None, max_ops: int | None = None) -> dict[str, Any]:
+    def sync_journal(
+        self,
+        *,
+        client: Any | None = None,
+        max_ops: int | None = None,
+        progress: Any | None = None,
+    ) -> dict[str, Any]:
         """Publish this client's ops and apply every peer's, without a write lock.
 
         ``max_ops`` publishes at most that many and skips the pull: a caller with a long first push
         (thousands of ops) drives it in slices so its own event loop is never held for minutes.
+
+        ``progress`` is an optional ``(phase, done, total)`` callback handed to the transport so a
+        UI can draw a real bar while the (slow) objects move; it is called from worker threads.
 
         Raises:
             VaultLocked: when the session is locked.
@@ -2242,6 +2251,7 @@ class VaultSession:
             blob_path=lambda blob_id: self.fs.blob_path(blob_id),
             handler=self.apply_journal_op,
             log=LOG.debug,
+            progress=progress,
         )
         index = self._require_index()
         pushed = transport.push(index, max_ops=max_ops)

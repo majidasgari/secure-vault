@@ -16,6 +16,7 @@ divergence this design exists to prevent.
 
 from __future__ import annotations
 
+import itertools
 import json
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -36,6 +37,10 @@ HEAD_NAME = "HEAD"
 PUSH_WORKERS = 8
 
 
+def _noop_progress(phase: str, done: int, total: int) -> None:
+    """Default progress sink: the core stays quiet unless a caller asks for counters."""
+
+
 class OpsTransport:
     """Push/pull one vault's operations through any S3-compatible client."""
 
@@ -49,11 +54,16 @@ class OpsTransport:
         blob_path: Callable[[str], Path] | None = None,
         handler: Callable[[dict[str, Any]], str | None] | None = None,
         log: Callable[[str], None] | None = None,
+        progress: Callable[[str, int, int], None] | None = None,
     ) -> None:
         """Bind the transport to an S3 client, the vault's identity and this machine's id.
 
         ``blob_path`` maps a blob id to its local file; with it the transport also moves content —
         an op names a blob id, and a peer that receives the op needs the bytes to read the file.
+
+        ``progress`` is called as ``(phase, done, total)`` while ops move (``phase`` is ``"push"``
+        or ``"pull"``, ``total`` is 0 when the size is unknown). It is called from the transport's
+        own worker threads, so a caller must only touch thread-safe state (a dict of counters).
         """
         self.client = client
         self.prefix = prefix or ""
@@ -62,6 +72,7 @@ class OpsTransport:
         self.blob_path = blob_path
         self.handler = handler
         self._log = log
+        self._progress = progress or _noop_progress
 
     # ------------------------------------------------------------------ keys
     def ops_root(self) -> str:
@@ -145,6 +156,14 @@ class OpsTransport:
         # One listing tells us which blobs the bucket already has: probing them one by one costs a
         # slow 412 per op, and the legacy mirror left every blob behind.
         existing = self._bucket_blobs()
+        # How many ops this slice is supposed to move, for the caller's progress bar. Computed once
+        # so the bar has a stable denominator while the slice runs.
+        target = 0
+        if max_ops is not None:
+            try:
+                target = min(max_ops, len(journal.pending(index)))
+            except Exception:  # noqa: BLE001 - a progress denominator is never worth an error
+                target = 0
         for _round in range(200):  # a backlog is drained in pages, not one run per 200 ops
             ops = journal.pending(index)
             if not ops:
@@ -153,30 +172,48 @@ class OpsTransport:
                 if published >= max_ops:
                     break
                 ops = ops[: max(1, max_ops - published)]
-            batch = self._publish(ops, existing)
+            batch = self._publish(ops, existing, base=published, target=target)
             pushed.extend(batch["pushed"])
             failed = batch["failed"]
             if pushed:
                 journal.mark_published(index, pushed)
                 published += len(pushed)
                 pushed = []
+                self._progress("push", published, target or published)
             if failed:
                 break
         head = self._head_seq(index)
         self._write_head(head)
         return {"pushed": published, "failed": failed, "head": head}
 
-    def _publish(self, ops: list[dict[str, Any]], existing: set[str]) -> dict[str, Any]:
+    def _publish(
+        self,
+        ops: list[dict[str, Any]],
+        existing: set[str],
+        *,
+        base: int = 0,
+        target: int = 0,
+    ) -> dict[str, Any]:
         """Upload one page of ops (content first), a few at a time.
 
         A PUT costs about a second on a slow bucket and the ops are independent objects, so the
         page goes out in parallel; ``mark_published`` still happens once, in the caller's thread.
+
+        ``base``/``target`` only describe this page's share of the slice for the progress sink.
         """
+        finished = itertools.count(1)
+
+        def report() -> None:
+            """Advance the slice's progress bar by one finished op (thread-safe counters)."""
+            done = base + next(finished)
+            self._progress("push", done, target or done)
+
         def one(op: dict[str, Any]) -> str | None:
             payload = dict(op.get("payload") or {})
             # Content first: a peer must never see an op whose blob is not in the bucket yet.
             if str(op.get("kind")) == "put" and payload.get("blob_id"):
                 if not self._upload_blob(str(payload["blob_id"]), existing):
+                    report()
                     return None
             client = str(op["client"])
             key = self.client_prefix(client) + self.op_key(client, int(op["seq"]))
@@ -188,6 +225,8 @@ class OpsTransport:
                 return str(op["op_id"]) if self.client.put(key, data) else None
             except Exception:  # noqa: BLE001 - a network failure must not lose the journal
                 return None
+            finally:
+                report()
 
         pushed: list[str] = []
         failed = 0
@@ -255,6 +294,9 @@ class OpsTransport:
         duplicates = 0
         gaps: list[dict[str, Any]] = []
         more = False
+        # One listing per peer, first, so the progress sink has a real denominator before the
+        # first (slow) GET: the fetch loop below is where the minutes go.
+        plan: list[tuple[str, int, list[int]]] = []
         for client in self.remote_clients():
             if client == self.client_id:
                 continue  # our own ops are already applied here
@@ -263,6 +305,14 @@ class OpsTransport:
             if not keys:
                 continue
             available = sorted(int(seq) for seq in keys if int(seq) > seen)
+            if available:
+                plan.append((client, seen, available))
+        total = sum(len(available) for _, _, available in plan)
+        if max_ops is not None:
+            total = min(total, max_ops)
+        fetched = 0
+        self._progress("pull", 0, total)
+        for client, seen, available in plan:
             batch: list[dict[str, Any]] = []
             expected = seen + 1
             for seq in available:
@@ -295,6 +345,8 @@ class OpsTransport:
                     )
                 batch.append(op)
                 expected += 1
+                fetched += 1
+                self._progress("pull", fetched, total)
             if batch:
                 result = journal.apply_ops(index, batch, handler=self.handler)
                 applied += int(result["applied"])

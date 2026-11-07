@@ -135,6 +135,57 @@ class OpsTransportTest(unittest.TestCase):
         body = json.loads(raw)
         self.assertEqual(body["vault_id"], "vault-1")
 
+    def test_push_and_pull_report_progress(self) -> None:
+        """The transport narrates ``(phase, done, total)`` so a UI can draw a real bar."""
+        events: list[tuple[str, int, int]] = []
+        transport = sync_ops.OpsTransport(
+            self.bucket,
+            prefix="sync/",
+            vault_id="vault-1",
+            client_id="phone",
+            progress=lambda phase, done, total: events.append((phase, done, total)),
+        )
+        for number in range(3):
+            journal.record(
+                self.index, "put", f"n{number}.md", client="phone",
+                payload={"blob_id": f"b{number}", "size": 1},
+            )
+
+        transport.push(self.index, max_ops=3)
+
+        pushes = [event for event in events if event[0] == "push"]
+        self.assertTrue(pushes, "a push must report progress")
+        self.assertEqual(pushes[-1][1], 3, "every op of the slice is counted")
+        self.assertEqual(pushes[-1][2], 3, "the denominator is the slice size")
+        self.assertEqual(
+            [done for _phase, done, _total in pushes],
+            sorted(done for _phase, done, _total in pushes),
+            "progress never goes backwards",
+        )
+
+        other = tmp_vault()
+        try:
+            events.clear()
+            desktop = sync_ops.OpsTransport(
+                self.bucket, prefix="sync/", vault_id="vault-1", client_id="desktop"
+            )
+            for number in range(2):
+                journal.record(
+                    other.index, "put", f"p{number}.md", client="desktop",
+                    payload={"blob_id": f"bp{number}", "size": 1},
+                )
+            desktop.push(other.index)
+
+            transport.pull(self.index)
+
+            pulls = [event for event in events if event[0] == "pull"]
+            self.assertTrue(pulls, "a pull must report progress")
+            self.assertEqual(pulls[0], ("pull", 0, 2), "the bar starts with a real denominator")
+            self.assertEqual(pulls[-1][1], 2)
+            self.assertEqual(pulls[-1][2], 2)
+        finally:
+            other.close()
+
     # ------------------------------------------------------------------ pull
     def test_pull_in_slices_says_when_there_is_more(self) -> None:
         """A caller can keep the pull out of its event loop: each call applies a slice."""

@@ -993,5 +993,96 @@ class SecretViewerOtpTest(unittest.TestCase):
             dialog.close()
 
 
+@unittest.skipUnless(HAVE_QT, "PySide6 is not installed")
+class JournalSyncThreadTest(unittest.TestCase):
+    """One multi-device sync slice must run off the GUI thread, not in the event loop."""
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        """Ensure a single offscreen QApplication exists."""
+        from PySide6.QtWidgets import QApplication
+
+        cls.app = QApplication.instance() or QApplication(["sv-journal-thread"])
+
+    def test_slice_is_handed_to_a_worker_thread(self) -> None:
+        """Pressing the menu returns at once; the S3 slice is executed by a worker.
+
+        Regression: ``_journal_sync_step`` used to dispatch ``vault.sync_journal`` from the
+        QTimer slot, so every S3 round-trip (2-3 s each on a slow link, 30 per slice) ran in
+        the event loop and the window stopped painting.
+        """
+        import tempfile
+        import threading
+        import time
+        from pathlib import Path
+
+        from vault.ui.app import JOURNAL_SYNC_STEP, VaultApplication
+
+        seen: dict[str, object] = {}
+
+        class FakeSession:
+            """Stands in for VaultSession: records which thread ran the slice."""
+
+            is_locked = False
+
+            def sync_journal(self, *, max_ops: int | None = None, progress=None) -> dict:
+                seen["thread"] = threading.current_thread().name
+                seen["main"] = threading.current_thread() is threading.main_thread()
+                seen["max_ops"] = max_ops
+                seen["progress"] = callable(progress)
+                if callable(progress):
+                    progress("push", 1, 1)
+                time.sleep(0.2)
+                return {"pushed": 1, "applied": 0, "conflicts": 0, "pending": 0, "more": False}
+
+        class FakeService:
+            """The old code path dispatched through the service; keep it working for the test."""
+
+            def __init__(self, session: FakeSession) -> None:
+                self.session = session
+
+            def dispatch(self, method: str, params: dict, *, role: str, session_id: str) -> dict:
+                seen["service"] = True
+                return {"result": self.session.sync_journal(max_ops=params.get("max_ops"))}
+
+        session = FakeSession()
+        controller = VaultApplication(
+            self.app,
+            home=Path(tempfile.mkdtemp(prefix="sv-jsync-")),
+            no_tray=True,
+            self_test=True,
+        )
+        try:
+            controller.session = session
+            controller.service = FakeService(session)
+            controller._journal_sync = {
+                "pushed": 0,
+                "applied": 0,
+                "conflicts": 0,
+                "pending": 0,
+                "more": True,
+            }
+            started = time.monotonic()
+            state = controller._journal_progress_state
+            controller._journal_sync_step()
+            self.assertLess(time.monotonic() - started, 0.1, "the GUI thread must not wait")
+            self.assertTrue(controller._journal_busy)
+            deadline = time.monotonic() + 5
+            while controller._journal_sync is not None and time.monotonic() < deadline:
+                self.app.processEvents()
+                time.sleep(0.01)
+            self.assertEqual(seen.get("max_ops"), JOURNAL_SYNC_STEP)
+            self.assertTrue(seen.get("progress"), "the slice must be given a progress sink")
+            self.assertEqual(
+                state.get("phase"), "push", "the counters the bar reads are written by the worker"
+            )
+            self.assertTrue(seen.get("thread"), "the slice never ran")
+            self.assertFalse(seen.get("main"), "the slice ran on the GUI thread")
+            self.assertIsNone(controller._journal_sync)
+            self.assertFalse(controller._journal_busy)
+        finally:
+            controller.shutdown()
+
+
 if __name__ == "__main__":
     unittest.main()

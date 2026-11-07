@@ -75,6 +75,8 @@ EXTERNAL_POLL_MS = 1500
 #: the whole call, so a first push of thousands of ops runs in slices from the event loop instead of
 #: freezing the window (and blocking every other call) for minutes.
 JOURNAL_SYNC_STEP = 30
+#: How often the multi-device sync's progress bar refreshes from the worker's counters.
+JOURNAL_PROGRESS_POLL_MS = 250
 #: How often the import dialog refreshes its percentage from the importer's progress state.
 IMPORT_POLL_MS = 400
 #: How often the GUI polls the background S3 sync job for progress.
@@ -233,6 +235,8 @@ class VaultApplication(QObject):
     semantic_finished = Signal(object)
     # Emitted from the verify worker thread with ``{checked, bad}`` (or an error).
     verify_finished = Signal(object)
+    # Emitted from the multi-device sync worker thread with one slice's counters (or an error).
+    journal_sync_finished = Signal(object)
     # Emitted from the fingerprint worker thread with the scan outcome / payload.
     fingerprint_finished = Signal(object)
 
@@ -305,6 +309,14 @@ class VaultApplication(QObject):
         #: The running multi-device sync (``pushed``/``applied``/``conflicts``) or None. It is driven
         #: from the event loop in slices, so a first push cannot freeze the window.
         self._journal_sync: dict[str, Any] | None = None
+        #: True while a slice is running on its worker thread (one slice at a time).
+        self._journal_busy = False
+        #: Progress dialog + the counters the sync worker writes (``phase``/``done``/``total``).
+        self._journal_progress: QProgressDialog | None = None
+        self._journal_progress_timer: QTimer | None = None
+        self._journal_progress_state: dict[str, Any] = {}
+        #: Set by the dialog's Cancel button; the current slice finishes, the next one never starts.
+        self._journal_cancel = False
         #: The running integrity check's progress dialog/timer (one at a time).
         self._verify_dialog: QProgressDialog | None = None
         self._verify_timer: QTimer | None = None
@@ -323,6 +335,7 @@ class VaultApplication(QObject):
         self.reindex_finished.connect(self._on_reindex_finished)
         self.semantic_finished.connect(self._on_semantic_finished)
         self.verify_finished.connect(self._on_verify_finished)
+        self.journal_sync_finished.connect(self._on_journal_step_done)
 
         self._auto_lock_timer = QTimer(self)
         self._auto_lock_timer.setInterval(AUTO_LOCK_TICK_MS)
@@ -2030,39 +2043,174 @@ class VaultApplication(QObject):
             self._notify_web_problem(i18n.tr("error.VAULT_LOCKED"))
             return {"ok": False, "error": "locked"}
         self._journal_sync = {"pushed": 0, "applied": 0, "conflicts": 0, "pending": 0, "more": True}
+        self._journal_cancel = False
+        if self.window is not None:
+            self.window.statusBar().showMessage(i18n.tr("sync.syncing"))
+        self._start_journal_progress()
         self._journal_sync_timer.start()
         return {"ok": True, "started": True}
 
+    def _start_journal_progress(self) -> None:
+        """Show the sync's progress bar and start polling the worker's counters."""
+        self._journal_progress_state = {"phase": "", "done": 0, "total": 0}
+        if self.self_test or self.window is None:
+            return
+        if self._journal_progress is None:
+            dialog = QProgressDialog(self.window)
+            dialog.setWindowTitle(i18n.tr("notification.sync_title"))
+            dialog.setLabelText(i18n.tr("sync.preparing"))
+            dialog.setRange(0, 0)
+            dialog.setCancelButtonText(i18n.tr("common.cancel"))
+            dialog.setMinimumDuration(0)
+            dialog.setWindowModality(Qt.WindowModality.WindowModal)
+            dialog.canceled.connect(self._request_journal_cancel)
+            dialog.show()
+            self._journal_progress = dialog
+        if self._journal_progress_timer is None:
+            timer = QTimer(self)
+            timer.setInterval(JOURNAL_PROGRESS_POLL_MS)
+            timer.timeout.connect(self._poll_journal_progress)
+            timer.start()
+            self._journal_progress_timer = timer
+
+    def _poll_journal_progress(self) -> None:
+        """Redraw the bar from the counters the sync worker is writing (never blocks)."""
+        dialog = self._journal_progress
+        if dialog is None:
+            return
+        state = self._journal_progress_state
+        phase = str(state.get("phase") or "")
+        done = int(state.get("done") or 0)
+        total = int(state.get("total") or 0)
+        text = i18n.tr("sync.preparing")
+        if phase:
+            if total > 0:
+                dialog.setRange(0, total)
+                dialog.setValue(max(0, min(done, total)))
+                key = "sync.pushing" if phase == "push" else "sync.pulling"
+                text = i18n.tr(key, done=done, total=total)
+            else:
+                dialog.setRange(0, 0)
+                text = i18n.tr("sync.syncing")
+        else:
+            dialog.setRange(0, 0)
+        job = self._journal_sync or {}
+        if job:
+            text += "\n" + i18n.tr(
+                "sync.totals",
+                pushed=int(job.get("pushed", 0)),
+                applied=int(job.get("applied", 0)),
+                pending=int(job.get("pending", 0)),
+            )
+        if self._journal_cancel:
+            text = i18n.tr("sync.cancelling")
+        dialog.setLabelText(text)
+
+    def _close_journal_progress(self) -> None:
+        """Tear the bar down (called on finish, error or cancel)."""
+        timer, self._journal_progress_timer = self._journal_progress_timer, None
+        if timer is not None:
+            timer.stop()
+            timer.deleteLater()
+        dialog, self._journal_progress = self._journal_progress, None
+        if dialog is not None:
+            dialog.close()
+            dialog.deleteLater()
+        self._journal_progress_state = {}
+
+    def _request_journal_cancel(self) -> None:
+        """Ask the running sync to stop after the slice that is already in flight."""
+        if self._journal_sync is None:
+            self._close_journal_progress()
+            return
+        self._journal_cancel = True
+        if self._journal_progress is not None:
+            self._journal_progress.setLabelText(i18n.tr("sync.cancelling"))
+
     def _journal_sync_step(self) -> None:
-        """Run one slice of the sync (a push or a pull), then schedule the next — or finish."""
+        """Start the next slice on a worker thread; the GUI thread only waits for it.
+
+        A slice is up to ``JOURNAL_SYNC_STEP`` pushes plus the pull, and every push is an S3
+        round-trip: on a slow link (Iran → ArvanCloud, ~2-3 s per request) that is minutes of
+        socket time. Running it from the event loop — which this timer used to do — froze the
+        whole window for the length of the slice, so the app looked hung.
+        """
+        if self._journal_sync is None or self._journal_busy:
+            return
+        if self.session is None or self.session.is_locked:
+            self._journal_sync = None
+            return
+        self._journal_busy = True
+        thread = threading.Thread(
+            target=self._journal_sync_worker, name="vault-journal-sync", daemon=True
+        )
+        thread.start()
+
+    def _journal_sync_worker(self) -> None:
+        """Run one sync slice off the GUI thread and hand the result back by signal."""
+        state = self._journal_progress_state
+
+        def report(phase: str, done: int, total: int) -> None:
+            """Publish the transport's counters; the GUI's poll timer reads them.
+
+            Called from the transport's own threads, so it only touches this dict (no Qt).
+            """
+            if isinstance(state, dict):
+                state["phase"] = phase
+                state["done"] = done
+                state["total"] = total
+
+        try:
+            payload: dict[str, Any] = dict(
+                self.session.sync_journal(max_ops=JOURNAL_SYNC_STEP, progress=report) or {}
+            )
+        except Exception as exc:  # noqa: BLE001 - report, never crash the window
+            payload = {"error": error_message(exc)}
+        self.journal_sync_finished.emit(payload)
+
+    def _on_journal_step_done(self, payload: Any) -> None:
+        """Book-keeping for one finished slice (GUI thread), then schedule the next."""
+        self._journal_busy = False
+        data = dict(payload or {})
         job = self._journal_sync
         if job is None:
             return
-        try:
-            data = dict(
-                self.dispatch_ui(
-                    "vault.sync_journal", {"max_ops": JOURNAL_SYNC_STEP}
-                ).get("result")
-                or {}
-            )
-        except Exception as exc:  # noqa: BLE001 - report, never crash the window
+        if data.get("error"):
             self._journal_sync = None
+            self._close_journal_progress()
+            if self.window is not None:
+                self.window.statusBar().clearMessage()
             notifications.notify(
                 i18n.tr("notification.sync_title"),
-                i18n.tr("notification.sync_failed", reason=i18n.sync_reason(str(exc))),
+                i18n.tr(
+                    "notification.sync_failed", reason=i18n.sync_reason(str(data["error"]))
+                ),
                 tray=self.tray,
             )
             return
         pushed = int(data.get("pushed", 0) or 0)
+        applied = int(data.get("applied", 0) or 0)
         job["pushed"] += pushed
-        job["applied"] += int(data.get("applied", 0) or 0)
+        job["applied"] += applied
         job["conflicts"] = int(data.get("conflicts", 0) or 0)
         job["pending"] = int(data.get("pending", 0) or 0)
         job["more"] = bool(data.get("more"))
+        if self._journal_cancel:
+            # Cancel lands between slices: this one's work is counted, nothing new is started.
+            self._journal_sync = None
+            self._close_journal_progress()
+            if self.window is not None:
+                self.window.statusBar().clearMessage()
+            notifications.notify(
+                i18n.tr("notification.sync_title"), i18n.tr("sync.cancelled"), tray=self.tray
+            )
+            self.hub.notify()
+            return
         if job["more"]:
-            if not pushed and not int(data.get("applied", 0) or 0) and not job["pending"]:
+            if not pushed and not applied and not job["pending"]:
                 # Nothing moved and nothing is queued: report it instead of spinning the timer.
                 self._journal_sync = None
+                self._close_journal_progress()
                 if self.window is not None:
                     self.window.statusBar().clearMessage()
                 notifications.notify(
@@ -2080,6 +2228,7 @@ class VaultApplication(QObject):
             self._journal_sync_timer.start()
             return
         self._journal_sync = None
+        self._close_journal_progress()
         if self.window is not None:
             self.window.statusBar().clearMessage()
         message = i18n.tr(
