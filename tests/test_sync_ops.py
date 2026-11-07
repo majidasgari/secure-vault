@@ -49,6 +49,19 @@ class _PreconditionBucket(FakeBucket):
         return super().put(key, data, if_none_match=if_none_match)
 
 
+class _CountingBucket(FakeBucket):
+    """A bucket that counts reads, to prove a pull fetched nothing."""
+
+    def __init__(self, source: FakeBucket) -> None:
+        super().__init__()
+        self.objects = source.objects
+        self.gets = 0
+
+    def get(self, key: str) -> bytes | None:
+        self.gets += 1
+        return super().get(key)
+
+
 class OpsTransportTest(unittest.TestCase):
     """What a sync must guarantee, without a real bucket."""
 
@@ -134,6 +147,46 @@ class OpsTransportTest(unittest.TestCase):
         self.assertIsNotNone(raw)
         body = json.loads(raw)
         self.assertEqual(body["vault_id"], "vault-1")
+
+    def test_a_restored_index_does_not_replay_the_bucket_history(self) -> None:
+        """Restoring adopts a peer's index: its ops are already local (journal_out), not "unseen".
+
+        Without this the pull re-fetched the whole history one object at a time and the window
+        answered «فرستادن تغییرها ناتمام ماند» after a slice that moved nothing.
+        """
+        other = tmp_vault()
+        try:
+            desktop = sync_ops.OpsTransport(
+                self.bucket, prefix="sync/", vault_id="vault-1", client_id="desktop"
+            )
+            for number in range(3):
+                journal.record(
+                    other.index, "put", f"n{number}.md", client="desktop",
+                    payload={"blob_id": f"bd{number}", "size": 1},
+                )
+            desktop.push(other.index)
+
+            # The restore adopted that index: the same three ops sit in journal_out, published.
+            published: list[str] = []
+            for number in range(3):
+                op = journal.record(
+                    self.index, "put", f"n{number}.md", client="desktop",
+                    payload={"blob_id": f"bd{number}", "size": 1},
+                )
+                published.append(str(op["op_id"]))
+            journal.mark_published(self.index, published)
+
+            counting = _CountingBucket(self.bucket)
+            transport = sync_ops.OpsTransport(
+                counting, prefix="sync/", vault_id="vault-1", client_id="phone"
+            )
+            result = transport.pull(self.index)
+
+            self.assertEqual(result["duplicates"], 0, "the history must not be fetched again")
+            self.assertEqual(result["applied"], 0)
+            self.assertEqual(counting.gets, 0, "not even one op object is read")
+        finally:
+            other.close()
 
     def test_push_and_pull_report_progress(self) -> None:
         """The transport narrates ``(phase, done, total)`` so a UI can draw a real bar."""

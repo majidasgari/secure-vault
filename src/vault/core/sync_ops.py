@@ -361,11 +361,23 @@ class OpsTransport:
         }
 
     def _cursor(self, index: Any, client: str) -> int:
-        """Return the last sequence number of ``client`` that was already handled here."""
-        row = index.conn.execute(
-            "SELECT MAX(seq) AS n FROM journal_in WHERE client=?", (client,)
-        ).fetchone()
-        return int(row["n"] or 0) if row is not None else 0
+        """Return the last sequence number of ``client`` that is already reflected here.
+
+        Two places count as "handled": ops applied from a peer (``journal_in``) and this vault's
+        own ops (``journal_out``) — its own changes *are* the local state. The second half is what
+        keeps a restored vault sane: a restore adopts another device's index, whose whole history
+        sits in ``journal_out`` while ``journal_in`` never saw it, so without it the pull replays
+        thousands of ops as duplicates (one GET each) and the UI reports a failed push.
+        """
+        seen = 0
+        for sql, param in (
+            ("SELECT MAX(seq) AS n FROM journal_in WHERE client=?", client),
+            ("SELECT MAX(seq) AS n FROM journal_out WHERE op_id LIKE ?", f"{client}-%"),
+        ):
+            row = index.conn.execute(sql, (param,)).fetchone()
+            value = int(row["n"] or 0) if row is not None else 0
+            seen = max(seen, value)
+        return seen
 
     def _op_keys(self, client: str) -> list[str]:
         """Return the sequence numbers present for ``client`` (as strings, zero padded)."""

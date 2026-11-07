@@ -2190,6 +2190,7 @@ class VaultApplication(QObject):
             return
         pushed = int(data.get("pushed", 0) or 0)
         applied = int(data.get("applied", 0) or 0)
+        duplicates = int(data.get("duplicates", 0) or 0)
         job["pushed"] += pushed
         job["applied"] += applied
         job["conflicts"] = int(data.get("conflicts", 0) or 0)
@@ -2208,15 +2209,23 @@ class VaultApplication(QObject):
             return
         if job["more"]:
             if not pushed and not applied and not job["pending"]:
-                # Nothing moved and nothing is queued: report it instead of spinning the timer.
-                self._journal_sync = None
-                self._close_journal_progress()
-                if self.window is not None:
-                    self.window.statusBar().clearMessage()
-                notifications.notify(
-                    i18n.tr("notification.sync_title"), i18n.tr("sync.push_failed"), tray=self.tray
-                )
-                return
+                if duplicates:
+                    # Only duplicates: the history still on the bucket is already in this index
+                    # (a restored vault's own journal_out). Nothing left to do — finish quietly.
+                    job["more"] = False
+                else:
+                    # Nothing moved and nothing is queued: report it instead of spinning the timer.
+                    self._journal_sync = None
+                    self._close_journal_progress()
+                    if self.window is not None:
+                        self.window.statusBar().clearMessage()
+                    notifications.notify(
+                        i18n.tr("notification.sync_title"),
+                        i18n.tr("sync.push_failed"),
+                        tray=self.tray,
+                    )
+                    return
+        if job["more"]:
             if self.window is not None:
                 self.window.statusBar().showMessage(
                     i18n.tr(
