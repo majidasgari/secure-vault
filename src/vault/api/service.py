@@ -700,6 +700,15 @@ class Service:
             path, host=host if isinstance(host, str) else None, session_id=session_id
         )
 
+    def _h_browser_cards(self, params: dict, role: str, session_id: str) -> dict:
+        """List the card entries a payment page can be filled from (metadata only)."""
+        return self._require_browser().cards()
+
+    def _h_browser_reveal_card(self, params: dict, role: str, session_id: str) -> dict:
+        """Return one card's fields (the audited reveal used by a payment page)."""
+        path = self._text(self._require(params, "path"), param="path")
+        return self._require_browser().reveal_card(path, session_id=session_id)
+
     def _h_browser_save_check(self, params: dict, role: str, session_id: str) -> dict:
         """Say what saving this credential would mean (new / changed / same) — write nothing."""
         return self._require_browser().save_check(
@@ -987,6 +996,11 @@ class Service:
         max_ops = int(params.get("max_ops") or 0)
         return {"result": self.session.sync_journal(max_ops=max_ops or None)}
 
+    def _h_publish_snapshot(self, params: dict, role: str, session_id: str) -> dict:
+        """Publish this index for a reader that cannot apply the operation log (the phone)."""
+        self.session._require_unlocked()
+        return {"result": self.session.publish_reader_snapshot()}
+
     def _h_migrate_journal(self, params: dict, role: str, session_id: str) -> dict:
         """Adopt the operation log for this vault (idempotent; the legacy mirror stays readable)."""
         return {"result": self.session.migrate_to_journal()}
@@ -1178,6 +1192,7 @@ class Service:
         "vault.sync_test": (_h_sync_test, _UI_ONLY),
         "vault.sync_now": (_h_sync_now, _UI_ONLY),
         "vault.sync_journal": (_h_sync_journal, _UI_ONLY),
+        "vault.publish_snapshot": (_h_publish_snapshot, _UI_ONLY),
         "vault.migrate_journal": (_h_migrate_journal, _UI_ONLY),
         "vault.conflicts": (_h_conflicts, _BOTH),
         "vault.resolve_conflict": (_h_resolve_conflict, _UI_ONLY),
@@ -1196,6 +1211,8 @@ class Service:
         "vault.browser_status": (_h_browser_status, ROLE_BROWSER),
         "vault.browser_match": (_h_browser_match, ROLE_BROWSER),
         "vault.browser_reveal": (_h_browser_reveal, ROLE_BROWSER),
+        "vault.browser_cards": (_h_browser_cards, ROLE_BROWSER),
+        "vault.browser_reveal_card": (_h_browser_reveal_card, ROLE_BROWSER),
         "vault.browser_save_check": (_h_browser_save_check, ROLE_BROWSER),
         "vault.browser_save": (_h_browser_save, ROLE_BROWSER),
     }

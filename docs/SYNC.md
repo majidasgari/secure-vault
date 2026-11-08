@@ -307,15 +307,26 @@ Both modes refuse the other's sync (`sync_mode_journal` / `sync_mode_legacy`), s
 have its index mirrored over its operation log. The menu, the tray and the settings page only show
 the actions of the current mode: in journal mode the mirror, the upgrade and the write lock are gone.
 
-### Read-only clients (the phone)
+### The phone as a peer (pull **and** push)
 
-A client that only *reads* has no operation log to apply, so once the vault is in journal mode it keeps
-showing the day it was migrated. `VaultSession.publish_reader_snapshot()` (tool:
-`tools/…`/one-off script) uploads a one-way snapshot for it — `meta.sqlite`, `secure.store`,
-`.vault-meta.json`, skipped by ETag when unchanged — which a reader downloads and a writer never does.
+`secure-vault-android` 1.9.7 applies the log itself: it lists `ops/<client>/`, applies every operation
+past its `journal_in` cursor (stopping at the first hole — a missing op **or** a missing blob), records
+conflicts in the same `conflicts` table, downloads the blobs those ops name, and publishes its own
+queued `journal_out` rows with a `HEAD` hint. So a phone in journal mode stays current without any
+desktop action, and its own notes travel back.
 
-It is deliberately **not** part of the sync run: the phone in 1.4 also *writes* (it queues ops in its
-own `journal_out`) and cannot push them yet, so a metadata pull replaces its `meta.sqlite` and takes
-that queue with it. Publish a snapshot only for a phone that has no unpublished edits, or after the
-phone learns to push and pull the op log (the real fix: its `JournalIndex.apply` and `journal_in`
-cursor already exist in `secure-vault-android`).
+Two rules it follows:
+
+* **The base snapshot is what a new client needs.** A client that has no `meta.sqlite` cannot apply a
+  log that starts in the middle; it first downloads the reader snapshot (`meta.sqlite`,
+  `secure.store`, `.vault-meta.json`) and seeds its cursors from it — every op the snapshot's own
+  `journal_out` had published is already inside the snapshot. **Tools → «انتشار وضعیت برای گوشی…»**
+  (`vault.publish_snapshot` over the API) uploads that snapshot, ETag-skipped; it is the button to use
+  before onboard a new device.
+* **Never adopt a snapshot over a queue.** Replacing `meta.sqlite` takes that client's unpublished
+  operations with it, so the phone adopts one only while its own `journal_out` is clean; otherwise it
+  pulls into the copy it has and pushes first.
+
+What a phone still cannot apply from an op is the *sealed* body of a `note`/`learning` operation — the
+row and its revision travel, the note text stays in `secure.store` until the next snapshot. The file
+list, levels, tags, emoji and content are carried by the log itself.

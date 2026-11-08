@@ -42,6 +42,35 @@ SITE_LABELS = ("سایت", "وبسایت", "site")
 CATEGORY_LABELS = ("دسته", "دسته بندی", "category", "group")
 OTP_LABELS = ("کد یکبارمصرف", "کد یک بار مصرف", "کد یکبار مصرف", "otp", "totp", "2fa", "2fa code")
 
+#: The card fields a Shetab (Iranian banking) card carries, as ``(field, label)``: the label is
+#: what the body writes and what :func:`parse_body` looks for, exactly like the labels above.
+CARD_FIELDS = (
+    ("bank", "بانک"),
+    ("number", "شماره کارت"),
+    ("expiry", "تاریخ انقضا"),
+    ("cvv2", "CVV2"),
+    ("pin2", "رمز دوم"),
+    ("account", "شماره حساب"),
+    ("sheba", "شبا"),
+    ("holder", "صاحب حساب"),
+)
+
+#: Spellings accepted for each card field when *reading* a body (first present wins). The entry
+#: may come from the KeePass migration, where the label is whatever the user typed back then.
+CARD_LABEL_ALIASES = {
+    "bank": ("بانک", "نام بانک", "bank"),
+    "number": ("شماره کارت", "شمارهٔ کارت", "کارت", "card number", "card"),
+    "expiry": ("تاریخ انقضا", "تاریخ انقضاء", "انقضا", "expiry", "expiry date", "exp"),
+    "cvv2": ("cvv2", "cv2", "cvv", "cvv2 (سه رقم)"),
+    "pin2": ("رمز دوم", "رمز دوم پویا", "رمز دوم ثابت", "رمز اینترنتی", "pin2", "رمز دوم اینترنتی"),
+    "account": ("شماره حساب", "حساب", "account", "account number"),
+    "sheba": ("شبا", "شماره شبا", "sheba", "iban"),
+    "holder": ("صاحب حساب", "نام صاحب حساب", "card holder", "holder"),
+}
+
+#: The category a card created in the desktop app lands in (the treasure's own card folder).
+CARD_CATEGORY = "بانک و پرداخت"
+
 #: A line starting with one of these ends the ``label: value`` region.
 SECTION_MARKERS = ("##",)
 
@@ -180,10 +209,6 @@ def match_score(page_host: str, candidate: str) -> int:
     return 0
 
 
-#: Every credential entry lives under this root; the credential index only looks inside it.
-CREDENTIAL_ROOT = "/رمزها"
-
-
 def build_body(
     *,
     site: str,
@@ -219,11 +244,151 @@ def build_body(
     return "\n".join(lines) + "\n"
 
 
+#: Persian/Arabic-Indic digits, so a number typed on a Persian keyboard is stored as ASCII.
+_DIGIT_MAP = str.maketrans("۰۱۲۳۴۵۶۷۸۹٠١٢٣٤٥٦٧٨٩", "01234567890123456789")
+
+
+def digits_only(value: str) -> str:
+    """Return a card/account number as plain digits (Persian digits and separators removed)."""
+    text = (value or "").translate(_DIGIT_MAP)
+    return "".join(char for char in text if char.isdigit())
+
+
+#: One-line card spellings the KeePass migration produced (a bare number line, `cvv2 3001`, `exp 10/07`).
+_FREEFORM_CVV = re.compile(r"^\s*(?:cvv2?|cvc|cv2|کد\s*امنیتی)\D{0,3}(\d{3,4})\s*$", re.IGNORECASE)
+_FREEFORM_EXP = re.compile(
+    r"^\s*(?:exp(?:iry|ires)?|تاریخ\s*انقضا|انقضا)\D{0,3}([0-9۰-۹]{1,2}\s*[/\-.]\s*[0-9۰-۹]{1,2})\s*$",
+    re.IGNORECASE,
+)
+_FREEFORM_PIN = re.compile(
+    r"^\s*(?:pin2?|رمز\s*دوم|رمز\s*اینترنتی|رمز)\D{0,3}(\d{3,10})\s*$", re.IGNORECASE
+)
+_FREEFORM_SHEBA = re.compile(r"^\s*IR\s*([0-9]{24})\s*$", re.IGNORECASE)
+_FREEFORM_BANK = re.compile(r"^\s*(?:بانک|bank)\s*[:：]\s*(.+?)\s*$", re.IGNORECASE)
+_FREEFORM_HOLDER = re.compile(
+    r"^\s*(?:صاحب\s*حساب|نام\s*دارنده|card\s*holder|holder)\s*[:：]?\s*(.+?)\s*$", re.IGNORECASE
+)
+
+
+def card_from_text(text: str) -> dict[str, str]:
+    """Read a card out of a free-form body (the migrated one-liner shape, no Persian labels).
+
+    The KeePass importer kept a card as its own lines — a bare 16-digit number, ``cvv2 3001``,
+    ``exp 10/07``, ``pin 6086``, ``IR…`` — so a label-only parser sees nothing at all. This reads
+    that shape; it is only ever used for a body that lives in the card folder.
+    """
+    card = {field: "" for field, _label in CARD_FIELDS}
+    for raw in (text or "").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        match = _FREEFORM_CVV.match(line)
+        if match and not card["cvv2"]:
+            card["cvv2"] = match.group(1)
+            continue
+        match = _FREEFORM_EXP.match(line)
+        if match and not card["expiry"]:
+            card["expiry"] = match.group(1).replace("-", "/").replace(".", "/").replace(" ", "")
+            continue
+        match = _FREEFORM_SHEBA.match(line)
+        if match and not card["sheba"]:
+            card["sheba"] = "IR" + match.group(1)
+            continue
+        match = _FREEFORM_PIN.match(line)
+        if match and not card["pin2"]:
+            card["pin2"] = match.group(1)
+            continue
+        match = _FREEFORM_BANK.match(line)
+        if match and not card["bank"]:
+            card["bank"] = match.group(1)
+            continue
+        match = _FREEFORM_HOLDER.match(line)
+        if match and not card["holder"]:
+            card["holder"] = match.group(1)
+            continue
+        digits = digits_only(line)
+        letters = any(char.isalpha() for char in line)
+        if not letters and not card["number"] and 16 <= len(digits) <= 19:
+            card["number"] = digits
+    return card
+
+
+def parse_entry(
+    text: str,
+    *,
+    logical: str = "",
+    fallback_title: str = "",
+    fallback_site: str = "",
+) -> dict[str, Any]:
+    """Parse one entry body; inside the card folder a free-form body still counts as a card."""
+    parsed = parse_body(text, fallback_title=fallback_title, fallback_site=fallback_site)
+    folder = logical.split("/")
+    if not parsed["is_card"] and logical.startswith(f"{CREDENTIAL_ROOT}/{CARD_CATEGORY}/"):
+        free = card_from_text(text)
+        if free["number"] or free["sheba"]:
+            parsed["card"] = free
+            parsed["is_card"] = True
+    # The migrated cards name the bank by their folder (``…/بانک و پرداخت/بانک ملی/x.md``): when the
+    # body itself says nothing, that folder is what the panel should show.
+    if parsed["is_card"] and not (parsed["card"] or {}).get("bank") and len(folder) >= 4:
+        name = folder[2]
+        if name and name != CARD_CATEGORY:
+            parsed["card"]["bank"] = name
+    return parsed
+
+
+def build_card_body(
+    *,
+    bank: str = "",
+    number: str = "",
+    expiry: str = "",
+    cvv2: str = "",
+    pin2: str = "",
+    account: str = "",
+    sheba: str = "",
+    holder: str = "",
+    notes: str = "",
+) -> str:
+    """Build a Shetab (bank card) entry in the credential shape — :func:`parse_body` reads it back.
+
+    It is the same ``# title`` / ``سایت: … | دسته: …`` / ``label: value`` body a login uses, so the
+    viewer, the search index and the phone need no second format. A card carries no password, so
+    the browser bridge never offers it: only a *nickname* for the card is derived from its last four
+    digits, and every value is written only when it was filled in.
+    """
+    digits = digits_only(number)
+    title = (bank or "").strip()
+    if digits:
+        title = f"{title} — کارت {digits[-4:]}" if title else f"کارت {digits[-4:]}"
+    title = title or "کارت بانکی"
+    values = (
+        ("بانک", (bank or "").strip()),
+        ("شماره کارت", digits),
+        ("تاریخ انقضا", (expiry or "").strip()),
+        ("CVV2", digits_only(cvv2)),
+        ("رمز دوم", (pin2 or "").strip()),
+        ("شماره حساب", digits_only(account)),
+        ("شبا", (sheba or "").strip().upper().replace(" ", "")),
+        ("صاحب حساب", (holder or "").strip()),
+    )
+    lines = [f"# {title}", f"سایت: {title} | دسته: {CARD_CATEGORY}"]
+    lines.extend(f"{label}: {value}" for label, value in values if value)
+    lines.extend(["", "## یادداشت"])
+    if notes.strip():
+        lines.append(notes.strip())
+    return "\n".join(lines) + "\n"
+
+
 def credential_path(site: str, category: str = "") -> str:
-    """Where a new entry goes: ``/رمزها/<دسته>/<سایت>.md``, with no path separators smuggled in."""
+    """Where a new entry goes: ``/رمزها/<دسته>/<سایت>.md``, with no path separators smuggled in.
+
+    The leading ``/`` is the app's absolute path form (the same shape the browser panel shows and
+    ``write_file`` accepts); ``CREDENTIAL_ROOT`` itself stays slash-less because the vault's index
+    rows and the browser bridge name folders without one.
+    """
     folder = (category or "").strip() or "عمومی"
     name = (site or "").strip() or "ورودی رمز"
-    return f"{CREDENTIAL_ROOT}/{folder.replace('/', '-')}/{name.replace('/', '-')}.md"
+    return f"/{CREDENTIAL_ROOT}/{folder.replace('/', '-')}/{name.replace('/', '-')}.md"
 
 
 def parse_body(text: str, *, fallback_title: str = "", fallback_site: str = "") -> dict[str, Any]:
@@ -297,6 +462,9 @@ def parse_body(text: str, *, fallback_title: str = "", fallback_site: str = "") 
     seen: dict[str, None] = {}
     for host in hosts:
         seen.setdefault(host, None)
+    # A Shetab card lives in the same body shape, so one parser reads both: the card fields are
+    # simply reported next to the login ones (a card has no password, so the bridge ignores it).
+    card = {field: first_of(aliases) for field, aliases in CARD_LABEL_ALIASES.items()}
     return {
         "title": title or fallback,
         "site": site,
@@ -308,6 +476,8 @@ def parse_body(text: str, *, fallback_title: str = "", fallback_site: str = "") 
         "has_password": bool(password),
         "has_otp": bool(otp),
         "hosts": list(seen),
+        "card": card,
+        "is_card": bool(card["number"] or card["sheba"] or card["cvv2"]),
     }
 
 
@@ -412,6 +582,10 @@ class CredentialEntry:
     has_otp: bool
     hosts: tuple[str, ...] = ()
     category: str = ""
+    #: The card fields of a Shetab entry (``{"bank", "number", "expiry", "cvv2", "pin2", …}``),
+    #: or ``None`` for a login. The full number stays here — :meth:`card_meta` is what leaves the
+    #: vault, and it carries only the bank and the last four digits.
+    card: dict[str, Any] | None = None
 
     def to_dict(self, *, score: int = 0) -> dict[str, Any]:
         """Return the caller-facing (password-free) representation."""
@@ -424,6 +598,21 @@ class CredentialEntry:
             "has_password": self.has_password,
             "has_otp": self.has_otp,
             "score": int(score),
+        }
+
+    def card_meta(self) -> dict[str, Any]:
+        """Return the password-free description of a card entry (bank, last four digits, fields)."""
+        card = self.card or {}
+        return {
+            "path": self.path,
+            "title": self.title,
+            "bank": card.get("bank", ""),
+            "last4": (card.get("number") or "")[-4:],
+            "holder": card.get("holder", ""),
+            "has_expiry": bool(card.get("expiry")),
+            "has_cvv2": bool(card.get("cvv2")),
+            "has_pin2": bool(card.get("pin2")),
+            "has_sheba": bool(card.get("sheba")),
         }
 
 
@@ -494,7 +683,9 @@ class CredentialIndex:
             except Exception:  # noqa: BLE001 - one unreadable entry must not kill the index
                 continue
             scanned += 1
-            parsed = parse_body(text, fallback_title=_stem(logical), fallback_site=fallback_site)
+            parsed = parse_entry(
+                text, logical=logical, fallback_title=_stem(logical), fallback_site=fallback_site
+            )
             entries.append(
                 CredentialEntry(
                     path="/" + logical,
@@ -506,6 +697,7 @@ class CredentialIndex:
                     has_otp=parsed["has_otp"],
                     hosts=tuple(parsed["hosts"]),
                     category=parsed["category"],
+                    card=dict(parsed["card"]) if parsed["is_card"] else None,
                 )
             )
         entries.sort(key=lambda item: item.path)
@@ -534,6 +726,10 @@ class CredentialIndex:
                 scored.append((score, entry))
         scored.sort(key=lambda item: (-item[0], not item[1].username, item[1].title.lower(), item[1].path))
         return [entry.to_dict(score=score) for score, entry in scored[: max(1, int(limit))]]
+
+    def cards(self) -> list[dict[str, Any]]:
+        """Return every card entry of the index, metadata only (no number, no CVV2, no PIN2)."""
+        return [entry.card_meta() for entry in self.entries() if entry.card]
 
     def search(self, query: str, *, limit: int = 50) -> list[dict[str, Any]]:
         """Return ``[{"path", "fields"}]`` for entries whose *fields* match ``query``.
@@ -617,9 +813,15 @@ def _now_ms() -> int:
 
 __all__ = [
     "BROWSER_CATEGORY",
+    "CARD_CATEGORY",
+    "CARD_FIELDS",
     "CREDENTIAL_ROOT",
     "CredentialEntry",
     "CredentialIndex",
+    "build_card_body",
+    "card_from_text",
+    "digits_only",
+    "parse_entry",
     "match_score",
     "normalize_host",
     "parse_body",

@@ -91,9 +91,15 @@ class SecretViewer(QDialog):
         # The values exist only inside this dialog (the agent/bridge never receive a secretfile's
         # content), so copying one is the same exposure as the existing whole-body copy: it goes to
         # the user's own clipboard and nowhere else. A button is only built when its field exists.
-        parsed = credentials.parse_body(text or "")
+        parsed = credentials.parse_entry(text or "", logical=path)
         self.username = str(parsed.get("username") or "")
         self.password = str(parsed.get("password") or "")
+        # A Shetab card is the same body shape, so the same dialog offers its copy actions
+        # (a card number, a CVV2 and a second password are what a payment form asks for).
+        card = dict(parsed.get("card") or {})
+        self.card_number = str(card.get("number") or "")
+        self.card_cvv2 = str(card.get("cvv2") or "")
+        self.card_pin2 = str(card.get("pin2") or "")
         self.field_actions = QWidget(self)
         actions = QHBoxLayout(self.field_actions)
         actions.setContentsMargins(0, 0, 0, 0)
@@ -106,8 +112,22 @@ class SecretViewer(QDialog):
         self.copy_password_button.clicked.connect(self.copy_password)
         self.copy_password_button.setVisible(bool(self.password))
         actions.addWidget(self.copy_password_button)
+        self.copy_card_button = QPushButton(self.field_actions)
+        self.copy_card_button.clicked.connect(self.copy_card)
+        self.copy_card_button.setVisible(bool(self.card_number))
+        actions.addWidget(self.copy_card_button)
+        self.copy_cvv2_button = QPushButton(self.field_actions)
+        self.copy_cvv2_button.clicked.connect(self.copy_cvv2)
+        self.copy_cvv2_button.setVisible(bool(self.card_cvv2))
+        actions.addWidget(self.copy_cvv2_button)
+        self.copy_pin2_button = QPushButton(self.field_actions)
+        self.copy_pin2_button.clicked.connect(self.copy_pin2)
+        self.copy_pin2_button.setVisible(bool(self.card_pin2))
+        actions.addWidget(self.copy_pin2_button)
         actions.addStretch(1)
-        self.field_actions.setVisible(bool(self.username or self.password))
+        self.field_actions.setVisible(
+            bool(self.username or self.password or self.card_number or self.card_cvv2 or self.card_pin2)
+        )
         layout.addWidget(self.field_actions)
 
         # --- live one-time code (hidden when the body carries no OTP field) ---
@@ -251,6 +271,18 @@ class SecretViewer(QDialog):
         """Copy the parsed password to the clipboard and notify."""
         self._copy_field(self.password, "viewer.copied_password")
 
+    def copy_card(self) -> None:
+        """Copy only the card number to the clipboard and notify."""
+        self._copy_field(self.card_number, "viewer.copied_card")
+
+    def copy_cvv2(self) -> None:
+        """Copy only the CVV2 to the clipboard and notify."""
+        self._copy_field(self.card_cvv2, "viewer.copied_cvv2")
+
+    def copy_pin2(self) -> None:
+        """Copy only the second password (رمز دوم) to the clipboard and notify."""
+        self._copy_field(self.card_pin2, "viewer.copied_pin2")
+
     def _copy_field(self, value: str, key: str) -> None:
         """Put one field on the clipboard.
 
@@ -286,15 +318,25 @@ class SecretViewer(QDialog):
     def _refresh_parsed(self) -> None:
         """Re-parse the body (either saved or while typing) to update copy/OTP actions."""
         current_text = self.edit.toPlainText() if hasattr(self, "edit") else (self.text or "")
-        parsed = credentials.parse_body(current_text)
+        parsed = credentials.parse_entry(current_text, logical=self.path)
         self.username = str(parsed.get("username") or "")
         self.password = str(parsed.get("password") or "")
         if hasattr(self, "copy_username_button"):
             self.copy_username_button.setVisible(bool(self.username))
+        card = dict(parsed.get("card") or {})
+        self.card_number = str(card.get("number") or "")
+        self.card_cvv2 = str(card.get("cvv2") or "")
+        self.card_pin2 = str(card.get("pin2") or "")
         if hasattr(self, "copy_password_button"):
             self.copy_password_button.setVisible(bool(self.password))
+        if hasattr(self, "copy_card_button"):
+            self.copy_card_button.setVisible(bool(self.card_number))
+            self.copy_cvv2_button.setVisible(bool(self.card_cvv2))
+            self.copy_pin2_button.setVisible(bool(self.card_pin2))
         if hasattr(self, "field_actions"):
-            self.field_actions.setVisible(bool(self.username or self.password))
+            self.field_actions.setVisible(
+                bool(self.username or self.password or self.card_number or self.card_cvv2 or self.card_pin2)
+            )
 
         self._otp_value = totp.otp_value_from_body(current_text)
         fresh_otp = (
@@ -409,6 +451,9 @@ class SecretViewer(QDialog):
         self.copy_button.setText(i18n.tr("viewer.copy"))
         self.copy_username_button.setText(i18n.tr("viewer.copy_username"))
         self.copy_password_button.setText(i18n.tr("viewer.copy_password"))
+        self.copy_card_button.setText(i18n.tr("viewer.copy_card"))
+        self.copy_cvv2_button.setText(i18n.tr("viewer.copy_cvv2"))
+        self.copy_pin2_button.setText(i18n.tr("viewer.copy_pin2"))
         self.otp_title.setText(i18n.tr("viewer.otp_title"))
         self.otp_copy_button.setText(i18n.tr("viewer.copy_otp"))
         self._render_otp()

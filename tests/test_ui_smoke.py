@@ -857,15 +857,17 @@ class SecretViewerOtpTest(unittest.TestCase):
             dialog.close()
 
     def test_body_without_otp_shows_no_row(self) -> None:
-        """A card entry has nothing to count down: the row stays hidden."""
+        """A card entry has nothing to count down, and offers the card's own copy buttons."""
         from vault.ui import viewer
 
         dialog = viewer.SecretViewer(None, "/رمزها/بانک/bank.md", self.PLAIN_BODY)
         try:
             self.assertIsNone(dialog.otp)
             self.assertFalse(dialog.otp_box.isVisibleTo(dialog))
-            # A card number is neither a user name nor a password: no copy button for it.
-            self.assertFalse(dialog.field_actions.isVisibleTo(dialog))
+            # A card number is neither a user name nor a password, so those two stay hidden —
+            # but the card row is exactly what a payment form needs, so it is shown.
+            self.assertTrue(dialog.field_actions.isVisibleTo(dialog))
+            self.assertTrue(dialog.copy_card_button.isVisibleTo(dialog))
             self.assertFalse(dialog.copy_username_button.isVisibleTo(dialog))
             self.assertFalse(dialog.copy_password_button.isVisibleTo(dialog))
         finally:

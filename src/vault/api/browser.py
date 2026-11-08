@@ -43,6 +43,7 @@ from .. import __version__
 from ..config import runtime_dir as default_runtime_dir
 from ..core.credentials import (
     BROWSER_CATEGORY,
+    CARD_CATEGORY,
     CREDENTIAL_ROOT,
     PASSWORD_LABELS,
     USERNAME_LABELS,
@@ -50,6 +51,7 @@ from ..core.credentials import (
     match_score,
     normalize_host,
     parse_body,
+    parse_entry,
     quiet_scan,
     render_body,
     safe_name,
@@ -340,6 +342,74 @@ class BrowserBridge:
             "url": parsed["url"],
             "has_password": parsed["has_password"],
             "has_otp": parsed["has_otp"],
+            "ts": now_ms(),
+        }
+
+    # ------------------------------------------------------------------------ cards
+    def cards(self) -> dict[str, Any]:
+        """List the card entries that can be filled into a payment page (metadata only).
+
+        The add-on shows ``بانک`` and the last four digits; the number, the CVV2 and the second
+        password never leave the vault until the user picks one card (:meth:`reveal_card`).
+        """
+        self._require_usable()
+        with quiet_scan(self.session):
+            found = self.index.cards()
+        return {
+            "count": len(found),
+            "cards": found,
+            "index": self.index.status(),
+            "ts": now_ms(),
+        }
+
+    def reveal_card(self, path: str, *, session_id: str = "") -> dict[str, Any]:
+        """Return one card's fields — the only call that yields a card number and a CVV2.
+
+        Payment pages live on the gateway's own domain, so there is no host to match against:
+        the guarantee here is that only an entry inside the card folder answers, that the call
+        is loopback-only (the route enforces it), rate-limited like a reveal and always audited.
+
+        Raises:
+            PermissionDenied: autofill off, path outside the card folder, too many reveals.
+            VaultLocked: the vault is locked.
+            NotFound: no such entry. BadRequest: the entry is not a card.
+        """
+        self._require_usable()
+        logical = normalize_vault_path(path)
+        folder = f"{CREDENTIAL_ROOT}/{CARD_CATEGORY}/"
+        if not logical.startswith(folder):
+            raise PermissionDenied(
+                "path_outside_cards",
+                details={
+                    "path": "/" + logical if logical else path,
+                    "root": "/" + folder.rstrip("/"),
+                },
+            )
+        row = self.session.index.require_file(logical)
+        if int(row.get("is_dir", 0)):
+            raise BadRequest("is_directory", details={"path": "/" + logical})
+        self._note_reveal()
+        data = self.session.read_file("/" + logical, source=SOURCE_BROWSER, session=session_id)
+        parsed = parse_entry(
+            data.decode("utf-8", errors="replace"),
+            logical=logical,
+            fallback_title=logical.rsplit("/", 1)[-1],
+            fallback_site=(logical.rsplit("/", 1)[0] if "/" in logical else "").rsplit("/", 1)[-1],
+        )
+        if not parsed["is_card"]:
+            raise BadRequest("not_a_card", details={"path": "/" + logical})
+        card = parsed["card"]
+        return {
+            "path": "/" + logical,
+            "title": parsed["title"],
+            "bank": card.get("bank", ""),
+            "number": card.get("number", ""),
+            "expiry": card.get("expiry", ""),
+            "cvv2": card.get("cvv2", ""),
+            "pin2": card.get("pin2", ""),
+            "account": card.get("account", ""),
+            "sheba": card.get("sheba", ""),
+            "holder": card.get("holder", ""),
             "ts": now_ms(),
         }
 

@@ -529,6 +529,19 @@ class WebAPI:
                     params[key] = value
         return self._autofill_call("vault.browser_reveal", params)
 
+    def autofill_cards(self) -> Response:
+        """List the card entries a payment page can be filled from (metadata only)."""
+        return self._autofill_call("vault.browser_cards", {})
+
+    def autofill_reveal_card(self, payload: Any) -> Response:
+        """Return one card's fields (the audited reveal for a payment page)."""
+        params: dict[str, Any] = {}
+        if isinstance(payload, dict):
+            value = payload.get("path")
+            if isinstance(value, str) and value:
+                params["path"] = value
+        return self._autofill_call("vault.browser_reveal_card", params)
+
     def autofill_save_check(self, payload: Any) -> Response:
         """Report what saving this credential would mean — new, changed or already stored."""
         return self._autofill_call(

@@ -515,6 +515,7 @@ class VaultApplication(QObject):
             on_take_control=self.take_write_access,
             on_new_note=self.new_note,
             on_new_credential=self.new_credential,
+            on_new_card=self.new_card,
             on_quit=self.quit,
         )
         self.tray.set_locked(not (self.session is None or self.session.is_locked))
@@ -1269,12 +1270,7 @@ class VaultApplication(QObject):
         from ..core.credentials import build_body, credential_path
 
         folder, name = credential_path(values["site"], values["category"]).rsplit("/", 1)
-        path = folder + "/" + name
-        suffix = 2
-        while self._exists(path):
-            stem = name[:-3] if name.endswith(".md") else name
-            path = f"{folder}/{stem} ({suffix}).md"
-            suffix += 1
+        path = self._unique_path(folder, name)
         try:
             self.dispatch_ui(
                 "vault.write_file",
@@ -1285,6 +1281,49 @@ class VaultApplication(QObject):
             return
         self.hub.notify()
         self.window.open_file(path)
+
+    def new_card(self) -> None:
+        """Create a Shetab card entry under ``/رمزها/بانک و پرداخت`` and open it."""
+        from .card_dialog import prompt_card
+
+        values = prompt_card(self.window)
+        if values is None:
+            return
+        from ..core.credentials import (
+            CARD_CATEGORY,
+            build_card_body,
+            credential_path,
+            parse_body,
+            safe_name,
+        )
+
+        body = build_card_body(**values)
+        # The body's own heading is the entry's name (``<بانک> — کارت <۴ رقم آخر>``): deriving it
+        # from the body keeps the file name and the title the viewer shows one single rule.
+        title = str(parse_body(body)["title"]) or i18n.tr("card.new_title")
+        folder, name = credential_path(safe_name(title, fallback="کارت بانکی"), CARD_CATEGORY).rsplit("/", 1)
+        path = self._unique_path(folder, name)
+        try:
+            self.dispatch_ui(
+                "vault.write_file",
+                {"path": path, "content": body, "sensitivity": "secretfile"},
+            )
+        except VaultError as exc:
+            QMessageBox.warning(self.window, i18n.tr("app.title"), error_message(exc))
+            return
+        self.hub.notify()
+        self.window.open_file(path)
+
+    def _unique_path(self, folder: str, name: str) -> str:
+        """Return ``folder/name``, numbered ``(2)``, ``(3)``… while that path already exists."""
+        path = folder + "/" + name
+        suffix = 2
+        while self._exists(path):
+            stem = name[:-3] if name.endswith(".md") else name
+            path = f"{folder}/{stem} ({suffix}).md"
+            suffix += 1
+        return path
+
 
     def _exists(self, path: str) -> bool:
         try:
@@ -2031,6 +2070,27 @@ class VaultApplication(QObject):
         notifications.notify(i18n.tr("migrate.title"), message, tray=self.tray)
         self.hub.notify()
         return {"ok": True, **result}
+
+    def publish_snapshot(self) -> dict[str, Any]:
+        """Publish the current index for the phone (a reader cannot apply the op log itself)."""
+        if self.session is None or self.session.is_locked:
+            self._notify_web_problem(i18n.tr("error.VAULT_LOCKED"))
+            return {"ok": False, "error": "locked"}
+        try:
+            result = self.dispatch_ui("vault.publish_snapshot", {}).get("result") or {}
+        except VaultError as exc:
+            notifications.notify(
+                i18n.tr("notification.sync_title"), error_message(exc), tray=self.tray
+            )
+            return {"ok": False, "error": exc.code}
+        uploaded = list(result.get("uploaded") or [])
+        message = (
+            i18n.tr("notification.snapshot_uploaded", count=len(uploaded))
+            if uploaded
+            else i18n.tr("notification.snapshot_current")
+        )
+        notifications.notify(i18n.tr("snapshot.title"), message, tray=self.tray)
+        return {"ok": True, "uploaded": uploaded}
 
     def sync_journal_now(self) -> dict[str, Any]:
         """Run the lock-free multi-client sync, in slices, then ask about anything that conflicts."""

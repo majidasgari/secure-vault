@@ -1876,6 +1876,12 @@
       var button = $(selector);
       if (button) { button.hidden = !!state.file.binary; }
     });
+    //: Download is the file's own bytes with the file's own name — only for a `normal` file,
+    //: because that is all /api/blob will hand out (a secret stays behind the desktop gate).
+    var downloadButton = $("#btn-note-download");
+    if (downloadButton) {
+      downloadButton.hidden = !!state.file.binary || state.file.sensitivity !== "normal";
+    }
     //: One button, two meanings, named out loud: add this note to the learning cycle, or open the
     //: cycle when it is already in it.
     var learnButton = $("#btn-note-learn-top");
@@ -3415,6 +3421,25 @@
       });
     };
     $("#btn-note-raw-top").addEventListener("click", rawHandler);
+    //: Download: the same bytes /api/blob serves, saved under the file's own name. (A plain
+    //: `<a download href="/api/blob?…">` is a 401: the token only rides on a fetch header.)
+    var downloadHandler = function () {
+      if (!state.file || state.file.binary || state.file.sensitivity !== "normal") { return; }
+      var name = state.file.name;
+      fetchBlob(state.file.path).then(function (blob) {
+        if (!blob) { showToast(t("error.ERROR"), "error"); return; }
+        var url = URL.createObjectURL(blob);
+        var link = document.createElement("a");
+        link.href = url;
+        link.download = name;
+        document.body.appendChild(link);
+        link.click();
+        link.remove();
+        window.setTimeout(function () { URL.revokeObjectURL(url); }, 60000);
+      });
+    };
+    var downloadButton = $("#btn-note-download");
+    if (downloadButton) { downloadButton.addEventListener("click", downloadHandler); }
     //: Printing is the browser's own dialog over the print stylesheet — no server call, no export
     //: endpoint, and nothing leaves the machine: the page is already the document. Ctrl+P needs no
     //: button at all; both paths print exactly the same thing.

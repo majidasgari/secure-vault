@@ -1477,6 +1477,38 @@ class PrintSpaTest(unittest.TestCase):
                 self.assertTrue(str(data[key]).strip(), f"{key} empty in {path.name}")
 
 
+class DownloadTest(unittest.TestCase):
+    """Downloading a note: the file's own bytes, saved under the file's own name.
+
+    The bytes come from /api/blob (the only reader that hands out a `normal` file), and a plain
+    `<a download href="/api/blob?…">` cannot be used — the token only rides on a fetch header.
+    """
+
+    def setUp(self) -> None:
+        self.js = (WEBUI_DIR / "app.js").read_text(encoding="utf-8")
+        self.html = (WEBUI_DIR / "index.html").read_text(encoding="utf-8")
+
+    def test_the_note_view_carries_a_download_button(self) -> None:
+        self.assertIn('id="btn-note-download"', self.html)
+        self.assertIn('data-i18n="web.download"', self.html)
+        self.assertIn('"#btn-note-download"', self.js)
+
+    def test_the_saved_name_is_the_files_own_name(self) -> None:
+        body = self.js[self.js.index('var downloadHandler = function') :]
+        body = body[: body.index("};\n") + 2]
+        self.assertIn("link.download = name", body)
+        self.assertIn("var name = state.file.name", body)
+        # the button is only offered where /api/blob will answer
+        self.assertIn('state.file.sensitivity !== "normal"', body)
+
+    def test_the_download_labels_exist_in_every_language(self) -> None:
+        for path in sorted(I18N_DIR.glob("*.json")):
+            data = json.loads(path.read_text(encoding="utf-8"))
+            for key in ("web.download", "web.download_title"):
+                self.assertIn(key, data, f"{key} missing in {path.name}")
+                self.assertTrue(str(data[key]).strip(), f"{key} empty in {path.name}")
+
+
 class LearningTest(_WebTestCase):
     """The learning cycle over the web API: the four actions and the due/upcoming split."""
 

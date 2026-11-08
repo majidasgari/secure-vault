@@ -184,6 +184,7 @@ class MainWindow(QMainWindow):
             ("migrate_sync", not journal),
             ("take_control", not journal),
             ("sync_journal", journal),
+            ("publish_snapshot", journal),
             ("conflicts", journal),
         ):
             if name in self.actions:
@@ -233,6 +234,8 @@ class MainWindow(QMainWindow):
         file_menu = self.menuBar().addMenu("")
         self._menus["file"] = file_menu
         add(file_menu, "new_note", "Ctrl+N", self.controller.new_note)
+        add(file_menu, "new_credential", None, self.controller.new_credential)
+        add(file_menu, "new_card", None, self.controller.new_card)
         add(file_menu, "new_folder", None, self.controller.new_folder)
         add(file_menu, "import", None, self.controller.import_joplin)
         file_menu.addSeparator()
@@ -264,6 +267,7 @@ class MainWindow(QMainWindow):
         tools_menu.addSeparator()
         add(tools_menu, "sync", None, self.controller.sync_now)
         add(tools_menu, "sync_journal", None, self.controller.sync_journal_now)
+        add(tools_menu, "publish_snapshot", None, self.controller.publish_snapshot)
         add(tools_menu, "migrate_sync", None, self.controller.migrate_sync)
         add(tools_menu, "conflicts", None, self.controller.show_conflicts)
         add(tools_menu, "take_control", None, self.controller.take_write_access)
@@ -723,6 +727,8 @@ class MainWindow(QMainWindow):
         self._menus["help"].setTitle(i18n.tr("menu.help"))
         labels = {
             "new_note": "menu.new_note",
+            "new_credential": "menu.new_credential",
+            "new_card": "menu.new_card",
             "new_folder": "menu.new_folder",
             "import": "menu.import",
             "save": "menu.save",
@@ -735,6 +741,7 @@ class MainWindow(QMainWindow):
             "semantic_index": "menu.semantic_index",
             "sync": "menu.sync",
             "sync_journal": "menu.sync_journal",
+            "publish_snapshot": "menu.publish_snapshot",
             "migrate_sync": "menu.migrate_sync",
             "conflicts": "menu.conflicts",
             "take_control": "tray.take_control",

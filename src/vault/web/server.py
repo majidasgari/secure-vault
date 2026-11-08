@@ -41,6 +41,10 @@ _STATIC_TYPES = {
 FONT_FILENAME = "Vazirmatn-Regular.ttf"
 FONT_ROUTE = f"/api/fonts/{FONT_FILENAME}"
 
+#: Origins a browser add-on is served from. Only these are answered cross-origin: a page cannot
+#: forge its own `Origin`, so echoing it cannot leak vault data to a site the user visits.
+WE_ORIGIN_PREFIXES = ("moz-extension://", "chrome-extension://", "safari-web-extension://")
+
 
 class _ThreadingHTTPServer(ThreadingHTTPServer):
     """Threading HTTP server carrying a back-reference to the :class:`WebServer`."""
@@ -73,6 +77,38 @@ class _Handler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
         """Handle POST requests."""
         self._handle("POST")
+
+    def do_OPTIONS(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
+        """Answer the browser add-on's CORS preflight.
+
+        A web-extension page that calls the bridge sends `X-Vault-Claim` / `X-Vault-Token`,
+        which makes its `fetch` a non-simple request: without this answer the browser never
+        sends the real request (and the add-on reported "the vault is not running" while the
+        vault was in fact running).
+        """
+        cors = self._cors()
+        if not cors:
+            self._send_json(403, {"error": {"code": "FORBIDDEN", "message": "origin_not_allowed"}})
+            return
+        self.send_response(204)
+        for key, value in cors.items():
+            self.send_header(key, value)
+        self.send_header("Access-Control-Allow-Methods", "GET, HEAD, POST, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "content-type, x-vault-claim, x-vault-token")
+        self.send_header("Access-Control-Max-Age", "600")
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    def _cors(self) -> dict[str, str]:
+        """Return the CORS headers for a web-extension origin, else an empty mapping.
+
+        Only an add-on origin is echoed: its `Origin` header cannot be forged by a web page,
+        so answering it cannot hand vault data to a site the user happens to visit.
+        """
+        origin = self.headers.get("Origin") or ""
+        if not origin.startswith(WE_ORIGIN_PREFIXES):
+            return {}
+        return {"Access-Control-Allow-Origin": origin, "Vary": "Origin"}
 
     def _handle(self, method: str) -> None:
         """Route one request, swallowing client disconnects."""
@@ -259,7 +295,14 @@ class _Handler(BaseHTTPRequestHandler):
         if method == "POST" and path == "/api/autofill/reveal":
             self._send(api.autofill_reveal(self._read_json()))
             return
-        if method == "POST" and path in ("/api/autofill/save-check", "/api/autofill/save"):
+        if method == "POST" and path == "/api/autofill/cards":
+            self._send(api.autofill_cards())
+            return
+        if method == "POST" and path in (
+            "/api/autofill/reveal-card",
+            "/api/autofill/save-check",
+            "/api/autofill/save",
+        ):
             # Saving is the one call that writes, so it also has to come from this machine: the
             # browser token is already required, and this keeps a *remote* holder of it out of
             # the credential folder even when the listener is bound beyond loopback.
@@ -277,7 +320,9 @@ class _Handler(BaseHTTPRequestHandler):
                     },
                 )
                 return
-            if path.endswith("save-check"):
+            if path == "/api/autofill/reveal-card":
+                self._send(api.autofill_reveal_card(self._read_json()))
+            elif path.endswith("save-check"):
                 self._send(api.autofill_save_check(self._read_json()))
             else:
                 self._send(api.autofill_save(self._read_json()))
@@ -331,6 +376,8 @@ class _Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(response.body)))
         self.send_header("Cache-Control", "no-store")
         self.send_header("X-Content-Type-Options", "nosniff")
+        for key, value in self._cors().items():
+            self.send_header(key, value)
         for key, value in response.headers.items():
             self.send_header(key, value)
         self.end_headers()
@@ -356,6 +403,8 @@ class _Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", cache)
         self.send_header("X-Content-Type-Options", "nosniff")
+        for key, value in self._cors().items():
+            self.send_header(key, value)
         for key, value in (extra or {}).items():
             self.send_header(key, value)
         self.end_headers()

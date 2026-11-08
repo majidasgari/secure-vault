@@ -34,18 +34,27 @@ the bridge must be attached (the web listener owns it), and the scope must be `b
 logged (`session.claim`, `role=browser`, `source=browser`) whether it is allowed or denied. The
 token rotates with every app start, so a stale token is simply re-claimed.
 
-## 2. The five calls
+## 2. The calls
 
 | route | returns | audited |
 | --- | --- | --- |
 | `GET /api/autofill/status` | `enabled`, `save_enabled`, `locked`, index counts (`entries`, `passwords`, `usernames`, …), `reveal_limit`, `reveals_last_minute`, `save_limit`, `saves_last_minute` | one row (`vault.browser_status`) |
 | `POST /api/autofill/match` `{host, url?, limit?}` | **metadata only** candidates for that host: `path`, `title`, `site`, `url`, `username`, `has_password`, `has_otp`, `score` | one row (`vault.browser_match`), no path |
 | `POST /api/autofill/reveal` `{path, host}` | that entry's fields: `username`, `password`, `otp`, `url`, `title`, `site` | one row (`vault.browser_reveal`) with `target_path` |
+| `POST /api/autofill/cards` | the card entries a payment page can be filled from: `path`, `title`, `bank`, `last4`, `holder`, `has_expiry`, `has_cvv2`, `has_pin2`, `has_sheba` — **never** the number, the CVV2 or رمز دوم | one row (`vault.browser_cards`) |
+| `POST /api/autofill/reveal-card` `{path}` | that card's fields: `number`, `expiry`, `cvv2`, `pin2`, `account`, `sheba`, `holder`, `bank` | one row (`vault.browser_reveal_card`) with `target_path` |
 | `POST /api/autofill/save-check` `{host, username?, password?, url?, title?}` | the verdict for a credential the add-on watched being typed: `state` (`new` / `changed` / `same`), `path`, `title`, `site`, `username`, `has_otp` | one row (`vault.browser_save_check`) — **writes nothing** |
 | `POST /api/autofill/save` `{host, username?, password, url?, title?, path?}` | the same shape with `saved: true` and `state` `created` / `updated` / `same` | one row (`vault.browser_save`) with `target_path` |
 
-`match` never returns a password. `reveal` is the only call that does, it is the only call that names
-a path, and it refuses unless:
+`match` and `cards` never return a secret. `reveal` is the only call that yields a password and
+`reveal-card` the only one that yields a card number: both name a path, both are rate-limited by the
+same rolling-minute bucket, and both are always audited.
+
+`reveal-card` has no host to match (a gateway lives on its own domain), so what confines it is the
+path: the entry must sit under `رمزها/بانک و پرداخت/`, must parse as a card, and the call is
+**loopback-only** — like the two save calls.
+
+`reveal` refuses unless:
 
 * the path is inside the credential root (`/رمزها`) — the root itself is not an entry;
 * the entry **matches the caller's host** (`host_mismatch` otherwise) — a page cannot ask for another
