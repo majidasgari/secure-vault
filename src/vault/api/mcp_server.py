@@ -374,6 +374,19 @@ _TOOL_SPECS: list[dict[str, Any]] = [
         _forward("vault.request_open_secret"),
     ),
     _tool(
+        "sync_journal",
+        "Run the multi-device sync now (the lock-free operation log): publish this device's "
+        "pending changes and apply every other device's. Call it after writing to the vault "
+        "so the phone and the other machines see the change. Returns how many operations "
+        "were pushed/applied, the unresolved conflict count and the operations still pending "
+        "(`more: true` means call again). Journal-mode vaults only; a legacy mirror answers "
+        "SYNC_MODE_LEGACY. A long first sync (a whole vault) needs `max_ops` slices — the "
+        "bridge gives up after 30 s.",
+        {"max_ops": {"type": "integer"}},
+        [],
+        _forward("vault.sync_journal"),
+    ),
+    _tool(
         "get_access_log",
         "Read the append-only access log (newest first).",
         {

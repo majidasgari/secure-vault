@@ -115,6 +115,7 @@ All tools accept a JSON object and return an object. Paths use the vault-absolut
 | `semantic_reindex` | `path` (optional subtree), `force` (default true) | `{"indexed","skipped","chunks"}` — re-embed all or just one subtree |
 | `request_open_secret` | `path` (req) | `{"request_id","status":"pending","note":"…"}` — `secretfile` only; content is never returned |
 | `get_access_log` | `limit` (default 100), `offset`, `source` (`ui`/`mcp`/`socket`), `outcome` (`allow`/`deny`/`error`) | `{"count","entries":[{ts,iso,source,role,tool,target_path,outcome,code,details,session}]}` |
+| `sync_journal` | `max_ops` (optional slice size) | `{"pushed","push_failed","applied","duplicates","gaps","conflicts","pending","more"}` — the multi-device (operation log) sync: publishes this device's pending changes and applies every peer's; call it after writing so the other devices see the change. Journal-mode vaults only (`SYNC_MODE_LEGACY` otherwise); `more: true` means call again |
 
 Agent-facing rules:
 

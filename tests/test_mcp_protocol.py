@@ -38,6 +38,7 @@ EXPECTED_TOOLS = {
     "semantic_reindex",
     "request_open_secret",
     "get_access_log",
+    "sync_journal",
 }
 
 NORMAL_MARKER = "hello normal body"

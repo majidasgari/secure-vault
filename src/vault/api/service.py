@@ -149,9 +149,12 @@ class ActivityFeed:
             self.add(event)
 
 # Methods callable by each role. Anything absent from the table is unknown (``-32601``).
-_UI_ONLY = "ui"
-_MCP_ONLY = "mcp"
-_BOTH = "both"
+_UI_ONLY: frozenset[str] = frozenset({ROLE_UI})
+_MCP_ONLY: frozenset[str] = frozenset({ROLE_MCP})
+_BOTH: frozenset[str] = frozenset(ROLES)
+# The multi-device sync is also an agent action: an agent that just wrote to the vault runs it.
+_UI_MCP: frozenset[str] = frozenset({ROLE_UI, ROLE_MCP})
+_BROWSER_ONLY: frozenset[str] = frozenset({ROLE_BROWSER})
 
 
 def _api_path(logical: str) -> str:
@@ -240,7 +243,7 @@ class Service:
                 )
                 raise BadRequest("unknown_method", details={"method": method})
             handler, scope = route
-            if scope != _BOTH and scope != role:
+            if role not in scope:
                 self._log(
                     role=role, tool=method, target=target, outcome="deny",
                     code=PermissionDenied.code, session_id=session_id,
@@ -1143,7 +1146,7 @@ class Service:
         }
 
     # ------------------------------------------------------------------- routing
-    _ROUTES: dict[str, tuple[Any, str]] = {
+    _ROUTES: dict[str, tuple[Any, frozenset[str]]] = {
         "vault.status": (_h_status, _BOTH),
         "vault.locked": (_h_locked, _BOTH),
         "vault.unlock": (_h_unlock, _UI_ONLY),
@@ -1191,7 +1194,7 @@ class Service:
         "vault.sync_status": (_h_sync_status, _BOTH),
         "vault.sync_test": (_h_sync_test, _UI_ONLY),
         "vault.sync_now": (_h_sync_now, _UI_ONLY),
-        "vault.sync_journal": (_h_sync_journal, _UI_ONLY),
+        "vault.sync_journal": (_h_sync_journal, _UI_MCP),
         "vault.publish_snapshot": (_h_publish_snapshot, _UI_ONLY),
         "vault.migrate_journal": (_h_migrate_journal, _UI_ONLY),
         "vault.conflicts": (_h_conflicts, _BOTH),
@@ -1208,13 +1211,13 @@ class Service:
         # the web UI or an agent — see ``api/browser.py`` for what each one may return. The two
         # ``browser_save*`` entries are the bridge's whole write surface: a verdict without a
         # write, and a write confined to one credential under the credential root.
-        "vault.browser_status": (_h_browser_status, ROLE_BROWSER),
-        "vault.browser_match": (_h_browser_match, ROLE_BROWSER),
-        "vault.browser_reveal": (_h_browser_reveal, ROLE_BROWSER),
-        "vault.browser_cards": (_h_browser_cards, ROLE_BROWSER),
-        "vault.browser_reveal_card": (_h_browser_reveal_card, ROLE_BROWSER),
-        "vault.browser_save_check": (_h_browser_save_check, ROLE_BROWSER),
-        "vault.browser_save": (_h_browser_save, ROLE_BROWSER),
+        "vault.browser_status": (_h_browser_status, _BROWSER_ONLY),
+        "vault.browser_match": (_h_browser_match, _BROWSER_ONLY),
+        "vault.browser_reveal": (_h_browser_reveal, _BROWSER_ONLY),
+        "vault.browser_cards": (_h_browser_cards, _BROWSER_ONLY),
+        "vault.browser_reveal_card": (_h_browser_reveal_card, _BROWSER_ONLY),
+        "vault.browser_save_check": (_h_browser_save_check, _BROWSER_ONLY),
+        "vault.browser_save": (_h_browser_save, _BROWSER_ONLY),
     }
 
 

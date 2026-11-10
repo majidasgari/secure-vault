@@ -145,6 +145,19 @@ class ServiceDispatchTest(unittest.TestCase):
     def tearDown(self) -> None:
         self.session.close()
 
+    def test_sync_journal_is_open_to_agents(self) -> None:
+        """An agent may run the multi-device sync; the browser role may not.
+
+        The scratch vault is a legacy mirror, so ``ui``/``mcp`` pass the policy check and fail
+        on the mode instead — that is what proves the role was allowed, not the other refusal.
+        """
+        for role in ("ui", "mcp"):
+            with self.subTest(role=role):
+                with self.assertRaises(BadRequest):
+                    self.service.dispatch("vault.sync_journal", {}, role=role, session_id="t")
+        with self.assertRaises(PermissionDenied):
+            self.service.dispatch("vault.sync_journal", {}, role="browser", session_id="t")
+
     def test_dispatch_table(self) -> None:
         """Every documented method routes correctly (>30 cases)."""
         self.assertGreater(len(CASES), 30)
