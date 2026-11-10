@@ -83,6 +83,7 @@ REQUIRED_LAYOUT = (
     "i18n/fa.json",
     "i18n/en.json",
     "assets/icon.svg",
+    "assets/secure-vault.ico",
 )
 
 

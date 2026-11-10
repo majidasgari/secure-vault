@@ -167,3 +167,37 @@ JSON-RPC).
   with a fake server).
 * Two vault processes (the GUI and the web UI) against one runtime directory: the
   second-instance guard is the named mutex, which is per-user session.
+
+## 6. Start-menu shortcut and autostart
+
+`tools/install_windows_shortcuts.ps1` registers the portable build as a per-user app — no admin
+rights, nothing written outside `%APPDATA%`:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File tools\install_windows_shortcuts.ps1
+```
+
+It writes two `.lnk` files:
+
+| shortcut | path | effect |
+| --- | --- | --- |
+| Secure Vault | `%APPDATA%\Microsoft\Windows\Start Menu\Programs\Secure Vault.lnk` | in the apps list and Start search |
+| Secure Vault | `%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup\Secure Vault.lnk` | launched at every logon |
+
+Both point at `portable\win\pythonw.exe -m vault` — `pythonw.exe` keeps the console window away and
+`src/` sits on the embedded `python312._pth`, so `-m vault` resolves from any working directory. The
+working directory is the portable folder and the icon is `assets\secure-vault.ico`.
+
+Flags: `-NoStartup` (Start menu only), `-Remove` (delete both), `-PortableDir` / `-IconPath`
+to override the defaults.
+
+Notes:
+
+* Autostart shows the unlock screen after logon. That is unavoidable and correct: the daemon
+  socket, the web UI and the agent tools all live in the *unlocked* session, so nothing can start
+  before the master password. With `start_minimized` on (Settings → start minimized) the main
+  window goes to the tray as soon as it is unlocked.
+* The per-user named mutex keeps a single instance, so clicking the shortcut while the app is
+  already running just reports `app.already_running`.
+* `assets/secure-vault.ico` is a build artifact: regenerate it with `python tools/make_icon.py`
+  after editing `assets/icon.svg` (the portable build copies `assets/` as-is).
