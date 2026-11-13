@@ -737,8 +737,8 @@ class CredentialIndex:
         Only what a :class:`CredentialEntry` keeps is matched — a password can never be found
         here, which is also why the caller gets field names and a path, never a value.
         """
-        needle = normalize_fa(query)
-        tokens = [token for token in needle.split(" ") if token]
+        needle = normalize_fa(query).casefold()
+        tokens = [token.casefold() for token in needle.split(" ") if token]
         if not tokens:
             return []
         hits: list[dict[str, Any]] = []
@@ -746,7 +746,7 @@ class CredentialIndex:
             matched = [
                 name
                 for name in SEARCHABLE_FIELDS
-                if (folded := normalize_fa(str(getattr(entry, name) or "")))
+                if (folded := normalize_fa(str(getattr(entry, name) or "")).casefold())
                 and (needle in folded or all(token in folded for token in tokens))
             ]
             if matched:

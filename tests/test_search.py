@@ -142,6 +142,24 @@ class SearchBehaviourTest(unittest.TestCase):
         self.assertEqual(self.session.search_filenames("very-secret-value-42", fields=True), [])
         self.assertEqual(self.session.search_filenames("max.card.user"), [])
 
+    def test_search_is_case_insensitive(self) -> None:
+        """A lower-case query finds a Capitalised name and field.
+
+        Case sensitivity here reads as a *lost* credential: the entry exists and shows its
+        value, but a typed-in query in the other case answers «0 نتیجه».
+        """
+        self.session.write_file("رمزها/Firefox/Firefox - Clone.md", b"x")
+        self.session.set_sensitivity("رمزها/Firefox/Firefox - Clone.md", "secretfile")
+        self.assertIn(
+            "رمزها/Firefox/Firefox - Clone.md",
+            [h["logical_path"] for h in self.session.search_filenames("firefox")],
+        )
+        body = "# حساب\nسایت: mozilla.org\nنام کاربری: Max.User@Proton.Me\n".encode("utf-8")
+        self.session.write_file("رمزها/Mozilla/main.md", body)
+        self.session.set_sensitivity("رمزها/Mozilla/main.md", "secretfile")
+        hits = self.session.search_filenames("max.user@proton.me", fields=True)
+        self.assertEqual([h["logical_path"] for h in hits], ["رمزها/Mozilla/main.md"])
+
     def test_search_text_returns_line_and_offset(self) -> None:
         """Literal hits carry the 1-based line and character offset of the match."""
         body = "line one\nline two\nneedle here\n"

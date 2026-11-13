@@ -62,7 +62,10 @@ def search_filenames(
     if not normalized:
         raise BadRequest("empty_query")
     scope = normalize_vault_path(path_prefix) if path_prefix else None
-    tokens = [tok for tok in normalized.split(" ") if tok]
+    # Case-fold both sides: an ASCII-case-sensitive compare hides "Firefox - Clone" from
+    # "firefox", which reads as a lost credential.
+    needle = normalized.casefold()
+    tokens = [tok.casefold() for tok in normalized.split(" ") if tok]
     results: list[dict[str, Any]] = []
     for row in session.index.walk("/"):
         level = row["sensitivity"]
@@ -72,8 +75,8 @@ def search_filenames(
             continue
         if not semantics.path_under(str(row["logical_path"]), scope):
             continue
-        name = normalize_fa(row["logical_path"])
-        if normalized in name or all(tok in name for tok in tokens):
+        name = normalize_fa(row["logical_path"]).casefold()
+        if needle in name or all(tok in name for tok in tokens):
             results.append(_result(row, "filename"))
     results.sort(key=lambda item: item["logical_path"])
     return results[: int(limit)]
